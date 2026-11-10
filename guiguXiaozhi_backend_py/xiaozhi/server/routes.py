@@ -154,6 +154,16 @@ async def metrics(request: Request):
     }
 
 
+@router.delete("/profile/{user_key}")
+async def forget_profile(user_key: str, request: Request):
+    """"忘记我"——删除该用户全部画像事实（MySQL + 向量）。合规要求端点。"""
+    container = _container(request)
+    if container.profile_service is None:
+        return JSONResponse({"detail": "画像功能未启用"}, status_code=404)
+    removed = await container.profile_service.forget(user_key)
+    return {"user_key": user_key, "removed": removed}
+
+
 @router.get("/audit")
 async def audit(request: Request, limit: int = 50):
     """最近的审计记录（已脱敏）"""

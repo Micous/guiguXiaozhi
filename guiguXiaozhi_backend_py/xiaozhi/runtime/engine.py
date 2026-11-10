@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from typing import Any, AsyncIterator, Dict, List, Optional
@@ -73,6 +74,8 @@ class AgentEngine(EnginePhases):
         circuit_breaker: Optional[CircuitBreaker] = None,
         request_timeout: Optional[float] = None,
         tool_failure_threshold: int = 3,
+        profile_injector=None,
+        profile_service=None,
     ) -> None:
         self.chat_model = chat_model
         self.tool_registry = tool_registry
@@ -90,6 +93,9 @@ class AgentEngine(EnginePhases):
         self.request_timeout = request_timeout
         self.tool_failure_threshold = max(1, tool_failure_threshold)
         self.persister = ConversationPersister()
+        # P2 患者画像（灰度：profile_enabled=false 时两者均为 None，行为与一期完全一致）
+        self.profile_injector = profile_injector
+        self.profile_service = profile_service
 
     async def run(
         self,
@@ -267,6 +273,14 @@ class AgentEngine(EnginePhases):
                         fallback_text=result.text,
                     )
                     await self.conversation_store.save(memory_id, new_messages)
+                    # ---- 画像抽取（P2-M6，fire-and-forget）----
+                    # 落库成功后才触发；失败只记日志，绝不影响本轮响应。
+                    if self.profile_service is not None:
+                        asyncio.get_running_loop().create_task(
+                            self.profile_service.maybe_extract(
+                                user_input, new_messages, trace_id=trace_id
+                            )
+                        )
                 except Exception as exc:
                     write_span.set_error(f"{type(exc).__name__}: {exc}")
                     result.degraded = True

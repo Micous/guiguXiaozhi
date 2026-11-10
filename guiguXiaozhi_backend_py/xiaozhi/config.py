@@ -91,6 +91,13 @@ class Settings(BaseSettings):
     rate_limit_max_requests: int = 30
     rate_limit_window_seconds: float = 60.0
 
+    # ---------- 患者画像（P2 长期记忆，灰度默认关） ----------
+    profile_enabled: bool = False
+    # 每积累 N 轮新消息抽取一次画像
+    profile_extract_interval_turns: int = 6
+    # Fernet 密钥；开启画像时必填，缺失则画像模块整体禁用（敏感字段必须密文落库）
+    profile_secret_key: str = ""
+
     # ---------- 可观测 ----------
     log_level: str = "INFO"
     json_logs: bool = True

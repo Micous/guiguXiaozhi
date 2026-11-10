@@ -24,6 +24,10 @@ from xiaozhi.models.ollama import OllamaChatModel, OllamaEmbeddingModel
 from xiaozhi.ops.audit import AuditLogger
 from xiaozhi.ops.lifecycle import GracefulShutdown, HealthChecker, RateLimiter
 from xiaozhi.ops.metrics import MetricsCollector
+from xiaozhi.profile.service import ProfileService
+from xiaozhi.profile.store import FactCipher, MySQLProfileRepository, ProfileDisabledError
+from xiaozhi.profile.injector import ProfileInjector
+from xiaozhi.profile.vector import MilvusProfileVectorStore
 from xiaozhi.reliability.logging import configure_logging
 from xiaozhi.reliability.resilience import CircuitBreaker, RetryConfig
 from xiaozhi.reliability.trace_store import TraceStore, set_default_store
@@ -75,6 +79,8 @@ class Application:
     health: HealthChecker
     rate_limiter: RateLimiter
     shutdown: GracefulShutdown
+    # P2 患者画像（灰度：profile_enabled=false 时为 None）
+    profile_service: Optional[ProfileService] = None
 
     async def aclose(self) -> None:
         """优雅停机：释放连接"""
@@ -273,6 +279,48 @@ async def get_application(settings: Optional[Settings] = None) -> Application:
         audit_logger=audit,
     )
 
+    # ---- 患者画像（P2，灰度开关默认关）----
+    # profile_enabled=false：所有组件保持 None，engine 行为与一期完全一致（红线）。
+    # ProfileDisabledError（缺 PROFILE_SECRET_KEY 等）：禁用 + 告警，不阻止启动。
+    profile_injector = None
+    profile_service: Optional[ProfileService] = None
+    if settings.profile_enabled:
+        try:
+            cipher = FactCipher(settings.profile_secret_key)
+            profile_repository = MySQLProfileRepository(
+                settings.mysql_host,
+                settings.mysql_port,
+                settings.mysql_user,
+                settings.mysql_password,
+                settings.mysql_database,
+            )
+            profile_vector = MilvusProfileVectorStore(
+                milvus_uri=settings.milvus_uri,
+                embed_fn=embedding_model.embed,
+                dimension=len(await embedding_model.embed("dim")),
+            )
+
+            async def _extract_llm(prompt: str) -> str:
+                turn = await chat_model.chat([{"role": "user", "content": prompt}])
+                return turn.text or ""
+
+            profile_service = ProfileService(
+                repository=profile_repository,
+                cipher=cipher,
+                llm_fn=_extract_llm,
+                vector_store=profile_vector,
+                extract_interval_turns=settings.profile_extract_interval_turns,
+            )
+            profile_injector = ProfileInjector(
+                repository=profile_repository,
+                vector_store=profile_vector,
+            )
+            logger.info("患者画像已启用（profile_enabled=true）")
+        except ProfileDisabledError as exc:
+            logger.warning("患者画像禁用：%s", exc)
+        except Exception as exc:
+            logger.warning("患者画像初始化失败（禁用）：%s: %s", type(exc).__name__, exc)
+
     # ---- 运行时 ----
     engine = AgentEngine(
         chat_model=chat_model,
@@ -299,6 +347,8 @@ async def get_application(settings: Optional[Settings] = None) -> Application:
         ),
         request_timeout=settings.request_timeout,
         tool_failure_threshold=settings.tool_failure_threshold,
+        profile_injector=profile_injector,
+        profile_service=profile_service,
     )
 
     return Application(
@@ -320,4 +370,5 @@ async def get_application(settings: Optional[Settings] = None) -> Application:
         health=health,
         rate_limiter=rate_limiter,
         shutdown=shutdown,
+        profile_service=profile_service,
     )

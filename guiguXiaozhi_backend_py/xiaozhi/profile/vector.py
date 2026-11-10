@@ -52,6 +52,10 @@ class ProfileVectorStore(ABC):
     async def search(self, query: str, user_key: str, top_k: int = 3) -> List[ProfileHit]:
         """当前对话语义 top-N + user_key 过滤（绝不出此用户的画像）"""
 
+    async def delete_user(self, user_key: str) -> int:
+        """"忘记我"：删除该用户全部向量事实（默认无操作，实现按需覆盖）。"""
+        return 0
+
 
 class InMemoryProfileVectorStore(ProfileVectorStore):
     """内存实现（测试 / Milvus 不可用时的降级兜底）。余弦相似度。"""
@@ -89,6 +93,12 @@ class InMemoryProfileVectorStore(ProfileVectorStore):
             )
         scored.sort(key=lambda h: h.score, reverse=True)
         return scored[:top_k]
+
+    async def delete_user(self, user_key: str) -> int:
+        with self._lock:
+            before = len(self._vectors)
+            self._vectors = [v for v in self._vectors if v["user_key"] != user_key]
+            return before - len(self._vectors)
 
 
 class MilvusProfileVectorStore(ProfileVectorStore):
@@ -156,6 +166,14 @@ class MilvusProfileVectorStore(ProfileVectorStore):
                 )
             )
         return hits
+
+    async def delete_user(self, user_key: str) -> int:
+        try:
+            self._client.delete(self._collection, filter=f'user_key == "{user_key}"')
+        except Exception as exc:
+            logger.warning("画像向量删除失败：user_key=%s %s", user_key, exc)
+            return 0
+        return -1  # Milvus delete 不返回条数，用 -1 表示已执行
 
 
 def _cosine(a: Sequence[float], b: Sequence[float]) -> float:

@@ -92,8 +92,14 @@ class EnginePhases:
 
         # ---- 组装上下文 ----
         with trace_span("context.assemble", trace_id=trace_id) as context_span:
+            # ---- 患者画像（P2-M4）：只在开关打开时非空；失败返回空串不阻断 ----
+            profile = ""
+            if getattr(self, "profile_injector", None) is not None:
+                profile = await self.profile_injector.build_segment(user_input, history)
+                if profile:
+                    context_span.set_attribute("profile_injected", True)
             context = self.context_assembler.assemble(
-                self.system_prompt, user_input, history, knowledge=knowledge
+                self.system_prompt, user_input, history, knowledge=knowledge, profile=profile
             )
             context_span.set_attribute("history_kept", len(context.history))
             context_span.set_attribute("dropped_items", context.dropped_items)
