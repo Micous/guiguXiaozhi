@@ -131,6 +131,8 @@ class AgentEngine:
             # 实测注入后模型会把请求当成"知识题"直接答题，工具调用率从 5/5 掉到 0/5。
             knowledge = ""
             inject_knowledge = should_inject_knowledge(user_input)
+            # 操作类请求：历史里的完成态回复会误导小模型跳过工具调用（B1 实测）
+            operation_request = not inject_knowledge
             if self.retriever is not None and inject_knowledge:
                 with trace_span("retrieval.search", trace_id=trace_id) as retrieval_span:
                     hits = await self.retriever.retrieve(user_input, top_k=2)
@@ -157,13 +159,19 @@ class AgentEngine:
                 context_span.set_attribute("history_kept", len(context.history))
                 context_span.set_attribute("dropped_items", context.dropped_items)
                 context_span.set_attribute("total_tokens", context.total_tokens)
+                context_span.set_attribute(
+                    "operation_history_neutralized", operation_request
+                )
 
-            messages = context.to_messages(user_input)
+            messages = context.to_messages(
+                user_input, neutralize_history=operation_request
+            )
             tools = self.tool_registry.list_definitions()
             known_tool_names = [d.name for d in tools]
 
             turn = 0
             tool_call_count = 0
+            successful_tool_calls = 0  # 请求级：用于抑制"工具已执行后的总结轮"误报
             tool_results: List[Message] = []
             tool_failures: Dict[str, int] = {}
 
@@ -228,7 +236,11 @@ class AgentEngine:
                             attempt_error = exc
                             candidate = _empty_turn()
 
-                        finding = inspect_turn(candidate, known_tool_names)
+                        finding = inspect_turn(
+                            candidate,
+                            known_tool_names,
+                            tool_executed=successful_tool_calls > 0,
+                        )
                         # 关键：只有"一个字都没下发"时才允许重试，避免前端出现重复文本
                         retryable = (not emitted) and (
                             attempt_error is not None or finding.needs_retry
@@ -356,6 +368,7 @@ class AgentEngine:
 
                         if tool_result.success:
                             tool_failures[call.name] = 0
+                            successful_tool_calls += 1
                         else:
                             tool_failures[call.name] = tool_failures.get(call.name, 0) + 1
 

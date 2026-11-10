@@ -28,6 +28,7 @@
 - [快速开始](#快速开始)
   - [本地一键启动（Ollama + Docker，推荐）](#-本地一键启动ollama--docker推荐)
   - [本地化改造说明](#本地化改造说明)
+  - [Python 版后端（自研 Harness）](#python-版后端自研-harness)
   - [手动启动](#-手动启动不使用脚本)
 - [核心机制解析](#核心机制解析)
 - [API 文档](#api-文档)
@@ -217,14 +218,30 @@ guiguXiaozhi/
 │           │   ├── 神经内科.md
 │           │   └── doctors.md                # 专家名单（专家名录检索的数据源）
 │           └── mapper/AppointmentMapper.xml
+├── guiguXiaozhi_backend_py/                 # ★ 第二套后端（Python / FastAPI + 自研 Harness）
+│   ├── run.py                               # 启动入口（默认 8081）
+│   ├── PLAN.md                              # 重写方案（开工前文档，以代码为准）
+│   ├── xiaozhi/
+│   │   ├── runtime/engine.py                # Agent 主循环（重试 / 熔断 / 时间预算 / 质量门控）
+│   │   ├── retrieval/                       # BM25 + 向量 RRF 混合检索、Milvus 灌库
+│   │   ├── security/                        # 权限 / 校验 / 注入 / 护栏 / 安全执行器
+│   │   ├── reliability/                     # 追踪、重试熔断、结构化日志、脱敏
+│   │   ├── ops/                             # 指标、审计、健康检查 / 限流 / 优雅停机
+│   │   ├── tools/                           # 4 个中文工具（预约 / 取消 / 号源 / 专家）
+│   │   └── server/                          # FastAPI 路由 + 追踪可视化页
+│   ├── scripts/                             # eval_rag.py / compare.py / e2e_appointment.py
+│   ├── tests/                               # unit（离线）/ integration（真实依赖）/ eval
+│   ├── Dockerfile · compose.yaml            # 容器化（复用宿主机中间件）
+│   └── README.md                            # Python 版专属说明
 ├── guiguXiaozhi_frontend/                   # 前端（Vue 3 + Vite）
 │   └── src/
 │       ├── App.vue                          # 应用入口
 │       ├── components/ChatWindow.vue        # ★ 核心聊天组件（流式渲染 / 会话管理）
 │       └── main.js                          # Element Plus 注册
-├── start-local.sh                           # ★ 本地一键启动（中间件 + 前后端）
+├── start-local.sh                           # ★ 本地一键启动（支持 --python / --with-python / --compare）
 ├── stop-local.sh                            # 停止本地服务
-└── logs/                                    # 运行日志（backend.log / frontend.log）
+├── 改造进度与后续规划.md                     # ★ 两套后端的实施状态与交接文档
+└── logs/                                    # 运行日志（backend.log / backend-py.log / frontend.log）
 ```
 
 ---
@@ -257,6 +274,7 @@ open http://localhost:5173
 | 中间件 | 启动 `guigu-mysql`（3306）与 `guigu-mongo`（27017）容器，并初始化 `appointment` 表 |
 | 大模型 | 校验 Ollama 服务与所需模型是否就绪 |
 | 后端 | `mvn spring-boot:run` → http://localhost:8080 |
+| Python 版后端（可选） | `--python` / `--with-python` 时启动 `run.py` → http://localhost:8081；`--compare` 额外产出 A/B 报告 |
 | 前端 | `npm run dev` → http://localhost:5173 |
 
 停止所有服务：
@@ -271,6 +289,92 @@ open http://localhost:5173
 - 后端接口：<http://localhost:8080/xiaozhi/chat>
 - 接口文档：<http://localhost:8080/doc.html>
 - 日志目录：`logs/backend.log`、`logs/frontend.log`
+
+### Python 版后端（自研 Harness）
+
+> 方案原文见 `guiguXiaozhi_backend_py/PLAN.md`，实施状态与交接结论见根目录
+> `改造进度与后续规划.md`。**方案是开工前文档，阈值与文件名以代码为准。**
+
+仓库里有两套**可独立运行**的后端，接口协议完全一致（`/xiaozhi/chat` 返回
+`text/stream;charset=utf-8` 裸文本分块），因此前端业务代码零改动即可切换：
+
+| | Java 版 | Python 版 |
+|---|---|---|
+| 目录 / 端口 | `guiguXiaozhi_backend/` · 8080 | `guiguXiaozhi_backend_py/` · 8081 |
+| 框架 | Spring Boot + LangChain4j | FastAPI + 自研 Harness（不依赖 Agent 框架） |
+| 记忆 | MongoDB 窗口 20 条 | MongoDB + 文件降级，token 预算裁剪 |
+| 检索 | Milvus 纯向量 | Milvus **BM25 + 向量 RRF 混合检索**，内容哈希幂等灌库、别名原子切换 |
+| 可观测 | 无链路追踪 | `/trace` span 树、`/metrics`、`/audit` 脱敏审计、响应头 `X-Trace-Id` |
+| 可靠性 | 空响应重试 | 空响应重试、模型/工具级熔断降级、请求时间预算、限流、优雅停机、幻觉与越权门控 |
+
+#### 启动
+
+```bash
+# 方式一：只起 Python 版 + 前端（/api 代理自动指向 8081）
+./start-local.sh --python
+
+# 方式二：双后端并存 + 自动生成 A/B 对比报告
+./start-local.sh --compare
+
+# 方式三：手动启动（需 Ollama / Milvus / MySQL / MongoDB 已在线）
+cd guiguXiaozhi_backend_py
+python3 -m venv .venv && ./.venv/bin/pip install -r requirements.txt
+cp .env.example .env          # 可选；默认值即可直接运行
+./.venv/bin/python run.py --port 8081
+```
+
+> **前端切换原理**：`guiguXiaozhi_frontend/vite.config.js` 的 `/api` 代理读取
+> `VITE_API_TARGET`（默认 `http://localhost:8080`）。`--python` 模式注入
+> `VITE_API_TARGET=http://localhost:8081`，`ChatWindow.vue` 一行都不用改。
+> Vite 只在启动时读配置，切换端口需重启前端 dev server。
+
+#### Python 版专属端点
+
+| 路径 | 说明 |
+|---|---|
+| `GET /health` | 存活探针（停机状态、在途请求数） |
+| `GET /ready` | 就绪探针：逐项探测 Ollama / Milvus / MySQL，单探针 2s 超时 |
+| `GET /metrics` | QPS、P50/P95、工具成功率、重试率、降级次数、熔断器与限流状态 |
+| `GET /audit?limit=50` | 权限决策与工具执行审计（JSONL 落盘，身份证 / 密钥脱敏） |
+| `GET /traces` · `GET /trace/{id}` | 追踪列表 / 单次对话的 span 树 JSON |
+| `GET /trace` | **追踪可视化页面**（纯 HTML + 原生 JS，无需前端框架） |
+| `GET /tools` | 当前注册的工具与参数 schema |
+| `GET /docs` | FastAPI 自动生成接口文档 |
+
+任意一次对话都能用响应头里的 `X-Trace-Id` 在 `/trace/{id}` 回查完整步骤树
+（`http.request` → `memory.load` → `retrieval.search` → `context.assemble` →
+`llm.chat` → `tool.execute` → `memory.write`）。
+
+#### 测试、评估与 A/B 对比
+
+```bash
+cd guiguXiaozhi_backend_py
+./.venv/bin/python -m pytest tests/ -q                # 离线单测（默认跳过集成测试）
+./.venv/bin/python scripts/eval_rag.py                # RAG 召回率评估
+./.venv/bin/python scripts/compare.py --help          # Java vs Python A/B 对比
+./.venv/bin/python scripts/e2e_appointment.py --help  # 挂号 → MySQL → 取消全链路
+
+# 真实依赖集成测试（需指定一套已启动的新版后端）
+XIAOZHI_PY_BASE_URL=http://127.0.0.1:8082 \
+  ./.venv/bin/python -m pytest tests/integration -q --run-integration
+```
+
+A/B 对比对同一批问题双发两套后端，产出 Markdown + JSON 报告（回答文本、耗时、
+Python 侧 span 数、工具调用与检索命中）：
+
+```bash
+./.venv/bin/python scripts/compare.py \
+  --java http://localhost:8080 --python http://localhost:8081 \
+  --questions-file tests/eval/ab_questions.txt --timeout 180 \
+  --output logs/ab-report.md --json logs/ab-report.json
+```
+
+#### 容器化
+
+`guiguXiaozhi_backend_py/` 下提供 `Dockerfile` 与 `compose.yaml`，复用宿主机的
+MySQL / MongoDB / Milvus / Ollama（`host.docker.internal`），不需要在容器里再拉一套中间件。
+
+---
 
 ### 本地化改造说明
 
@@ -480,6 +584,10 @@ System Prompt 中约定了严格的执行规则：**预约前必须确认患者�
 |------|------|------|
 | POST | `/xiaozhi/chat` | 对话接口，`{ "memoryId": 123, "message": "..." }`，返回流式文本 |
 
+两套后端的 `/xiaozhi/chat` 请求/响应格式一致（Java 版 `memoryId` 为 `Long`，Python 版会
+自动 `str()` 转换）。Python 版额外提供 `/health`、`/ready`、`/metrics`、`/audit`、
+`/traces`、`/trace`、`/tools`、`/docs`，见上文「Python 版专属端点」。
+
 ---
 
 ## 测试
@@ -496,6 +604,15 @@ System Prompt 中约定了严格的执行规则：**预约前必须确认患者�
 | `PromptTest` | 提示词模板 |
 | `AIServiceTest` | AI Service 装配 |
 | `AppointmentServiceTest` | 预约业务逻辑 |
+
+Python 版另有一套独立测试（**全部离线可跑**，不依赖 Ollama / Milvus / MySQL / MongoDB）：
+
+| 命令 | 覆盖内容 |
+|---|---|
+| `pytest tests/ -q` | 单测：RAG 分块与检索、质量门控、重试/熔断、指标/审计/生命周期、日志与护栏、engine 可靠性、trace 时长统计 |
+| `pytest tests/integration -q --run-integration` | 集成测试：打真实服务的健康/就绪探针、工具注册表、一次真实对话与追踪树（默认跳过，需 `XIAOZHI_PY_BASE_URL`） |
+| `python scripts/eval_rag.py` | RAG 召回率评估（`tests/eval/rag_eval.json`） |
+| `python scripts/e2e_appointment.py` | 端到端：问诊 → 分导诊 → 挂号 → MySQL 落库 → 取消 |
 
 ---
 
@@ -534,6 +651,7 @@ System Prompt 中约定了严格的执行规则：**预约前必须确认患者�
 - [Technical Architecture](#technical-architecture)
 - [Project Structure](#project-structure)
 - [Quick Start](#quick-start)
+- [Python Backend (In-house Harness)](#python-backend-in-house-harness)
 - [Core Mechanisms](#core-mechanisms)
 - [API Documentation](#api-documentation)
 - [Tests](#tests)
@@ -790,6 +908,59 @@ Open `http://localhost:5173` and start chatting with Xiaozhi. Vite proxies `/api
 
 ---
 
+## Python Backend (In-house Harness)
+
+The repository ships a **second, independently runnable backend** written in Python
+(FastAPI + an in-house Harness, no Agent framework). It speaks exactly the same wire
+protocol as the Java backend — `POST /xiaozhi/chat` returns a raw
+`text/stream;charset=utf-8` chunked stream — so the Vue frontend needs no changes.
+
+| | Java | Python |
+|---|---|---|
+| Path / port | `guiguXiaozhi_backend/` · 8080 | `guiguXiaozhi_backend_py/` · 8081 |
+| Framework | Spring Boot + LangChain4j | FastAPI + in-house Harness |
+| Retrieval | Milvus dense vectors | Milvus **BM25 + dense RRF hybrid**, idempotent ingestion, atomic alias switch |
+| Observability | none | `/trace` span tree, `/metrics`, redacted `/audit`, `X-Trace-Id` header |
+| Resilience | empty-response retry | retry, model/tool circuit breakers, time budget, rate limit, graceful shutdown, quality gates |
+
+### Start
+
+```bash
+./start-local.sh --python      # Python backend only; Vite /api proxy -> 8081
+./start-local.sh --compare     # both backends + auto A/B report
+
+cd guiguXiaozhi_backend_py
+python3 -m venv .venv && ./.venv/bin/pip install -r requirements.txt
+./.venv/bin/python run.py --port 8081
+```
+
+`vite.config.js` reads `VITE_API_TARGET` (default `http://localhost:8080`);
+`--python` sets it to `http://localhost:8081`. Restart Vite when switching targets.
+
+### Extra endpoints & tooling
+
+| Path | Purpose |
+|---|---|
+| `GET /health` · `GET /ready` | liveness / readiness probes (2s per-probe timeout) |
+| `GET /metrics` · `GET /audit` | QPS, P50/P95, tool success rate; redacted JSONL audit |
+| `GET /traces` · `GET /trace/{id}` · `GET /trace` | trace list, span-tree JSON, visual trace page |
+| `GET /tools` · `GET /docs` | registered tool schemas; FastAPI docs |
+
+```bash
+cd guiguXiaozhi_backend_py
+./.venv/bin/python -m pytest tests/ -q
+./.venv/bin/python scripts/compare.py --questions-file tests/eval/ab_questions.txt --timeout 180
+./.venv/bin/python scripts/e2e_appointment.py --help
+XIAOZHI_PY_BASE_URL=http://127.0.0.1:8082 \
+  ./.venv/bin/python -m pytest tests/integration -q --run-integration
+```
+
+Design and implementation status: `guiguXiaozhi_backend_py/PLAN.md` and
+`改造进度与后续规划.md` (Chinese). PLAN is a pre-implementation design — thresholds
+and filenames in code take precedence. Integration tests are skipped by default.
+
+---
+
 ## Core Mechanisms
 
 ### RAG (Retrieval-Augmented Generation)
@@ -881,4 +1052,4 @@ This is an AI technology demo and educational project. AI-generated content is f
 
 ---
 
-*Last Updated: 2026.03.20*
+*Last Updated: 2026.11.10*

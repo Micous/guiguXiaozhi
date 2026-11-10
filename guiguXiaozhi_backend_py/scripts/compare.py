@@ -100,7 +100,12 @@ async def fetch_trace(
 def summarize_trace(tree: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """从追踪树里统计 span 数与工具调用"""
     if not tree:
-        return {"available": False, "span_count": 0, "tools": []}
+        return {
+            "available": False,
+            "span_count": 0,
+            "tools": [],
+            "retrieval": {"searches": 0, "hit_count": 0, "headings": []},
+        }
 
     spans: List[Dict[str, Any]] = []
 
@@ -120,10 +125,35 @@ def summarize_trace(tree: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         for span in spans
         if span.get("name") == "tool.execute"
     ]
+
+    # 检索命中：从 retrieval.search span 里取（Java 版没有 trace 接口，无法对齐）
+    retrieval_spans = [
+        span for span in spans if span.get("name") == "retrieval.search"
+    ]
+    hit_count = 0
+    headings: List[str] = []
+    for span in retrieval_spans:
+        attrs = span.get("attributes") or {}
+        count = attrs.get("hit_count")
+        if isinstance(count, int):
+            hit_count += count
+        raw_hits = attrs.get("hits")
+        items = raw_hits if isinstance(raw_hits, list) else ([raw_hits] if raw_hits else [])
+        for item in items:
+            if isinstance(item, dict) and item.get("heading_path"):
+                headings.append(str(item["heading_path"]))
+            elif isinstance(item, str) and item:
+                headings.append(item)
+
     return {
         "available": True,
         "span_count": len(spans),
         "tools": [t for t in tools if t],
+        "retrieval": {
+            "searches": len(retrieval_spans),
+            "hit_count": hit_count,
+            "headings": headings[:3],
+        },
         "total_duration_ms": tree.get("summary", {}).get("total_duration_ms"),
     }
 
@@ -164,8 +194,8 @@ def render_markdown(results: List[Dict[str, Any]], args: argparse.Namespace) -> 
         f"- 问题数：{len(results)} · 单请求超时：{args.timeout}s",
         "- 过程可见性：Python 侧通过 `X-Trace-Id` 关联 `/trace/{id}`，Java 侧无追踪接口",
         "",
-        "| # | 问题 | Java 回答 | Python 回答 | Java 耗时 | Python 耗时 | Python span 数 | Python 工具调用 |",
-        "|---|---|---|---|---|---|---|---|",
+        "| # | 问题 | Java 回答 | Python 回答 | Java 耗时 | Python 耗时 | Python span 数 | Python 检索命中 | Python 工具调用 |",
+        "|---|---|---|---|---|---|---|---|---|",
     ]
     def failure(item: Dict[str, Any]) -> str:
         return f"❌ {_cell(item.get('error') or 'HTTP ' + str(item.get('status', '连接失败')))}"
@@ -175,10 +205,19 @@ def render_markdown(results: List[Dict[str, Any]], args: argparse.Namespace) -> 
         trace = item["python_trace"]
         java_text = _cell(java.get("text")) if java.get("ok") else failure(java)
         py_text = _cell(py.get("text")) if py.get("ok") else failure(py)
+        retrieval = trace.get("retrieval") or {}
+        hit_text = (
+            f"{retrieval.get('hit_count', 0)} 命中 / {retrieval.get('searches', 0)} 次检索"
+            if retrieval.get("searches")
+            else "未检索"
+        )
+        headings = retrieval.get("headings") or []
+        if headings:
+            hit_text += "（" + _cell("、".join(headings), 60) + "）"
         lines.append(
             f"| {index} | {_cell(item['question'], 60)} | {java_text} | {py_text} "
             f"| {java.get('elapsed_ms', 0)} ms | {py.get('elapsed_ms', 0)} ms "
-            f"| {trace['span_count']} | {', '.join(trace['tools']) or '—'} |"
+            f"| {trace['span_count']} | {hit_text} | {', '.join(trace['tools']) or '—'} |"
         )
 
     lines += [
@@ -186,12 +225,39 @@ def render_markdown(results: List[Dict[str, Any]], args: argparse.Namespace) -> 
         "## 说明",
         "",
         "- 两端使用**相同 memoryId**，但各自独立存储记忆；首次提问无历史干扰。",
-        "- Java 版没有 trace 接口，过程可见性只能与 Python 侧的 span 数对照。",
+        "- Java 版没有 trace 接口，过程可见性只能与 Python 侧的 span 数对照；"
+        "「Python 检索命中」来自 `retrieval.search` span 的 `hit_count` 与命中章节路径。",
+        "- 挂号/取消是**多轮**流程，A/B 脚本只做单轮双发，落库对齐由 "
+        "`scripts/e2e_appointment.py` 单独验证（见下方小节）。",
         "- 若某端显示 ❌，说明服务未启动或连接失败；先执行 `./start-local.sh` 起中间件，"
         "再分别启动两套后端。",
         "",
     ]
+    lines += _e2e_section(getattr(args, "e2e_report", None))
     return "\n".join(lines)
+
+
+def _e2e_section(path: Optional[str]) -> List[str]:
+    """把 B1 的落库结论并入 B2 报告，形成完整的行为对齐视图。"""
+    if not path or not Path(path).exists():
+        return []
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    return [
+        "## 挂号全链路落库对齐（来自 B1 端到端报告）",
+        "",
+        f"- 目标：`{data.get('base_url')}` · 预约日期 `{data.get('appointment_date')}`",
+        f"- 问诊/分导诊：{'✅' if data.get('consult_ok') else '❌'} · "
+        f"挂号落库：{'✅' if data.get('book_ok') else '❌'}"
+        f"（{data.get('rows_after_book', 0)} 条）· "
+        f"取消删除：{'✅' if data.get('cancel_ok') else '❌'}"
+        f"（剩余 {data.get('rows_after_cancel', 0)} 条）",
+        "- 两套后端共用 `guiguxiaozhi.appointment` 表；Java 侧的落库由相同表结构保证，"
+        "本次端到端验证以 Python 侧为准。",
+        "",
+    ]
 
 
 async def run(args: argparse.Namespace) -> int:
@@ -248,6 +314,11 @@ def main() -> int:
     parser.add_argument("--timeout", type=float, default=120.0, help="单请求超时秒数")
     parser.add_argument("--output", help="Markdown 报告输出路径（不填则打印到 stdout）")
     parser.add_argument("--json", help="结构化 JSON 结果输出路径")
+    parser.add_argument(
+        "--e2e-report",
+        default=str(ROOT / "logs" / "e2e-report.json"),
+        help="B1 端到端报告路径（存在时并入 Markdown 报告，不存在则忽略）",
+    )
     return asyncio.run(run(parser.parse_args()))
 
 

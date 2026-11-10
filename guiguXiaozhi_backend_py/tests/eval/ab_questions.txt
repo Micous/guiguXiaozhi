@@ -1,0 +1,7 @@
+# Java(8080 / LangChain4j) vs Python(8081 / 自研 Harness) 行为对齐问题集
+# 每行一个问题；# 开头为注释。覆盖：知识库事实、分导诊、工具调用、已记录的业务差异。
+# 用法：python scripts/compare.py --questions-file tests/eval/ab_questions.txt --timeout 180
+医院地址在哪里？
+最近总是头痛，应该挂什么科？
+抽血检查需要空腹吗？
+神经内科有哪些专家？

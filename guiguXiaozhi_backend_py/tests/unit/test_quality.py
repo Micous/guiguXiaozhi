@@ -68,3 +68,37 @@ def test_is_empty_turn_helper():
     assert is_empty_turn("  ", [])
     assert not is_empty_turn("", [ToolCall(id="1", name="x", arguments={})])
     assert not is_empty_turn("内容", [])
+
+
+# ---- B1 联调发现的两个缺陷：取消措辞漏报、工具已执行后的总结轮误报 ----
+
+def test_cancel_confirmation_phrasings_are_detected():
+    for text in (
+        "您的预约已成功取消。",
+        "已成功取消预约",
+        "已经为您取消了预约",
+        "取消预约成功",
+        "成功取消了您的挂号",
+    ):
+        assert detect_false_confirmation(text), text
+        assert inspect_turn(ChatTurn(text=text)).false_confirmation, text
+
+
+def test_cancel_intent_is_not_treated_as_confirmation():
+    for text in (
+        "我想取消预约",
+        "如何取消预约？",
+        "取消预约需要本人身份证吗",
+        "已收到您要取消预约的请求，请稍等",
+    ):
+        assert not detect_false_confirmation(text), text
+
+
+def test_tool_executed_suppresses_false_positive_on_summary_turn():
+    """工具执行后模型会再生成一轮没有 tool_calls 的总结文本，不该被判成幻觉。"""
+    assert detect_false_confirmation("预约成功，详情如下", tool_executed=True) is False
+    assert detect_false_confirmation("您的预约已成功取消", tool_executed=True) is False
+    assert detect_false_confirmation("您的预约已成功取消", tool_executed=False) is True
+    finding = inspect_turn(ChatTurn(text="已为您预约成功"), tool_executed=True)
+    assert not finding.false_confirmation
+    assert finding.ok

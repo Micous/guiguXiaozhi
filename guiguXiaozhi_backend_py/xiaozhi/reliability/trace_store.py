@@ -18,6 +18,31 @@ from typing import Any, Dict, List, Optional
 from xiaozhi.reliability.tracing import Span, register_span_sink
 
 
+def _wall_time_ms(spans: List[Dict[str, Any]]) -> float:
+    """一条 trace 的墙钟耗时：最早开始 → 最晚结束。
+
+    父子 span 的区间是**包含关系**——``http.request`` 已经覆盖整轮请求，
+    再把 ``llm.chat`` / ``tool.execute`` 等子 span 的 duration_ms 全部相加
+    会重复计数（实测约为真实耗时的 2 倍）。因此总耗时取时间轴跨度，
+    嵌套、并行、多根 span 都不会被重复累加。
+    """
+    starts: List[datetime] = []
+    ends: List[datetime] = []
+    for span in spans:
+        raw_start, raw_end = span.get("start_time"), span.get("end_time")
+        if not raw_start or not raw_end:
+            continue
+        try:
+            starts.append(datetime.fromisoformat(raw_start))
+            ends.append(datetime.fromisoformat(raw_end))
+        except (TypeError, ValueError):
+            continue
+    if starts and ends:
+        return max(0.0, (max(ends) - min(starts)).total_seconds() * 1000.0)
+    # 兜底：无时间戳的人工构造 span（单测场景）退回各 span 耗时之和
+    return sum(float(s.get("duration_ms") or 0.0) for s in spans)
+
+
 class TraceStore:
     """追踪数据仓库（线程安全）"""
 
@@ -58,9 +83,12 @@ class TraceStore:
                     "input_preview": None,
                 },
             )
-            summary["span_count"] = len(trace["spans"])
-            summary["total_duration_ms"] = round(
-                sum(s["duration_ms"] for s in trace["spans"].values()), 2
+            spans = list(trace["spans"].values())
+            summary["span_count"] = len(spans)
+            # total = 墙钟耗时；span_duration_sum = 各 span 自身耗时之和（诊断用）
+            summary["total_duration_ms"] = round(_wall_time_ms(spans), 2)
+            summary["span_duration_sum_ms"] = round(
+                sum(float(s.get("duration_ms") or 0.0) for s in spans), 2
             )
             if record.get("error"):
                 summary["has_error"] = True
@@ -179,12 +207,24 @@ class TraceStore:
                         continue
                     with self._lock:
                         trace = self._traces.setdefault(trace_id, {"spans": {}, "order": []})
+                        # 每行都是「该 trace 到此为止的完整快照」，重建而非追加，
+                        # 否则同一 span 会在 order 里出现多次（旧实现的历史 bug）。
+                        trace["spans"] = {}
+                        trace["order"] = []
                         for span in raw.get("spans", []):
                             trace["spans"][span["span_id"]] = span
                             trace["order"].append(span["span_id"])
                         self._traces.move_to_end(trace_id)
-                        self._summary[trace_id] = raw.get("summary", {"trace_id": trace_id})
-                    loaded += 1
+                        summary = dict(raw.get("summary") or {"trace_id": trace_id})
+                        summary["span_count"] = len(trace["spans"])
+                        spans = list(trace["spans"].values())
+                        # 重算：兼容旧版本按「所有 span 耗时之和」落盘的 2 倍总时长
+                        summary["total_duration_ms"] = round(_wall_time_ms(spans), 2)
+                        summary["span_duration_sum_ms"] = round(
+                            sum(float(s.get("duration_ms") or 0.0) for s in spans), 2
+                        )
+                        self._summary[trace_id] = summary
+            loaded = len(self._traces)
         except Exception:
             return loaded
         return loaded

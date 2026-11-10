@@ -10,7 +10,9 @@ export default defineConfig({
   server: {
     proxy: {
       '/api': {
-        target: 'http://localhost:8080',
+        // 默认仍指向 Java 版；start-local.sh --python 会注入 VITE_API_TARGET
+        // 切到 Python 版。业务代码（ChatWindow.vue）不需要任何改动。
+        target: process.env.VITE_API_TARGET || 'http://localhost:8080',
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/api/, ''), // 去掉 /api 前缀
       },

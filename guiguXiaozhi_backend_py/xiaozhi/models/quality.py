@@ -25,6 +25,17 @@ _FALSE_CONFIRMATION = re.compile(
     r"|预约号[:：]\s*[A-Za-z0-9-]+"
 )
 
+# 取消类承诺单独处理：真实联调里模型会写「您的预约已成功取消」，
+# 语序与「已取消预约」相反，原来的正则匹配不到（B1 端到端发现的漏报）。
+# 只匹配「完成态」措辞，不匹配「我想取消预约 / 如何取消预约」这类意图或疑问句。
+_CANCEL_CONFIRMATION = re.compile(
+    r"已(?:经)?(?:为您|替您|帮你|替你)?(?:成功)?取消(?:了)?"
+    r"(?:预约|挂号|该预约|本次预约|这次预约)?"
+    r"|(?:预约|挂号)(?:已经)?(?:已)?(?:成功)?取消(?:了|成功)?"
+    r"|取消(?:预约|挂号)?(?:已经)?(?:成功|完成|办理成功)"
+    r"|(?:成功|已经)(?:为您|替您|帮你)?取消(?:了)?(?:预约|挂号)?"
+)
+
 # 工具调用被当成纯文本输出（形如「预约挂号\n{...}」）
 _TEXTUAL_TOOL_CALL = re.compile(
     r"(预约挂号|取消预约|查询是否有号源|查询科室专家)\s*[{\n\r]"
@@ -32,7 +43,8 @@ _TEXTUAL_TOOL_CALL = re.compile(
 
 # 兜底提示：不下结论说预约失败，只提醒以系统记录为准
 FALSE_CONFIRMATION_NOTICE = (
-    "\n\n（提示：本次未检测到系统预约记录，请以查询结果为准，不要视为预约已成功。）"
+    "\n\n（提示：本次未检测到对应的工具执行记录，请以系统查询结果为准，"
+    "不要视为预约或取消已办理成功。）"
 )
 
 
@@ -87,10 +99,17 @@ def detect_false_confirmation(
     has_tool_calls: bool = False,
     tool_executed: bool = False,
 ) -> bool:
-    """是否在没有任何工具调用的情况下声称已预约或已取消成功"""
+    """是否在没有任何工具调用的情况下声称已预约或已取消成功。
+
+    ``tool_executed`` 是**请求级**标志：工具执行后模型会再生成一轮总结文本，
+    那一轮本身没有 tool_calls，但只要本请求内真的执行过工具，就不能算幻觉。
+    """
     if has_tool_calls or tool_executed:
         return False
-    return bool(_FALSE_CONFIRMATION.search(text or ""))
+    text = text or ""
+    return bool(
+        _FALSE_CONFIRMATION.search(text) or _CANCEL_CONFIRMATION.search(text)
+    )
 
 
 def detect_textual_tool_call(text: str) -> bool:

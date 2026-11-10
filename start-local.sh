@@ -3,18 +3,45 @@
 # 硅谷小智 —— 本地一键启动脚本
 #
 # 依赖：
-#   - JDK 17+ / Maven      (后端)
+#   - JDK 17+ / Maven      (Java 版后端)
+#   - Python 3.10+ / venv  (Python 版后端，仅 --python / --with-python 需要)
 #   - Node.js 18+ / npm    (前端)
 #   - Ollama               (本地大模型)
-#   - Docker               (MySQL / MongoDB)
+#   - Docker               (MySQL / MongoDB / Milvus)
+#
+# 用法：
+#   ./start-local.sh                 仅 Java 版 + 前端（默认，行为不变）
+#   ./start-local.sh --python        仅 Python 版 + 前端（/api 代理指向 8081）
+#   ./start-local.sh --with-python   Java + Python 双后端 + 前端（代理仍指 8080）
+#   ./start-local.sh --compare       双后端 + 前端 + 自动生成 A/B 对比报告
 # ============================================================
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BACKEND="$ROOT/guiguXiaozhi_backend"
+PY_BACKEND="$ROOT/guiguXiaozhi_backend_py"
 FRONTEND="$ROOT/guiguXiaozhi_frontend"
 LOG_DIR="$ROOT/logs"
 mkdir -p "$LOG_DIR"
+
+# 启动模式：java（默认） / python / both
+MODE="java"
+RUN_COMPARE=0
+for arg in "$@"; do
+  case "$arg" in
+    --python)      MODE="python" ;;
+    --with-python) MODE="both" ;;
+    --compare)     MODE="both"; RUN_COMPARE=1 ;;
+    -h|--help)
+      echo "用法: ./start-local.sh [--python | --with-python | --compare]"
+      exit 0
+      ;;
+    *)
+      echo "未知参数: ${arg}（可用：--python / --with-python / --compare）" >&2
+      exit 1
+      ;;
+  esac
+done
 
 export PATH="$HOME/.local/bin:$PATH"
 
@@ -47,7 +74,12 @@ PYEOF
 # ---------- 1. 基础环境检查 ----------
 check_deps() {
   local missing=0
-  for cmd in java node npm curl ollama; do
+  local -a required=(node npm curl ollama)
+  # 纯 Python 模式不需要 Java / Maven
+  if [ "$MODE" != "python" ]; then
+    required+=(java)
+  fi
+  for cmd in "${required[@]}"; do
     if command -v "$cmd" >/dev/null 2>&1; then
       ok "✔ $cmd 已安装"
     else
@@ -55,9 +87,18 @@ check_deps() {
       missing=1
     fi
   done
-  if ! command -v mvn >/dev/null 2>&1; then
+  if [ "$MODE" != "python" ] && ! command -v mvn >/dev/null 2>&1; then
     warn "! 未找到 mvn，请执行: brew install maven  （或解压 Maven 到 ~/tools 并加入 PATH）"
     missing=1
+  fi
+  if [ "$MODE" != "java" ]; then
+    if [ -x "$PY_BACKEND/.venv/bin/python" ]; then
+      ok "✔ Python 版虚拟环境已就绪"
+    else
+      err "✘ 缺少 Python 版虚拟环境：$PY_BACKEND/.venv/bin/python"
+      err "  请先执行：cd $PY_BACKEND && python3 -m venv .venv && ./.venv/bin/pip install -r requirements.txt"
+      missing=1
+    fi
   fi
   [ "$missing" -eq 0 ] || { err "请先补齐上述依赖"; exit 1; }
 }
@@ -211,8 +252,62 @@ start_backend() {
   exit 1
 }
 
+# ---------- 4b. Python 版后端（可选） ----------
+start_backend_py() {
+  log "正在启动 Python 版后端 (FastAPI :8081) ..."
+
+  # 8081 可能已被用户手动启动的旧进程占用：不主动杀，避免打断正在运行的会话
+  if curl -s --noproxy '*' --max-time 2 http://localhost:8081/health >/dev/null 2>&1; then
+    warn "! 8081 已有服务在监听，跳过启动（不会中断现有进程）"
+    warn "  若要用新代码替换，请先手动停止该进程再重跑本脚本"
+    return 0
+  fi
+
+  cd "$PY_BACKEND"
+  : > "$LOG_DIR/backend-py.log"
+  local py_pid
+  py_pid="$(start_detached "$LOG_DIR/backend-py.log" "$PY_BACKEND/.venv/bin/python" run.py)"
+  echo "$py_pid" > "$LOG_DIR/backend-py.pid"
+
+  # 启动含 RAG 灌库（首次约 30s），留足等待时间
+  for i in $(seq 1 90); do
+    if curl -s --noproxy '*' --max-time 2 http://localhost:8081/health >/dev/null 2>&1; then
+      ok "✔ Python 版后端启动成功 → http://localhost:8081"
+      return 0
+    fi
+    if ! kill -0 "$py_pid" 2>/dev/null; then
+      err "✘ Python 版后端进程已退出，日志：$LOG_DIR/backend-py.log"
+      tail -30 "$LOG_DIR/backend-py.log"
+      exit 1
+    fi
+    sleep 2
+  done
+  err "✘ Python 版后端启动超时（含 RAG 灌库），请查看 $LOG_DIR/backend-py.log"
+  exit 1
+}
+
+run_compare() {
+  local questions="$PY_BACKEND/tests/eval/ab_questions.txt"
+  log "正在生成 Java / Python A/B 对比报告 ..."
+  NO_PROXY='*' no_proxy='*' "$PY_BACKEND/.venv/bin/python" \
+    "$PY_BACKEND/scripts/compare.py" \
+    --java http://localhost:8080 --python http://localhost:8081 \
+    --questions-file "$questions" --timeout 180 \
+    --output "$LOG_DIR/ab-report.md" --json "$LOG_DIR/ab-report.json" \
+    || warn "! 对比脚本未完全成功，请检查 $LOG_DIR/ab-report.md"
+  ok "✔ 对比报告：$LOG_DIR/ab-report.md"
+}
+
 # ---------- 5. 前端 ----------
 start_frontend() {
+  # 只切换代理目标，前端业务代码零改动；默认仍指向 Java 版
+  local api_target="http://localhost:8080"
+  if [ "$MODE" = "python" ]; then
+    api_target="http://localhost:8081"
+  fi
+  export VITE_API_TARGET="$api_target"
+  ok "前端 /api 代理 → $api_target"
+
   log "正在安装前端依赖 ..."
   cd "$FRONTEND"
   [ -d node_modules ] || npm install
@@ -242,14 +337,37 @@ check_deps
 start_middleware
 check_ollama
 start_milvus
-start_backend
+case "$MODE" in
+  java)   start_backend ;;
+  python) start_backend_py ;;
+  both)   start_backend; start_backend_py ;;
+esac
 start_frontend
+if [ "$RUN_COMPARE" -eq 1 ]; then
+  run_compare
+fi
 
 echo ""
-ok "全部服务已启动 🚀"
+ok "全部服务已启动 🚀（模式：$MODE）"
 echo "    前端页面 : http://localhost:5173"
-echo "    后端接口 : http://localhost:8080/xiaozhi/chat"
-echo "    接口文档 : http://localhost:8080/doc.html"
+case "$MODE" in
+  java)
+    echo "    后端接口 : http://localhost:8080/xiaozhi/chat"
+    echo "    接口文档 : http://localhost:8080/doc.html"
+    ;;
+  python)
+    echo "    后端接口 : http://localhost:8081/xiaozhi/chat"
+    echo "    接口文档 : http://localhost:8081/docs"
+    echo "    追踪页面 : http://localhost:8081/trace"
+    echo "    运行指标 : http://localhost:8081/metrics"
+    ;;
+  both)
+    echo "    Java 后端 : http://localhost:8080/xiaozhi/chat"
+    echo "    Python 后端: http://localhost:8081/xiaozhi/chat"
+    echo "    追踪 / 指标: http://localhost:8081/trace  · /metrics"
+    echo "    A/B 对比  : $LOG_DIR/ab-report.md"
+    ;;
+esac
 echo "    日志目录 : $LOG_DIR"
 echo ""
 echo "停止所有服务请执行: ./stop-local.sh"

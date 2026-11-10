@@ -47,7 +47,8 @@ class FakeAssembled:
     dropped_items = 0
     total_tokens = 0
 
-    def to_messages(self, user_input):
+    def to_messages(self, user_input, *, neutralize_history: bool = False):
+        self.neutralize_history = neutralize_history
         return [{"role": "user", "content": user_input}]
 
 

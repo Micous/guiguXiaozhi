@@ -59,7 +59,11 @@ python run.py
   只在**尚未向用户吐出任何文本**时允许重试，避免前端出现重复文字。
 - **模型熔断**：连续失败达到阈值后打开，返回本地规则分导诊建议（只给方向，绝不声称预约成功）。
 - **工具级熔断**：某个工具在本轮连续失败 N 次后停用，防止死循环。
-- **幻觉防护**：没调工具却说"已为您预约成功"时追加提示，并在 trace 与指标留痕。
+- **幻觉防护**：没调工具却声称"已预约 / 已取消成功"时追加提示，并在 trace 与指标留痕；
+  覆盖"您的预约已成功取消"这类反序措辞，且**工具确实执行过的总结轮不算幻觉**。
+- **历史去完成态**：操作类请求组装上下文时，把历史里"预约成功/已取消"的断言替换为中性短句，
+  避免小模型误以为本次操作已办完而跳过工具调用（实测踩坑记录 7.1）。
+  只影响发给模型的上下文，持久化记忆与用户可见回答不变。
 - **降级**：Milvus 挂 → 跳过 RAG；MongoDB 挂 → 文件记忆；记忆写失败 → 不阻断对话。
 - **护栏**：输入超长截断、注入只留痕不误拦，输出敏感信息（身份证/手机号/密钥）统一打码。
 - **优雅停机**：SIGTERM 后停止收新请求，等在途请求排空再释放连接。
@@ -69,21 +73,42 @@ python run.py
 
 ```bash
 python scripts/eval_rag.py                # 检索召回评估（纯向量 vs 混合检索）
-pytest tests/ -q                          # 全量单测（不依赖外部服务）
+pytest tests/ -q                          # 全量单测（不依赖外部服务，默认跳过集成测试）
 python scripts/compare.py --help          # Java vs Python A/B 对比用法
+python scripts/e2e_appointment.py --help  # 挂号 → MySQL → 取消 端到端联调
 ```
 
-对比示例（两端都要先启动）：
+**集成测试**打真实 Ollama / Milvus / MySQL / MongoDB，默认全部跳过，需显式开启并指定
+一套已启动的**新版**后端（旧进程没有 `/metrics`，夹具会给出明确报错）：
+
+```bash
+XIAOZHI_PY_BASE_URL=http://127.0.0.1:8082 \
+  pytest tests/integration -q --run-integration
+```
+
+**端到端联调**用同一 `memoryId` 连续多轮对话，从追踪树确认工具真的被调用，
+并直连 MySQL 核对 `appointment` 表的写入与删除。`--base-url` 可传 Vite 代理地址，
+用来验证"前端业务代码零改动"：
+
+```bash
+python scripts/e2e_appointment.py --base-url http://127.0.0.1:5174/api \
+  --output logs/e2e-report.json
+```
+
+**A/B 对比**（两端都要先启动），报告含回答文本、耗时、Python 侧 span 数、检索命中与工具调用：
 
 ```bash
 python scripts/compare.py \
   --java http://localhost:8080 --python http://localhost:8081 \
-  --question "医院地址在哪里？" \
-  --output report.md --json report.json
+  --questions-file tests/eval/ab_questions.txt --timeout 180 \
+  --output logs/ab-report.md --json logs/ab-report.json
 ```
 
-> `compare.py` 的 `memoryId` 必须是**数字**：Java 版 `ChatForm.memoryId` 是 `Long`，
-> 传字符串会直接被 Jackson 拒绝。
+> - `compare.py` 的 `memoryId` 必须是**数字**：Java 版 `ChatForm.memoryId` 是 `Long`，
+>   传字符串会直接被 Jackson 拒绝。
+> - 若已生成 `logs/e2e-report.json`，A/B 报告会自动附上挂号全链路的落库结论。
+> - trace 的 `total_duration_ms` 是**墙钟耗时**（最早 span 开始 → 最晚结束），
+>   不是各 span 耗时之和；后者单独记为 `span_duration_sum_ms`。
 
 ## 容器化
 
