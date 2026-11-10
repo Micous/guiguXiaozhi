@@ -256,3 +256,60 @@ def test_department_hint_lists_real_departments():
     assert "本院科室有：呼吸内科、神经内科。" in hint
     # 必须提示模型：用户说的科室不在清单里时，先说明并让用户确认
     assert "先向用户说明本院没有该科室" in hint
+
+
+# ---- QuerySlotTool 参数先行校验（2026-11-10 第五轮联调） ----
+
+def _slot_tool(available=True):
+    slot = FakeSlotService(available=available)
+    return QuerySlotTool(slot, FakeDoctorService()), slot
+
+
+def test_slot_query_missing_time_asks_user_not_fake_no_slots():
+    """模型漏传时段 → 让模型去问用户，绝不能包装成『没有号源』"""
+    tool, slot = _slot_tool()
+    result = await_call(tool, {"department": "神经内科", "date": "2026-11-20"})
+    assert not result.success
+    assert result.error_type == "ValidationError"
+    assert "上午" in result.content and "下午" in result.content
+    assert slot.calls == []  # 参数不全根本不该查号源服务
+
+
+def test_slot_query_nonexistent_department_is_validation_error():
+    """「内科」不存在 → 明确说『本院没有该科室』，而不是『没有号源』"""
+    tool, slot = _slot_tool()
+    result = await_call(
+        tool, {"department": "内科", "date": "2026-11-20", "time": "上午"}
+    )
+    assert not result.success
+    assert result.error_type == "ValidationError"
+    assert "本院没有【内科】" in result.content
+    assert "神经内科" in result.content  # 带上真实科室清单
+    assert slot.calls == []
+
+
+def test_slot_query_missing_date_is_validation_error():
+    tool, _slot = _slot_tool()
+    result = await_call(tool, {"department": "神经内科", "time": "上午"})
+    assert not result.success
+    assert "日期" in result.content
+
+
+def test_slot_query_unavailable_relays_real_reason():
+    """真没号源时如实转述原因（号源已满），不再套"暂时没有可预约的号源"前缀"""
+    tool, _slot = _slot_tool(available=False)
+    result = await_call(
+        tool, {"department": "神经内科", "date": "2026-11-20", "time": "上午"}
+    )
+    assert result.success
+    assert "暂时没有可预约的号源" not in result.content
+    assert "号源已满" in result.content
+
+
+def test_slot_query_available_returns_message():
+    tool, _slot = _slot_tool()
+    result = await_call(
+        tool, {"department": "神经内科", "date": "2026-11-20", "time": "上午"}
+    )
+    assert result.success
+    assert "有号源" in result.content

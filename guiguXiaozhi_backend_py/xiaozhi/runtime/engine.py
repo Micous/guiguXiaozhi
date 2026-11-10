@@ -271,6 +271,10 @@ class AgentEngine:
             # 只看 tool_calls 会把失败调用也当成已预约（2026-11-10 事故根因）。
             booking_executed_success = False
             cancel_executed_success = False
+            # 本请求里查询工具（号源/科室专家）真实执行成功过 →
+            # 模型转述"查询结果显示…"是真话，不能当编造拦截
+            # （booking/cancel 的 legit 标记不覆盖查询，需要单独跟踪）。
+            query_executed_success = False
             tool_results: List[Message] = []
             tool_failures: Dict[str, int] = {}
             # 最近一次工具失败（工具名 / 错误类型 / 原始反馈），
@@ -397,6 +401,13 @@ class AgentEngine:
                                     )
                                     continue
                                 match = None if claim_is_legit else claim_span(turn_buffer)
+                                if (
+                                    match is not None
+                                    and match[0] == "query"
+                                    and query_executed_success
+                                ):
+                                    # 查询工具真的执行过 → "查询结果显示…"是真话
+                                    match = None
                                 if match is not None:
                                     kind, start, _end = match
                                     truncated_claim = kind
@@ -513,10 +524,12 @@ class AgentEngine:
                                     corrective_pending = True
                                     corrective_kind = "tool_call"
                                     llm_span.set_attribute("corrective_retry_scheduled", True)
-                            if finding.false_confirmation:
+                            claim = truncated_claim or claim_kind(detected_text)
+                            if finding.false_confirmation or (
+                                claim == "query" and not query_executed_success
+                            ):
                                 self.metrics.inc("hallucination_suspected")
                                 llm_span.set_attribute("hallucination_suspected", True)
-                                claim = truncated_claim or claim_kind(detected_text)
                                 llm_span.set_attribute("claim_kind", claim)
                                 if corrective_used == 0 and not prior_booking:
                                     # 先不追加免责提示——注入纠正提示重试一轮，
@@ -669,6 +682,8 @@ class AgentEngine:
                                 booking_executed_success = True
                             elif call.name == "取消预约挂号":
                                 cancel_executed_success = True
+                            elif call.name in ("查询是否有号源", "查询科室专家"):
+                                query_executed_success = True
                         else:
                             tool_failures[call.name] = tool_failures.get(call.name, 0) + 1
                             # 记住**失败原因**：模型编造"预约成功"时，兜底文案要

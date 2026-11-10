@@ -237,3 +237,45 @@ def test_fallback_reflects_real_tool_failure():
     # 没有工具失败信息时用通用文案
     assert fallback_for("book", None) == FALLBACK_BOOKING_NOT_DONE
     assert fallback_for("cancel", None) == FALLBACK_CANCEL_NOT_DONE
+
+
+# ---- 编造查询结果检测（2026-11-10 第五轮联调新增） ----
+
+def test_query_result_claim_is_detected_with_kind_query():
+    """没调工具却报"查询结果显示…" → kind=query，流式截断依据"""
+    span = claim_span("好的，查询结果显示，内科暂时没有可预约的号源。")
+    assert span is not None and span[0] == "query"
+    assert claim_span("查询结果：神经内科有号源")[0] == "query"
+    assert claim_span("神经内科的号源已约满")[0] == "query"
+
+
+def test_query_question_is_not_a_claim():
+    """疑问/条件语境不能误伤："有没有号源吗"里包含"没有(可预约的)号源"的近形"""
+    for text in (
+        "请问您想查询内科有没有号源吗？",
+        "您是想问神经内科有没有号源吗？",
+        "如果号源已约满，可以换个时段。",
+    ):
+        assert claim_span(text) is None, text
+
+
+def test_query_corrective_uses_action_prompt():
+    from xiaozhi.models.quality import corrective_prompt
+
+    assert corrective_prompt("query") == corrective_prompt("action")
+    assert "工具" in corrective_prompt("query")
+
+
+def test_query_fallback_reflects_no_execution():
+    from xiaozhi.models.quality import FALLBACK_QUERY_NOT_EXECUTED
+
+    assert fallback_for("query", None) == FALLBACK_QUERY_NOT_EXECUTED
+    assert "没有实际执行" in FALLBACK_QUERY_NOT_EXECUTED
+
+
+def test_narrated_query_promise_is_detected():
+    """「我将查询…号源」这种口头承诺也要被 narrated 检测抓住"""
+    from xiaozhi.models.quality import detect_narrated_tool_call
+
+    assert detect_narrated_tool_call("好的，我将查询2026年11月11日内科是否有号源。")
+    assert not detect_narrated_tool_call("建议您挂神经内科，注意休息。")

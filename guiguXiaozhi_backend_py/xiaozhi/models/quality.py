@@ -79,8 +79,21 @@ _NARRATED_TOOL_CALL = re.compile(
     r"(?:调用|使用|发起|执行|提交)[^。！？\n]{0,12}工具"
     r"|(?:调用|使用)[^。！？\n]{0,10}(?:预约挂号|取消预约挂号|查询是否有号源|查询科室专家)"
     r"|(?:我将|我这就|马上|稍后|接下来)[^。！？\n]{0,16}"
-    r"(?:为您)?(?:提交|发起|办理|执行)[^。！？\n]{0,12}"
-    r"(?:预约请求|挂号请求|预约|挂号|取消预约|查询)"
+    r"(?:为您)?(?:提交|发起|办理|执行|查询)[^。！？\n]{0,16}"
+    r"(?:预约请求|挂号请求|预约|挂号|取消预约|查询|号源)"
+)
+
+# 没调查询工具却**报告查询结果**（"查询结果显示，内科没有号源"）。
+# 2026-11-10 第五轮联调实测：模型口头说"我将查询…"，然后直接编出
+# "查询结果显示，2026年11月11日内科暂时没有可预约的号源"——同一轮零工具调用。
+# 这类谎报比"承诺要调"更恶劣：用户会以为号源真的查过了。
+# 措辞刻意不用裸的"没有号源"——"有没有号源吗"会误伤
+# （有没有号源 包含 没有号源 子串），疑问语境另有 _is_conditional_context 兜底。
+_QUERY_RESULT_CLAIM = re.compile(
+    r"查询结果显示|查询结果[：为]"
+    r"|没有可预约的号源"
+    r"|号源已(全部)?约满"
+    r"|还有?\s*\d+\s*个号"
 )
 
 # 兜底提示：不下结论说预约失败，只提醒以系统记录为准
@@ -147,6 +160,11 @@ FALLBACK_CANCEL_NOT_DONE = (
     "请核对姓名、身份证号、科室、日期与时段后重试。"
 )
 
+FALLBACK_QUERY_NOT_EXECUTED = (
+    "抱歉，本次查询没有实际执行——系统没有生成查询结果，"
+    "刚才的号源信息不可信。请告诉我科室、日期和时段，我会重新为您查询。"
+)
+
 
 # 条件/疑问语境标记：出现在承诺**之前**时，说明这不是"已完成"的断言，
 # 而是"如果…还没预约成功…"这类指导语，不该被当成幻觉拦截。
@@ -177,12 +195,16 @@ def claim_span(text: str) -> Optional[Tuple[str, int, int]]:
     指导语不是完成态断言，不能拦（否则会把正常回答拦腰截断）。
 
     Returns:
-        ("book"|"cancel", start, end) 或 None
+        ("book"|"cancel"|"query", start, end) 或 None
     """
     if not text:
         return None
     best: Optional[Tuple[str, int, int]] = None
-    for kind, regex in (("cancel", _CANCEL_CONFIRMATION), ("book", _FALSE_CONFIRMATION)):
+    for kind, regex in (
+        ("cancel", _CANCEL_CONFIRMATION),
+        ("book", _FALSE_CONFIRMATION),
+        ("query", _QUERY_RESULT_CLAIM),
+    ):
         for match in regex.finditer(text):
             if _is_conditional_context(text, match.start()):
                 continue
@@ -195,7 +217,7 @@ def claim_kind(text: str) -> Optional[str]:
     """判断文本里的成功承诺属于哪类操作。
 
     Returns:
-        "book" / "cancel" / None
+        "book" / "cancel" / "query" / None
     """
     span = claim_span(text)
     return span[0] if span else None
@@ -209,6 +231,9 @@ def corrective_prompt(kind: Optional[str]) -> str:
         return CORRECTIVE_PROMPT_ACTION
     if kind == "tool_call":
         return CORRECTIVE_PROMPT_TOOL_CALL
+    if kind == "query":
+        # 编造查询结果 → 用通用的"别描述、真调工具"纠正提示
+        return CORRECTIVE_PROMPT_ACTION
     return CORRECTIVE_PROMPT_BOOK
 
 
@@ -239,6 +264,8 @@ def fallback_for(
     """
     if kind == "cancel":
         base = FALLBACK_CANCEL_NOT_DONE
+    elif kind == "query":
+        base = FALLBACK_QUERY_NOT_EXECUTED
     else:
         base = FALLBACK_BOOKING_NOT_DONE
 

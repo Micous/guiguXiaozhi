@@ -293,15 +293,52 @@ class QuerySlotTool(Tool):
         data_in = normalize_arguments(
             params, ["department", "date", "time", "doctor_name"]
         )
+        department = str(data_in.get("department") or "").strip()
+        date_str = str(data_in.get("date") or "").strip()
+        time_slot = str(data_in.get("time") or "").strip()
+
+        # ---- 参数先行校验，缺什么直接 fail 并给出纠正指引 ----
+        # 2026-11-10 第五轮联调实测：模型漏传时段，slot_service 提前返回
+        # "时段只能是上午或下午"，本工具却把它包装成
+        # ok("暂时没有可预约的号源。时段只能是…") → 模型转述成
+        # "内科没有号源"，用户被误导成"号源查过了、确实没有"。
+        # 参数问题必须让模型**去问用户**，而不是当作查询结果。
+        try:
+            departments = sorted(self.doctor_service.list_departments() or [])
+        except Exception:
+            departments = []
+        if not department:
+            return ToolResult.fail(
+                "缺少科室名称。请向用户询问要查询哪个科室的号源。",
+                error_type="ValidationError",
+            )
+        if departments and department not in departments:
+            return ToolResult.fail(
+                f"本院没有【{department}】这个科室。本院科室有：{'、'.join(departments)}。"
+                "请先向用户说明本院没有该科室，推荐最接近的真实科室，"
+                "等用户确认后再查询，不要把不存在当成'没有号源'。",
+                error_type="ValidationError",
+            )
+        if not date_str:
+            return ToolResult.fail(
+                "缺少就诊日期。请向用户询问就诊日期（格式如 2026-11-20）。",
+                error_type="ValidationError",
+            )
+        if not time_slot:
+            return ToolResult.fail(
+                "缺少预约时段。请向用户询问是上午还是下午，确认后再查询号源。",
+                error_type="ValidationError",
+            )
+
         availability = self.slot_service.check(
-            data_in.get("department", ""),
-            data_in.get("date", ""),
-            data_in.get("time", ""),
-            data_in.get("doctor_name"),
+            department, date_str, time_slot, data_in.get("doctor_name")
         )
         if availability.available:
             return ToolResult.ok(availability.message)
-        return ToolResult.ok(f"暂时没有可预约的号源。{availability.message}")
+        # 不可用的真实原因（周末不出诊 / 已约满 / 暂无排班 / 科室不存在）
+        # message 里已经说清楚了，直接转述即可——
+        # 不要再套"暂时没有可预约的号源"这种一概而论的误导前缀。
+        return ToolResult.ok(availability.message)
 
 
 class QueryDoctorsTool(Tool):
