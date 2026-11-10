@@ -118,8 +118,11 @@ class MilvusProfileVectorStore(ProfileVectorStore):
         self._embed_fn = embed_fn
         self._dimension = dimension
         self._collection = collection
-        self._client = MilvusClient(uri=milvus_uri, alias=alias)
         self._alias = alias
+        # 注意：MilvusClient 不能传 alias（与内部 Connections.connect 冲突，
+        # 实测报 "got multiple values for argument 'alias'"）；
+        # alias 仅作日志标识，连接由 MilvusClient 自管理（与主知识库一致）。
+        self._client = MilvusClient(uri=milvus_uri)
         if not self._client.has_collection(collection):
             schema = self._client.create_schema(auto_id=True, enable_dynamic_field=False)
             schema.add_field("id", DataType.INT64, is_primary=True)
