@@ -84,19 +84,39 @@ class Application:
         self.audit.close()
 
 
-def load_system_prompt() -> str:
+def load_system_prompt(doctor_service=None) -> str:
     """读取系统提示词（与 Java 版同一份内容），并替换模板变量。
 
     Java 版用的是 LangChain4j 的 PromptTemplate，``{{current_date}}`` 会自动替换；
     这里自己替换，否则模型会看到字面量 ``{{current_date}}``。
+
+    2026-11-10 第八轮事故：用户问"有内科吗"被意图层当成知识问答（注入 RAG），
+    模型拿通用医学知识答"内科是一个较大的科室，包含了多个亚专科"——
+    本院根本没有"内科"这个科室。工具描述里的科室清单只有模型主动看工具时才可见，
+    system prompt 必须带权威名单，模型回答科室存在性问题时才有依据。
     """
     from datetime import date
 
     path = PROMPT_DIR / "xiaozhi-prompt.txt"
     if not path.exists():
-        return "你是硅谷小智，北京协和医院的智能客服与医疗顾问。"
-    text = path.read_text(encoding="utf-8")
-    return text.replace("{{current_date}}", date.today().isoformat())
+        text = "你是硅谷小智，北京协和医院的智能客服与医疗顾问。"
+    else:
+        text = path.read_text(encoding="utf-8")
+    text = text.replace("{{current_date}}", date.today().isoformat())
+
+    if doctor_service is not None:
+        try:
+            departments = sorted(doctor_service.list_departments() or [])
+        except Exception:
+            departments = []
+        if departments:
+            text += (
+                "\n\n9、本院开设科室（权威名单，回答“本院有没有某科室”时必须以此为准）："
+                + "、".join(departments)
+                + "。名单里没有的科室（如泛称的“内科”）不要用通用医学知识搪塞，"
+                "直接说明本院未开设并推荐名单里最接近的科室。"
+            )
+    return text
 
 
 async def get_application(settings: Optional[Settings] = None) -> Application:
@@ -256,7 +276,7 @@ async def get_application(settings: Optional[Settings] = None) -> Application:
             token_budget=settings.memory_token_budget,
             summarizer=rule_based_summary,
         ),
-        system_prompt=load_system_prompt(),
+        system_prompt=load_system_prompt(doctor_service),
         retriever=rag,
         max_turns=settings.max_turns,
         max_tool_calls=settings.max_tool_calls,

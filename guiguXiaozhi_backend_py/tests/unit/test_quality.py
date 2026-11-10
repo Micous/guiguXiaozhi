@@ -304,3 +304,21 @@ def test_narrated_renamed_promise_variants_are_detected():
     assert not detect_narrated_tool_call("我将为您介绍预约挂号的流程。")
     assert not detect_narrated_tool_call("我为您讲解一下如何查询就诊记录。")
     assert not detect_narrated_tool_call("本院预约放号时间为每天早上7点。")
+
+
+def test_narrated_recommend_doctor_promise_is_detected():
+    """第八轮事故（2026-11-10）：「我可以为您推荐一位内科医生」零工具调用放行。
+
+    用户问"有内科吗"，模型答"内科包含多个亚专科……我可以为您推荐一位内科医生"
+    ——推荐医生必须走"查询科室专家"工具，口头承诺等于什么都没发生。
+    """
+    from xiaozhi.models.quality import detect_narrated_tool_call
+
+    assert detect_narrated_tool_call("我可以为您推荐一位内科医生。")
+    assert detect_narrated_tool_call(
+        "根据您的描述……如果没有特别的偏好，我可以为您推荐一位内科医生。"
+    )
+    assert detect_narrated_tool_call("我能帮您查询呼吸内科的号源。")
+    # 不误伤：泛化推荐（非挂号业务对象）、教学句
+    assert not detect_narrated_tool_call("我可以为您推荐一些日常保健的注意事项。")
+    assert not detect_narrated_tool_call("我可以为您总结预约挂号的三种方式。")

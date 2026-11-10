@@ -39,6 +39,23 @@ def test_recommend_doctor_is_operation():
         assert is_operation_request(msg), msg
 
 
+def test_department_existence_question_is_operation():
+    """问"本院有没有某科室"必须按操作类处理（第八轮事故，2026-11-10）。
+
+    "有内科吗"旧正则漏判 → 注入 RAG → 模型拿通用医学知识答
+    "内科是一个较大的科室，包含了多个亚专科"——本院根本没有"内科"。
+    """
+    for msg in ("有内科吗？", "有内科吗", "你们医院有内科吗", "有没有儿科", "是否有康复科"):
+        assert is_operation_request(msg), msg
+        assert not should_inject_knowledge(msg), msg
+
+
+def test_department_smalltalk_not_operation():
+    """含"科"的闲聊/比较句不应误判成操作类"""
+    for msg in ("有的科室比较偏", "内科和心内科有什么区别？", "怎么选择科室", "我有空吗"):
+        assert not is_operation_request(msg), msg
+
+
 def test_plain_questions_are_not_operation():
     for msg in (
         "你好",
