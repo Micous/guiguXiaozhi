@@ -9,7 +9,7 @@ import static dev.langchain4j.service.spring.AiServiceWiringMode.EXPLICIT;
 //智能体
 @AiService(
     wiringMode = EXPLICIT,
-    chatModel = "qwenChatModel",
+    chatModel = "ollamaChatModel",
     chatMemory = "chatMemory"
     )
 public interface MemoryChatAssistant {

@@ -1,0 +1,15 @@
+{
+  "description": "RAG 召回评估集：每个问题标注期望命中的关键词。改动解析/分块/检索策略后跑这个，能立刻看出召回有没有掉。",
+  "cases": [
+    {"query": "抽血需要空腹吗？", "expect": ["空腹"], "type": "keyword"},
+    {"query": "我最近经常头痛，还有点恶心，应该挂什么科？", "expect": ["头痛"], "type": "triage"},
+    {"query": "医保怎么报销？", "expect": ["医保"], "type": "keyword"},
+    {"query": "医院在哪里？地址是什么？", "expect": ["帅府园"], "type": "keyword"},
+    {"query": "胃镜检查要注意什么？", "expect": ["胃镜"], "type": "keyword"},
+    {"query": "什么时间门诊？", "expect": ["门诊时间"], "type": "keyword"},
+    {"query": "做核磁共振要摘金属吗？", "expect": ["核磁共振"], "type": "keyword"},
+    {"query": "失眠看什么科？", "expect": ["失眠"], "type": "triage"},
+    {"query": "号源每天几点更新？", "expect": ["16:00"], "type": "keyword"},
+    {"query": "儿科有哪些专家？", "expect": ["儿科"], "type": "keyword"}
+  ]
+}

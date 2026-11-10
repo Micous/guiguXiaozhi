@@ -26,6 +26,9 @@
 - [技术架构](#技术架构)
 - [项目结构](#项目结构)
 - [快速开始](#快速开始)
+  - [本地一键启动（Ollama + Docker，推荐）](#-本地一键启动ollama--docker推荐)
+  - [本地化改造说明](#本地化改造说明)
+  - [手动启动](#-手动启动不使用脚本)
 - [核心机制解析](#核心机制解析)
 - [API 文档](#api-文档)
 - [测试](#测试)
@@ -189,8 +192,15 @@ guiguXiaozhi/
 │       │   │   ├── MemoryChatAssistant.java # 记忆功能示例
 │       │   │   └── SeparateChatAssistant.java # 多用户隔离示例
 │       │   ├── config/                      # Bean 装配
-│       │   │   ├── XiaozhiAgentConfig.java  # ChatMemoryProvider + RAG ContentRetriever
-│       │   │   └── EmbeddingStoreConfig.java# Pinecone 向量存储
+│       │   │   ├── OllamaConfig.java        # ★ 本地大模型（对话 / 流式 / 向量化）配置
+│       │   │   ├── XiaozhiAgentConfig.java  # ChatMemoryProvider + RAG 检索增强
+│       │   │   ├── EmbeddingStoreConfig.java# ★ Milvus 向量库 + 知识库灌入
+│       │   │   └── MedicalServiceConfig.java# 院内系统装配（Mock 号源 / 真实专家检索）
+│       │   ├── service/                     # 院内数据访问层
+│       │   │   ├── SlotService.java         # ★ 号源查询接口（真实 HIS 扩展点）
+│       │   │   ├── DoctorService.java       # ★ 专家名录接口
+│       │   │   ├── mock/MockSlotService.java# ★ 号源 Mock 实现（调不通的外部接口）
+│       │   │   └── impl/VectorStoreDoctorService.java # 专家名录（查 Milvus，真实检索）
 │       │   ├── controller/XiaozhiController.java  # POST /xiaozhi/chat
 │       │   ├── tools/                       # Function Calling 工具
 │       │   │   ├── AppointmentTools.java    # ★ 预约 / 取消 / 查号源
@@ -201,17 +211,157 @@ guiguXiaozhi/
 │       └── main/resources/
 │           ├── application.properties       # 模型 / 数据库 / 向量库配置
 │           ├── xhaozhi-prompt-template.txt  # ★ System Prompt（角色与规则）
+│           ├── knowledge/                   # ★ 本地知识库（启动时自动向量化写入 Milvus）
+│           │   ├── 医院信息.md
+│           │   ├── 科室信息.md
+│           │   ├── 神经内科.md
+│           │   └── doctors.md                # 专家名单（专家名录检索的数据源）
 │           └── mapper/AppointmentMapper.xml
-└── guiguXiaozhi_frontend/                   # 前端（Vue 3 + Vite）
-    └── src/
-        ├── App.vue                          # 应用入口
-        ├── components/ChatWindow.vue        # ★ 核心聊天组件（流式渲染 / 会话管理）
-        └── main.js                          # Element Plus 注册
+├── guiguXiaozhi_frontend/                   # 前端（Vue 3 + Vite）
+│   └── src/
+│       ├── App.vue                          # 应用入口
+│       ├── components/ChatWindow.vue        # ★ 核心聊天组件（流式渲染 / 会话管理）
+│       └── main.js                          # Element Plus 注册
+├── start-local.sh                           # ★ 本地一键启动（中间件 + 前后端）
+├── stop-local.sh                            # 停止本地服务
+└── logs/                                    # 运行日志（backend.log / frontend.log）
 ```
 
 ---
 
 ## 快速开始
+
+### 🚀 本地一键启动（Ollama + Docker，推荐）
+
+本仓库已改造为**完全本地化运行**：大模型走本机 Ollama，MySQL / MongoDB 走 Docker，
+无需任何云端 API Key，也不需要 Pinecone 云端向量库。
+
+```bash
+# 1. 准备依赖（仅首次）
+brew install maven                       # 后端构建
+ollama pull qwen2.5:7b                  # 对话 / 流式对话模型（支持 Function Calling）
+ollama pull andersc/qwen3-embedding:0.6b # 向量化模型（1024 维）
+
+# 2. 一键启动（自动拉起 MySQL / MongoDB 容器、建表、启动前后端）
+./start-local.sh
+
+# 3. 打开浏览器
+open http://localhost:5173
+```
+
+`start-local.sh` 会自动完成：
+
+| 步骤 | 说明 |
+|------|------|
+| 环境检查 | 校验 Java / Node / Maven / Ollama / Docker |
+| 中间件 | 启动 `guigu-mysql`（3306）与 `guigu-mongo`（27017）容器，并初始化 `appointment` 表 |
+| 大模型 | 校验 Ollama 服务与所需模型是否就绪 |
+| 后端 | `mvn spring-boot:run` → http://localhost:8080 |
+| 前端 | `npm run dev` → http://localhost:5173 |
+
+停止所有服务：
+
+```bash
+./stop-local.sh
+```
+
+启动后的访问地址：
+
+- 前端页面：<http://localhost:5173>
+- 后端接口：<http://localhost:8080/xiaozhi/chat>
+- 接口文档：<http://localhost:8080/doc.html>
+- 日志目录：`logs/backend.log`、`logs/frontend.log`
+
+### 本地化改造说明
+
+| 原云端依赖 | 本地替代方案 | 涉及文件 |
+|-----------|-------------|---------|
+| 阿里云百炼 `qwen-max` / `qwen-plus` | Ollama `qwen2.5:7b` | `config/OllamaConfig.java` |
+| 阿里云百炼 `text-embedding-v3` | Ollama `andersc/qwen3-embedding:0.6b` | `config/OllamaConfig.java` |
+| Pinecone 云端向量库 | **本地 Docker Milvus**（standalone），知识库启动时自动切分向量化入库，索引持久化 | `config/EmbeddingStoreConfig.java` |
+| `DASH_SCOPE_API_KEY` / `PINECONE_API_KEY` | 不再需要 | `application.properties` |
+
+### 哪些是真实调用、哪些是 Mock
+
+原则：**本地能正常调通的一律真调；只有调不通的外部接口才用 Mock，并留好替换成真实接口的口子。**
+
+| 能力 | 当前实现 | 是否 Mock | 说明 |
+|------|---------|----------|------|
+| 对话 / 流式对话 / 向量化 | 本机 Ollama | ❌ 真实调用 | 本地推理，无外部依赖 |
+| 向量库（RAG 检索） | 本地 Docker Milvus | ❌ 真实调用 | 索引持久化，重启不用重新向量化 |
+| 业务数据（预约记录） | 本地 Docker MySQL | ❌ 真实调用 | MyBatis-Plus 直接读写 |
+| 对话记忆 | 本地 Docker MongoDB | ❌ 真实调用 | LangChain4j `ChatMemoryStore` 持久化 |
+| **专家名录**（哪位医生擅长什么） | **检索本地向量库（Milvus）** | ❌ **真实调用** | `VectorStoreDoctorService`，从知识库 `doctors.md` 检索解析 |
+| **号源 / 排班查询** | `MockSlotService` | ✅ **Mock** | 真实环境要调医院 HIS / 统一挂号平台，本地调不通，用本地内存模拟排班规则 |
+
+Mock 的部分只有 `SlotService` 一个，替换成真实接口只需两步，工具层代码不用动：
+
+```java
+// 1) 新建 HisSlotService implements SlotService，在方法里调用医院挂号平台接口
+// 2) 在 MedicalServiceConfig 里把 MockSlotService 换成你的实现
+@Bean
+public SlotService slotService(DoctorService doctorService) {
+    return new MockSlotService(doctorService);   // ← 改成 new HisSlotService(...)
+}
+```
+
+`MockSlotService` 的排班规则是**确定性**的（同样入参永远同样结果），方便联调与回归：
+周一至周五出诊（周末不出诊）、同科室医生轮流值上午/下午、每位医生每日 1~5 个号、
+约 10% 概率当日已约满（用于覆盖"号源已满"分支）。
+
+改造过程中踩到并已修复的几个坑（代码里都有注释说明原因）：
+
+| # | 问题 | 原因 | 修复位置 |
+|---|------|------|---------|
+| 1 | 模型收到乱码，全是 `?`，且用英文作答 | LangChain4j 的 Ollama 模块默认依赖 Spring RestClient，其 `StringHttpMessageConverter` 用 ISO-8859-1 写请求体，中文全部被转成 `?` | `OllamaConfig#ollamaHttpClientBuilder` 统一改用 JDK `HttpClient`（UTF-8） |
+| 2 | 被英文知识注入模板"带跑"，回答变英文 | LangChain4j 默认注入模板是英文的 `"Answer using the following information:..."` | `XiaozhiAgentConfig#retrievalAugmentorXiaozhi` 换成中文模板 |
+| 3 | 偶尔返回空白回答 | 本地 Ollama 在提示词缓存命中 + 模型直接输出工具调用时，有小概率返回 HTTP 200 但内容为空的响应 | `XiaozhiController#chatWithRetry` 用 `switchIfEmpty` 自动重试；`RetryStreamingChatModel` 作为第二道保险 |
+| 4 | 长对话被截断 | Ollama 默认上下文只有 4k，系统提示词 + 工具定义 + 知识库 + 20 条历史很容易超 | `OllamaConfig` 中 `numCtx` 调大到 8192 |
+| 5 | 小模型不按流程调用"预约挂号"工具 | 工具入参是嵌套对象且带必填 `id`，小模型无法正确映射 | `AppointmentTools` 改成扁平字符串参数；`bookAppointment` 内部自动查号源 |
+
+> **模型选择**：本地模型能力有限，工具调用的稳定性与模型参数量正相关。
+> 脚本 `start-local.sh` 会自动挑选本机已安装的模型（优先 `qwen2.5:7b`，其次 `3b` / `1.5b`）；
+> 如果配置的模型本机没装，`OllamaConfig` 也会自动回退到已安装的模型。
+
+### ⌨️ 手动启动（不使用脚本）
+
+<details>
+<summary>展开查看</summary>
+
+```bash
+# 1) 中间件
+docker run -d --name guigu-mysql -e MYSQL_ROOT_PASSWORD=123456 \
+  -e MYSQL_DATABASE=guiguxiaozhi -p 3306:3306 mysql:8.0.35 \
+  --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+docker run -d --name guigu-mongo -p 27017:27017 mongo:7
+
+# 建表
+docker exec -i mysql mysql -uroot -p123456 <<'SQL'
+USE guiguxiaozhi;
+CREATE TABLE IF NOT EXISTS appointment (
+    id          BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '主键',
+    username    VARCHAR(64)  NOT NULL COMMENT '患者姓名',
+    id_card     VARCHAR(32)  NOT NULL COMMENT '身份证号',
+    department  VARCHAR(64)  NOT NULL COMMENT '预约科室',
+    date        VARCHAR(16)  NOT NULL COMMENT '预约日期',
+    time        VARCHAR(8)   NOT NULL COMMENT '时段：上午 / 下午',
+    doctor_name VARCHAR(64)  DEFAULT NULL COMMENT '医生姓名'
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT ='预约挂号记录表';
+SQL
+
+# 2) 后端
+cd guiguXiaozhi_backend && mvn spring-boot:run
+
+# 3) 前端
+cd guiguXiaozhi_frontend && npm install && npm run dev
+```
+
+</details>
+
+### 云端部署方式（保留原方案）
+
+<details>
+<summary>展开查看</summary>
 
 ### 环境要求
 
@@ -279,6 +429,8 @@ npm run dev
 ```
 
 访问 `http://localhost:5173` 即可开始与小智对话。Vite 已将 `/api` 请求代理至后端 `8080` 端口。
+
+</details>
 
 ---
 

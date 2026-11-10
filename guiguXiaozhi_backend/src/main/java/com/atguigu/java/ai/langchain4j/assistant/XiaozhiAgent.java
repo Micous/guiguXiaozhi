@@ -6,10 +6,10 @@ import reactor.core.publisher.Flux;
 import static dev.langchain4j.service.spring.AiServiceWiringMode.EXPLICIT;
 @AiService(
     wiringMode = EXPLICIT,
-    streamingChatModel = "qwenStreamingChatModel",
+    streamingChatModel = "xiaozhiStreamingChatModel",
     chatMemoryProvider = "chatMemoryProviderXiaozhi",
     tools = "appointmentTools",
-    contentRetriever = "contentRetrieverXiaozhiPincone" //配置向量存储
+    retrievalAugmentor = "retrievalAugmentorXiaozhi" //配置向量存储
 )
 public interface XiaozhiAgent {
     @SystemMessage(fromResource = "xhaozhi-prompt-template.txt")

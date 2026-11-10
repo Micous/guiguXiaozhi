@@ -1,0 +1,14 @@
+# 运行时依赖（通用库，不含任何 Agent 框架）
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+httpx==0.28.1
+pydantic==2.10.4
+pydantic-settings==2.7.0
+pymilvus==2.5.3
+pymongo==4.10.1
+mysql-connector-python==9.1.0
+PyYAML==6.0.2
+
+# 开发依赖
+pytest==8.3.4
+pytest-asyncio==0.25.0

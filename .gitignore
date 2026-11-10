@@ -1,0 +1,10 @@
+logs/
+target/
+node_modules/
+.idea/
+*.log
+.DS_Store
+
+# 参考输入（非本项目产物，不入库）
+参考项目/
+参考文档/

@@ -12,7 +12,7 @@ import static dev.langchain4j.service.spring.AiServiceWiringMode.EXPLICIT;
         wiringMode = EXPLICIT,
     //    chatMemory = "chatMemory",
         chatMemoryProvider = "chatMemoryProvider",
-        chatModel = "qwenChatModel",
+        chatModel = "ollamaChatModel",
         tools = "calculatorTools" //配置tools
 
 )
