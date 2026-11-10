@@ -71,6 +71,19 @@ class BookAppointmentTool(Tool):
             )
 
         data = validation.normalized
+
+        # ---- 姓名/医生名**字段错位**防护 ----
+        # 2026-11-10 真实联调：用户回"王新勃，610121199401032831，2026.11.11，上午"
+        # （王新勃是**医生**名，患者姓名还没给），小模型把"王新勃"填进了
+        # username（患者姓名），doctor_name 留空 → 工具随手选了第一个出诊医生，
+        # **用医生名建了一条患者预约记录**。这是实打实的数据事故。
+        #
+        # 这里做一次交叉校验：username 命中了本科室的医生名录，
+        # 而 doctor_name 为空 → 几乎必然是字段填反了，直接拒绝并让模型重问。
+        swap_error = self._detect_name_swap(data)
+        if swap_error is not None:
+            return ToolResult.fail(swap_error, error_type="ValidationError")
+
         availability = self.slot_service.check(
             data["department"], data["date"], data["time"], data.get("doctor_name")
         )
@@ -103,6 +116,32 @@ class BookAppointmentTool(Tool):
         if saved is None:
             return ToolResult.fail("预约写入失败，请稍后重试。", error_type="PersistenceError")
         return ToolResult.ok(f"预约成功。预约详情：{self._describe(saved)}")
+
+    def _detect_name_swap(self, data: Dict[str, Any]) -> Optional[str]:
+        """检测"患者姓名"和"医生姓名"填反了。
+
+        返回错误说明（没问题时返回 None）。
+
+        判据：``username`` 命中了本科室专家名录里的某个医生，
+        且 ``doctor_name`` 为空 —— 说明模型把医生名当成了患者名。
+        """
+        username = (data.get("username") or "").strip()
+        doctor_name = (data.get("doctor_name") or "").strip()
+        if not username or doctor_name:
+            return None
+        try:
+            roster = self.doctor_service.list_doctors(data.get("department") or "")
+        except Exception:  # 名录不可用时不做判断，放行
+            return None
+        matched = next((d for d in roster if d.name == username), None)
+        if matched is None:
+            return None
+        return (
+            f"参数填写有误：{username} 是本院{matched.department}的**医生**，"
+            f"不能作为患者姓名。请把患者姓名填入 username，"
+            f"医生姓名填入 doctor_name；如果用户还没提供患者姓名，"
+            f"请先向用户询问患者姓名，不要用医生名代替。"
+        )
 
     @staticmethod
     def _describe(appointment: Appointment) -> str:

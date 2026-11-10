@@ -20,7 +20,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Dict, List, Optional
+from typing import Any, AsyncIterator, Dict, List, Optional, Sequence
 
 from xiaozhi.core.event import (
     AgentEndEvent,
@@ -38,9 +38,14 @@ from xiaozhi.core.tool import ToolResult
 from xiaozhi.memory.context import ContextAssembler
 from xiaozhi.memory.store import ConversationStore
 from xiaozhi.models.quality import (
-    CORRECTIVE_PROMPT,
-    FALSE_CONFIRMATION_NOTICE,
     booking_executed_in_history,
+    claim_kind,
+    claim_span,
+    corrective_prompt,
+    detect_narrated_tool_call,
+    detect_textual_tool_call,
+    fallback_for,
+    textual_tool_call_span,
     inspect_turn,
 )
 from xiaozhi.ops.metrics import MetricsCollector
@@ -55,6 +60,87 @@ from xiaozhi.security.secure_executor import SecureToolExecutor, ToolCall as Sec
 from xiaozhi.tools.registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
+
+# 流式下发的**回看窗口**（字）。
+#
+# 承诺正则要等匹配文本完整出现才命中，而命中点比承诺**起点**晚十几个字
+# （"已为您预约成功"要等到"预约"出现才命中，起点却在更早的"已"）。
+# 不留窗口就会先漏出"已"再被截断 —— 用户看到半截承诺。
+# 窗口必须 >= 最长承诺正则的长度（当前最长约 20 字），取 40 留足余量。
+LOOKBEHIND = 40
+
+
+class _TurnView:
+    """只读的模型输出视图 —— 用来在"检测"和"下发"之间传递不同的文本。"""
+
+    __slots__ = ("text", "tool_calls")
+
+    def __init__(self, text: str, tool_calls: Any) -> None:
+        self.text = text
+        self.tool_calls = tool_calls
+
+
+# 句子边界（截断时保留到这里为止，避免留下半截句子）
+_SENTENCE_END = "。！？!?\n"
+# 次级边界：没有完整句子时，裁到最近的逗号，至少保留已经说清的信息
+_CLAUSE_END = "，,、;；"
+
+
+def _trim_to_sentence(text: str) -> str:
+    """把文本裁到最后一个完整句子的边界。
+
+    截断承诺时，承诺之前的前缀往往停在半句上
+    （"很遗憾，您在2026年11月11日上午" + 兜底文案 → 读起来像病句）。
+
+    裁剪策略：
+      1. 有完整句子 → 裁到最后一个句末标点；
+      2. 只有逗号分句 → 裁到最后一个逗号（保留已经说清的信息）；
+      3. 连逗号都没有 → 整段丢弃（半句话比不完整更糟）。
+
+    **保留标点**：裁出来的"很遗憾，"要带着逗号，
+    后面接下一句时读起来才通顺（"很遗憾，抱歉，本次预约…"）。
+    """
+    if not text:
+        return ""
+    cut = -1
+    for index, char in enumerate(text):
+        if char in _SENTENCE_END:
+            cut = index + 1
+    if cut >= 0:
+        return text[:cut].rstrip()
+    for index, char in enumerate(text):
+        if char in _CLAUSE_END:
+            cut = index + 1
+    if cut < 0:
+        return ""
+    return text[:cut].rstrip()
+
+
+def _safe_prefix(turn_buffer: str, full_text: str) -> str:
+    """从完整输出里切出"实际下发给用户"的那一段（去掉被截断的承诺及其后续）。
+
+    ``turn_buffer`` 是流式拼出来的完整文本，``full_text`` 是 holder 里的
+    同一段文本；两者一致时直接按承诺起点裁剪，不一致时保守返回空串。
+
+    裁剪后再裁到句子边界 —— 承诺前的半截句子对用户没有意义。
+    """
+    if not full_text:
+        return ""
+    if turn_buffer.startswith(full_text):
+        span = claim_span(full_text)
+        if span is None:
+            return full_text
+        return _trim_to_sentence(full_text[: span[1]])
+    # 兜底：holder 文本与流式缓冲不一致（理论上不该发生）→ 宁可丢也别漏
+    return ""
+
+
+def _last_assistant_text(history: Sequence[Any]) -> str:
+    """取历史里最后一条 assistant 回复的正文（用于上下文相关的意图判定）"""
+    for message in reversed(history or []):
+        if getattr(message, "role", None) == Role.ASSISTANT:
+            return str(getattr(message, "content", "") or "")
+    return ""
 
 
 @dataclass
@@ -131,8 +217,14 @@ class AgentEngine:
             # ---- 检索知识 ----
             # 操作类请求（预约/取消/查号源/查专家）不注入知识：
             # 实测注入后模型会把请求当成"知识题"直接答题，工具调用率从 5/5 掉到 0/5。
+            #
+            # 关键：判定必须**带上上下文**。2026-11-10 真实联调发现，
+            # 助手问"是否需要我帮您预约？"，用户回"需要" —— 这两个字没有任何
+            # 操作关键词，纯文本正则漏判 → 注入知识 + 历史不中性化 →
+            # 模型直接照抄历史里的"预约成功啦"，工具一次都没调。
             knowledge = ""
-            inject_knowledge = should_inject_knowledge(user_input)
+            last_assistant_text = _last_assistant_text(history)
+            inject_knowledge = should_inject_knowledge(user_input, last_assistant_text)
             # 操作类请求：历史里的完成态回复会误导小模型跳过工具调用（B1 实测）
             operation_request = not inject_knowledge
             if self.retriever is not None and inject_knowledge:
@@ -181,11 +273,15 @@ class AgentEngine:
             cancel_executed_success = False
             tool_results: List[Message] = []
             tool_failures: Dict[str, int] = {}
+            # 最近一次工具失败（工具名 / 错误类型 / 原始反馈），
+            # 用于生成**与事实相符**的兜底文案
+            last_tool_failure: Optional[Dict[str, Any]] = None
             # 历史里是否真的执行过预约（本次会话早前请求成功挂过号且未取消）。
             # 是真话依据：模型说"已经预约好了"时不算幻觉，也不做纠正重试。
             prior_booking = booking_executed_in_history(history)
             corrective_used = 0     # 已做过的纠正重试次数（每请求至多 1 次）
             corrective_pending = False  # 本轮检测到幻觉且待纠正
+            corrective_kind: Optional[str] = None  # 幻觉承诺的操作类型（book/cancel）
 
             while turn < self.max_turns:
                 # ---- 请求级时间预算 ----
@@ -232,26 +328,148 @@ class AgentEngine:
                         holder: Dict[str, Any] = {}
                         emitted = False
                         attempt_error: Optional[Exception] = None
+                        # 放在 try 外面：流异常时也能把已收到的内容补发出去
+                        turn_buffer = ""
+                        pending_start = 0
+                        suppressed = False
+                        truncated_claim: Optional[str] = None
+                        textual_tool_call = False
+                        detected_text = ""
                         try:
+                            # ---- 虚假承诺的**下发前**拦截 ----
+                            # 2026-11-10 事故：模型没调任何工具，却两次输出"预约成功"，
+                            # 而事后追加的免责提示是挂在"预约成功"后面的 —— 用户先读到的
+                            # 仍然是"预约成功"。所以必须在承诺**流式下发之前**截断，
+                            # 事后补救（追加提示 / 兜底文案）无法收回已显示的字。
+                            #
+                            # **回看窗口**：承诺的正则要等"匹配文本完整出现"才能命中，
+                            # 而它的**起点**可能比命中点早十几个字（"已为您预约成功"
+                            # 要等到"预约"两个字出现才命中，起点却在更早的"已"）。
+                            # 所以这里留出 LOOKBEHIND 个字不立即下发，
+                            # 承诺就能在"露头"之前被拦下来。
+                            # 只有"承诺不成立"时才拦截：挂号/取消工具**真的成功执行过**，
+                            # 或本会话早前确实挂过号 —— 这时"已经预约好了"是真话。
+                            # 注意不能只看 successful_tool_calls：查询号源也算工具调用，
+                            # 但"查询成功"不等于"预约成功"。
+                            claim_is_legit = (
+                                booking_executed_success
+                                or cancel_executed_success
+                                or prior_booking
+                            )
                             async for delta in self.chat_model.stream_chat(
                                 messages, tools=tools, result_holder=holder
                             ):
-                                if delta:
+                                if not delta:
+                                    continue
+                                turn_buffer += delta
+                                if suppressed:
+                                    # 承诺之后的内容一律不下发（但**继续读完流**，
+                                    # 否则拿不到 tool_calls，工具就永远不会被执行）
+                                    continue
+                                # 「把工具调用写成纯文本 JSON」也要拦在下发之前：
+                                # 原始参数漏给用户是一方面，更关键的是
+                                # 工具一次都没执行 —— 用户以为在办事，其实什么都没发生。
+                                textual_span = (
+                                    None
+                                    if claim_is_legit
+                                    else textual_tool_call_span(turn_buffer)
+                                )
+                                if textual_span is not None:
+                                    textual_tool_call = True
+                                    suppressed = True
+                                    # 精确切掉"工具名 + JSON"这一段，
+                                    # 切割点不对就会把参数漏给用户
+                                    safe = _trim_to_sentence(
+                                        turn_buffer[pending_start : textual_span[0]]
+                                    )
+                                    if safe:
+                                        result.text += safe
+                                        emitted = True
+                                        emitted_this_turn = True
+                                        yield TextResponseEvent(
+                                            trace_id=trace_id, metadata={"delta": safe}
+                                        )
+                                    pending_start = len(turn_buffer)
+                                    self.metrics.inc("textual_tool_call_truncated")
+                                    logger.warning(
+                                        "模型把工具调用写成了纯文本，就地截断：trace=%s",
+                                        trace_id,
+                                    )
+                                    continue
+                                match = None if claim_is_legit else claim_span(turn_buffer)
+                                if match is not None:
+                                    kind, start, _end = match
+                                    truncated_claim = kind
+                                    suppressed = True
+                                    # 承诺之前的前缀无害，补发出去（承诺本身被丢掉）
+                                    safe = _trim_to_sentence(turn_buffer[pending_start:start])
+                                    if safe:
+                                        result.text += safe
+                                        emitted = True
+                                        emitted_this_turn = True
+                                        yield TextResponseEvent(
+                                            trace_id=trace_id, metadata={"delta": safe}
+                                        )
+                                    pending_start = len(turn_buffer)
+                                    self.metrics.inc("false_confirmation_truncated")
+                                    logger.warning(
+                                        "模型输出中出现虚假成功承诺，就地截断：trace=%s kind=%s",
+                                        trace_id,
+                                        kind,
+                                    )
+                                    continue
+                                # 回看窗口：末尾 LOOKBEHIND 个字先留着不下发，
+                                # 等下一段文本来了再判断它是不是承诺的开头
+                                flush_upto = len(turn_buffer) - LOOKBEHIND
+                                if flush_upto > pending_start:
+                                    chunk = turn_buffer[pending_start:flush_upto]
+                                    pending_start = flush_upto
+                                    result.text += chunk
                                     emitted = True
                                     emitted_this_turn = True
-                                    result.text += delta
                                     yield TextResponseEvent(
-                                        trace_id=trace_id, metadata={"delta": delta}
+                                        trace_id=trace_id, metadata={"delta": chunk}
                                     )
+                            # 本轮结束：把回看窗口里剩下的字补发出去
+                            if not suppressed and pending_start < len(turn_buffer):
+                                chunk = turn_buffer[pending_start:]
+                                result.text += chunk
+                                emitted = True
+                                emitted_this_turn = True
+                                yield TextResponseEvent(
+                                    trace_id=trace_id, metadata={"delta": chunk}
+                                )
                             candidate = holder.get("turn") or _empty_turn()
+                            # 检测用**完整**文本（含被截断的承诺）；
+                            # 下发给用户 / 写进历史的是**裁剪后**的文本。
+                            # 两者分开，才不会因为"先把谎话删掉"而检测不到它。
+                            detected_text = candidate.text
+                            if truncated_claim is not None:
+                                candidate.text = _safe_prefix(turn_buffer, detected_text)
                         except Exception as exc:
                             attempt_error = exc
                             candidate = _empty_turn()
+                            detected_text = ""
+                            # 流中断：把已经收到、但还压在回看窗口里的内容补发出去，
+                            # 否则用户会凭空少看到一截
+                            if not suppressed and pending_start < len(turn_buffer):
+                                chunk = turn_buffer[pending_start:]
+                                pending_start = len(turn_buffer)
+                                result.text += chunk
+                                emitted = True
+                                emitted_this_turn = True
+                                yield TextResponseEvent(
+                                    trace_id=trace_id, metadata={"delta": chunk}
+                                )
 
                         finding = inspect_turn(
-                            candidate,
+                            _TurnView(detected_text, candidate.tool_calls),
                             known_tool_names,
-                            tool_executed=successful_tool_calls > 0 or prior_booking,
+                            tool_executed=(
+                                booking_executed_success
+                                or cancel_executed_success
+                                or prior_booking
+                            ),
                         )
                         # 关键：只有"一个字都没下发"时才允许重试，避免前端出现重复文本
                         retryable = (not emitted) and (
@@ -288,26 +506,45 @@ class AgentEngine:
                                 logger.warning(
                                     "模型把工具调用写成了纯文本：trace=%s", trace_id
                                 )
+                                llm_span.set_attribute("textual_tool_call", True)
+                                # 已经在流式阶段截断过了，这里只需安排纠正重试，
+                                # 让模型用**结构化 tool_call** 重新发起
+                                if corrective_used == 0 and not corrective_pending:
+                                    corrective_pending = True
+                                    corrective_kind = "tool_call"
+                                    llm_span.set_attribute("corrective_retry_scheduled", True)
                             if finding.false_confirmation:
                                 self.metrics.inc("hallucination_suspected")
                                 llm_span.set_attribute("hallucination_suspected", True)
+                                claim = truncated_claim or claim_kind(detected_text)
+                                llm_span.set_attribute("claim_kind", claim)
                                 if corrective_used == 0 and not prior_booking:
                                     # 先不追加免责提示——注入纠正提示重试一轮，
                                     # 逼迫模型真正调用工具（比事后提示更能纠错）
                                     corrective_pending = True
+                                    corrective_kind = claim
                                     llm_span.set_attribute(
                                         "corrective_retry_scheduled", True
                                     )
                                     logger.warning(
-                                        "检测到未调工具的预约/取消承诺，准备纠正重试：trace=%s",
+                                        "检测到未调工具的预约/取消承诺，准备纠正重试：trace=%s kind=%s",
                                         trace_id,
+                                        claim,
                                     )
                                 else:
-                                    result.text += FALSE_CONFIRMATION_NOTICE
+                                    # 纠正重试后仍然编造成功：**丢弃**这段文本，
+                                    # 换成陈述事实的兜底文案 —— 绝不能让"预约成功"显示给用户
+                                    fallback = fallback_for(claim, last_tool_failure)
+                                    prefix = (result.text or "").rstrip()
+                                    if prefix:
+                                        prefix += "\n\n"
+                                    result.text = prefix + fallback
                                     yield TextResponseEvent(
                                         trace_id=trace_id,
-                                        metadata={"delta": FALSE_CONFIRMATION_NOTICE},
+                                        metadata={"delta": fallback},
                                     )
+                                    self.metrics.inc("hallucination_fallbacks")
+                                    llm_span.set_attribute("hallucination_fallback", True)
                         break
 
                     self.metrics.record_llm((time.monotonic() - llm_started) * 1000)
@@ -339,11 +576,35 @@ class AgentEngine:
 
                 # ---- 没有工具调用 → 结束（或纠正重试一轮） ----
                 if not response.tool_calls:
+                    # 模型说"我这就调用预约挂号工具"却没真调 —— 逼它真的调一次。
+                    # （2026-11-10 实测：用户看到"我将调用预约挂号工具"，
+                    #   然后什么都没发生，工具一次都没执行。）
+                    if (
+                        not corrective_pending
+                        and corrective_used == 0
+                        and operation_request
+                        and detect_narrated_tool_call(response.text)
+                    ):
+                        corrective_pending = True
+                        corrective_kind = "action"
+                        self.metrics.inc("narrated_tool_call_retries")
+                        span.set_attribute("narrated_tool_call", True)
+                        logger.warning(
+                            "模型只说要调工具却没调，准备纠正重试：trace=%s",
+                            trace_id,
+                        )
+
                     if corrective_pending:
                         corrective_pending = False
                         corrective_used += 1
-                        self.metrics.inc("false_confirmation_retries")
-                        messages.append({"role": "user", "content": CORRECTIVE_PROMPT})
+                        if corrective_kind != "action":
+                            self.metrics.inc("false_confirmation_retries")
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": corrective_prompt(corrective_kind),
+                            }
+                        )
                         turn += 1
                         yield TurnEndEvent(
                             trace_id=trace_id,
@@ -410,6 +671,15 @@ class AgentEngine:
                                 cancel_executed_success = True
                         else:
                             tool_failures[call.name] = tool_failures.get(call.name, 0) + 1
+                            # 记住**失败原因**：模型编造"预约成功"时，兜底文案要
+                            # 反映工具的真实反馈（"已有预约，请勿重复"），
+                            # 而不是笼统地说"没有生成记录" —— 后者在用户明明
+                            # 已经约过号时是误导。
+                            last_tool_failure = {
+                                "tool": call.name,
+                                "error_type": tool_result.error_type,
+                                "content": tool_result.content,
+                            }
 
                         self.metrics.record_tool(call.name, tool_result.success)
                         self.metrics.observe(

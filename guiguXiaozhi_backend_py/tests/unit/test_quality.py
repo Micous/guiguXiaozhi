@@ -12,8 +12,12 @@ from xiaozhi.core.message import Message, Role, ToolCall  # noqa: E402
 from xiaozhi.models.ollama import ChatTurn  # noqa: E402
 from xiaozhi.models.quality import (  # noqa: E402
     CORRECTIVE_PROMPT,
+    FALLBACK_BOOKING_NOT_DONE,
+    FALLBACK_CANCEL_NOT_DONE,
+    fallback_for,
     FALSE_CONFIRMATION_NOTICE,
     booking_executed_in_history,
+    claim_span,
     detect_false_confirmation,
     detect_textual_tool_call,
     inspect_turn,
@@ -180,5 +184,56 @@ def test_completion_claim_questions_not_flagged():
 
 
 def test_corrective_prompt_exists():
+    """纠正提示必须点名具体工具、且禁止输出结论性文字。
+
+    旧措辞「不得再声称成功」会让 7B 模型顺着这句话再编一遍
+    （它会重复"你声称成功"这句话），实测纠正重试完全无效。
+    """
     assert "工具" in CORRECTIVE_PROMPT
-    assert "不得再声称成功" in CORRECTIVE_PROMPT
+    assert "预约挂号" in CORRECTIVE_PROMPT
+    assert "不要输出任何结论性文字" in CORRECTIVE_PROMPT
+
+
+def test_claim_span_locates_earliest_claim():
+    """流式截断需要知道承诺在文本中的位置，且取**最早**出现的那一处"""
+    span = claim_span("您好，经过查询，我为您预约了2026年11月11日上午的神经内科")
+    assert span is not None
+    kind, start, end = span
+    assert kind == "book"
+    assert "为您预约了" in "您好，经过查询，我为您预约了2026年11月11日上午的神经内科"[start:end]
+
+    cancel = claim_span("您的预约已成功取消")
+    assert cancel is not None and cancel[0] == "cancel"
+
+
+def test_fallback_wording_never_claims_success():
+    for text in (FALLBACK_BOOKING_NOT_DONE, FALLBACK_CANCEL_NOT_DONE):
+        assert "成功" not in text.replace("没有办理成功", "").replace("没有执行成功", "")
+
+
+def test_fallback_reflects_real_tool_failure():
+    """兜底文案要反映工具的真实反馈，不能笼统说"没有生成记录"。
+
+    用户明明已经约过号（工具返回 DuplicateAppointment）时说"没有生成记录"
+    同样是误导。
+    """
+    failure = {
+        "tool": "预约挂号",
+        "error_type": "DuplicateAppointment",
+        "content": "您在神经内科 2026-11-11 上午已有预约（医生：王笠），请勿重复预约。",
+    }
+    text = fallback_for("book", failure)
+    assert "已经有一条预约记录" in text
+    assert "没有生成对应的预约记录" not in text
+
+    slot_failure = {
+        "tool": "预约挂号",
+        "error_type": "NoSlotAvailable",
+        "content": "医生【王笠】在 2026-11-11 上午不出诊…",
+    }
+    text2 = fallback_for("book", slot_failure)
+    assert "不出诊" in text2 or "约满" in text2
+
+    # 没有工具失败信息时用通用文案
+    assert fallback_for("book", None) == FALLBACK_BOOKING_NOT_DONE
+    assert fallback_for("cancel", None) == FALLBACK_CANCEL_NOT_DONE

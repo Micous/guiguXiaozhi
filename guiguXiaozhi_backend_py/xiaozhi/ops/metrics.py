@@ -27,6 +27,10 @@ DEFAULT_COUNTERS = (
     "degraded_total",
     "rate_limited_total",
     "hallucination_suspected",
+    "hallucination_fallbacks",
+    "false_confirmation_truncated",
+    "narrated_tool_call_retries",
+    "textual_tool_call_truncated",
 )
 
 
@@ -159,6 +163,16 @@ class MetricsCollector:
             "degraded_total": counters.get("degraded_total", 0.0),
             "rate_limited_total": counters.get("rate_limited_total", 0.0),
             "hallucination_suspected": counters.get("hallucination_suspected", 0.0),
+            "hallucination_fallbacks": counters.get("hallucination_fallbacks", 0.0),
+            "false_confirmation_truncated": counters.get(
+                "false_confirmation_truncated", 0.0
+            ),
+            "narrated_tool_call_retries": counters.get(
+                "narrated_tool_call_retries", 0.0
+            ),
+            "textual_tool_call_truncated": counters.get(
+                "textual_tool_call_truncated", 0.0
+            ),
             "latency": latency,
         }
 

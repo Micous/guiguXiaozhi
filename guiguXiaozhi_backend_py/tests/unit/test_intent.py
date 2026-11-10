@@ -15,6 +15,8 @@ sys.path.insert(0, str(ROOT))
 
 from xiaozhi.runtime.intent import (  # noqa: E402
     is_operation_request,
+    is_short_confirmation,
+    is_status_inquiry,
     should_inject_knowledge,
 )
 
@@ -58,3 +60,43 @@ def test_date_like_numbers_do_not_trigger():
     """日期、电话号不应误判为操作类"""
     assert not is_operation_request("2026-11-20 上午门诊几点开始？")
     assert not is_operation_request("请给我拨打电话13800138000咨询")
+
+
+def test_short_confirmation_recognized():
+    """短确认句是"承接上一轮操作提议"的关键信号"""
+    for msg in ("需要", "好的", "好", "行", "嗯", "是的", "可以", "确认", "麻烦你了", "ok"):
+        assert is_short_confirmation(msg), msg
+    for msg in ("我需要挂号", "帮我预约神经内科的号", "好的谢谢再见"):
+        assert not is_short_confirmation(msg), msg
+
+
+def test_confirmation_after_operation_offer_is_operation():
+    """助手问"是否需要我帮您预约"，用户回"需要" → 必须按操作类处理。
+
+    2026-11-10 真实前端联调：这两个字不含任何操作关键词，纯文本正则漏判 →
+    注入知识 + 历史不中性化 → 模型照抄历史里的"预约成功啦"，工具一次没调。
+    """
+    offer = "目前可预约的医生有：王笠、崔丽英。请问您是否需要我帮您预约其中一位医生？"
+    assert is_operation_request("需要", offer)
+    assert not should_inject_knowledge("需要", offer)
+
+
+def test_confirmation_after_knowledge_answer_is_not_operation():
+    """上一轮是知识问答时，"好的"不应被误判成操作类"""
+    answer = "北京协和医院位于北京市东城区帅府园一号，门诊时间为周一至周五。"
+    assert not is_operation_request("好的", answer)
+    assert should_inject_knowledge("好的", answer)
+
+
+def test_status_inquiry_detected():
+    """询问既有预约结果 ≠ 发起新操作"""
+    for msg in (
+        "挂号成功了吗？",
+        "我的预约还在吗",
+        "预约结果怎么样",
+        "取消成功了吗",
+        "我的预约记录",
+    ):
+        assert is_status_inquiry(msg), msg
+    for msg in ("帮我预约神经内科", "预约挂号", "取消预约"):
+        assert not is_status_inquiry(msg), msg

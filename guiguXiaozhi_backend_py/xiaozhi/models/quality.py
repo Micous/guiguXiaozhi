@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 # 模型没调工具却声称完成了写操作（Java 版实测：temperature 高时会出现）
 _FALSE_CONFIRMATION = re.compile(
@@ -22,12 +22,20 @@ _FALSE_CONFIRMATION = re.compile(
     r"|预约(已经)?(成功|完成|提交成功)"
     r"|挂号(成功|已完成)"
     r"|已(成功)?取消(预约|挂号)"
-    r"|预约号[:：]\s*[A-Za-z0-9-]+"
+    r"|预约号[:：]\s*[A-Za-z0-9-]{1,20}"
     # 2026-11-10 事故新增：「我为您预约了…以下是预约信息」——不带"成功/已"字样
     # 的完成态声明，原来的正则全部漏报（工具失败后模型仍谎报预约成功）。
     r"|[为帮](您|你)(成功)?预约了"
     r"|预约好了(?![吗么再之])"
     r"|挂号好了(?![吗么再之])"
+    # 2026-11-10 第二次事故新增：「您的预约已成功安排在…」——
+    # "预约"与"成功"之间隔着"已"，原正则的 `预约(已经)?(成功|…)` 只认"已经"，
+    # 于是漏报，模型把一次**失败**的预约说成了成功。
+    r"|预约(?:已经|已)?(?:成功|完成|办理成功|安排|提交)"
+    r"|已(?:经)?(?:成功|完成)[^。！？\n]{0,6}(?:预约|挂号|安排|提交|办理)"
+    # 2026-11-10 第三次事故新增：模型**伪造工具返回结果**
+    # 「预约挂号工具返回结果：【成功】…」——整段都是编的，必须一起拦掉。
+    r"|工具(?:调用)?(?:返回|执行)[^。！？\n]{0,10}(?:结果)?[：:【\s]*(?:【)?成功"
 )
 
 # 取消类承诺单独处理：真实联调里模型会写「您的预约已成功取消」，
@@ -46,21 +54,187 @@ _TEXTUAL_TOOL_CALL = re.compile(
     r"(预约挂号|取消预约|查询是否有号源|查询科室专家)\s*[{\n\r]"
 )
 
+# 模型**用文字描述**自己要调工具，但同一轮并没有真的发出 tool_call。
+#
+# 2026-11-10 真实前端联调实测（trace ba096001...）：
+#   模型输出「…现在我将为您提交预约请求。请稍等，我将调用预约挂号工具。」
+#   同一轮 tool_call_count = 0 → 引擎按"没有工具调用 → 本轮结束"处理，
+#   用户看到一句"我这就调用工具"，然后**什么都没发生**，工具一次都没执行。
+# 这类"口头承诺"必须触发一次纠正重试，逼模型真的把工具调出来。
+_NARRATED_TOOL_CALL = re.compile(
+    r"(?:调用|使用|发起|执行|提交)[^。！？\n]{0,12}工具"
+    r"|(?:调用|使用)[^。！？\n]{0,10}(?:预约挂号|取消预约挂号|查询是否有号源|查询科室专家)"
+    r"|(?:我将|我这就|马上|稍后|接下来)[^。！？\n]{0,16}"
+    r"(?:为您)?(?:提交|发起|办理|执行)[^。！？\n]{0,12}"
+    r"(?:预约请求|挂号请求|预约|挂号|取消预约|查询)"
+)
+
 # 兜底提示：不下结论说预约失败，只提醒以系统记录为准
 FALSE_CONFIRMATION_NOTICE = (
     "\n\n（提示：本次未检测到对应的工具执行记录，请以系统查询结果为准，"
     "不要视为预约或取消已办理成功。）"
 )
 
-# 幻觉纠正提示：检测到"没调工具却声称成功"时注入一轮，逼迫模型真正调工具。
-# 实测（2026-11-10 真实前端联调）：仅追加免责提示时，7B 模型下一轮仍会
-# 编造"预约挂号结果显示成功"；注入本提示后模型会真正执行工具。
-CORRECTIVE_PROMPT = (
-    "（系统校正）你在没有调用工具的情况下声称预约/取消已成功，"
-    "系统并没有产生任何预约记录变更，这是错误的。请立即调用对应的工具"
-    "（预约挂号 / 取消预约挂号）真正完成该操作；"
-    "如果信息不全或无法完成，请如实告知用户尚未办理，不得再声称成功。"
+# 「把工具调用写成纯文本 JSON」的纠正提示。
+#
+# 实测（qwen2.5:7b）：模型有时不发出结构化 tool_call，而是把
+# `预约挂号 {"username": "张三", ...}` 直接当正文吐出来。
+# 后果有二：
+#   1. **原始 JSON 直接漏给用户**（前端显示成一坨乱码般的参数）；
+#   2. 工具一次都没执行 → 用户以为在办事，其实什么都没发生。
+# 所以这类文本必须**拦在下发之前**，并纠正重试逼模型发出真正的 tool_call。
+CORRECTIVE_PROMPT_TOOL_CALL = (
+    "（系统要求）你刚才把工具调用写成了普通文本，参数不会被执行。"
+    "请立即以**结构化工具调用**的方式发起调用（不要在正文里写工具名或 JSON），"
+    "把参数如实填进去；不要输出任何说明性文字。"
+    "只有工具真正执行后才会产生记录。如果工具返回失败，请如实把失败原因告诉用户。"
 )
+
+# 幻觉纠正提示：检测到"没调工具却声称成功"时注入一轮，逼迫模型真正调工具。
+#
+# 措辞要点（都是实测踩出来的）：
+#   * **不要复述"你声称成功"** —— 旧措辞会把"已为您预约成功"这句话再说一遍，
+#     7B 模型顺着这句话继续编，纠正重试等于白做；
+#   * **必须点名具体工具** —— 旧措辞写"预约挂号 / 取消预约挂号"，模型分不清该调哪个，
+#     于是干脆不调；
+#   * **明确要求"只调用工具、不要输出文字"** —— 模型的自然倾向是先说话再干活。
+CORRECTIVE_PROMPT_BOOK = (
+    "（系统要求）本次请求需要完成一次挂号操作。"
+    "请立即调用“预约挂号”工具，把姓名、身份证号、科室、日期、时段如实填入参数。"
+    "不要输出任何结论性文字，也不要描述预约结果——只有工具真正执行后才会产生预约记录。"
+    "如果工具返回失败，请如实把失败原因告诉用户。"
+)
+
+CORRECTIVE_PROMPT_CANCEL = (
+    "（系统要求）本次请求需要取消一次挂号。"
+    "请立即调用“取消预约挂号”工具，把姓名、身份证号、科室、日期、时段如实填入参数。"
+    "不要输出任何结论性文字，也不要描述取消结果——只有工具真正执行后才会产生记录变更。"
+    "如果工具返回失败，请如实把失败原因告诉用户。"
+)
+
+# "我这就调工具"但其实没调 —— 纠正提示要点是"不要描述，直接调"
+CORRECTIVE_PROMPT_ACTION = (
+    "（系统要求）你刚才只是**描述**了将要执行的动作，但并没有真正发起工具调用。"
+    "用户看不到任何执行结果。请立即调用对应的工具完成这次操作，"
+    "不要输出任何结论性文字，也不要描述你将要做什么——"
+    "只有工具真正执行后才会产生记录。如果工具返回失败，请如实把失败原因告诉用户。"
+)
+
+CORRECTIVE_PROMPT = CORRECTIVE_PROMPT_BOOK  # 兼容旧引用
+
+# 连续两次都编造成功时的兜底：只陈述事实，不给成功结论
+FALLBACK_BOOKING_NOT_DONE = (
+    "抱歉，本次预约**没有办理成功**——系统没有生成对应的预约记录。"
+    "可能是号源刚刚被占满，请稍后重试，或换一个日期 / 时段再试。"
+)
+
+FALLBACK_CANCEL_NOT_DONE = (
+    "抱歉，本次取消**没有执行成功**——系统没有找到可取消的预约记录或删除失败。"
+    "请核对姓名、身份证号、科室、日期与时段后重试。"
+)
+
+
+# 条件/疑问语境标记：出现在承诺**之前**时，说明这不是"已完成"的断言，
+# 而是"如果…还没预约成功…"这类指导语，不该被当成幻觉拦截。
+# 误判的代价：把一段正常的指导文字拦腰截断（2026-11-10 实测踩到）。
+_CONDITIONAL_MARKERS: Tuple[str, ...] = (
+    "没有", "还没", "未", "不", "若", "如果", "假如", "能否", "是否",
+    "请问", "会不会", "有没有", "尚未", "并未", "并没", "需不需要",
+    "要不要", "可以", "还没能", "失败", "无法",
+)
+
+
+def _is_conditional_context(text: str, start: int) -> bool:
+    """承诺前文是否是条件/疑问语境（是 → 不算完成态断言）"""
+    if start <= 0:
+        return False
+    window = text[max(0, start - 10) : start]
+    return any(marker in window for marker in _CONDITIONAL_MARKERS)
+
+
+def claim_span(text: str) -> Optional[Tuple[str, int, int]]:
+    """找出文本里**最早**的一处成功承诺，返回 (类型, 起点, 终点)。
+
+    与 ``claim_kind`` 的区别：这里给出位置，流式输出时可以**精确定位并截断**
+    承诺所在的句子 —— 事后追加免责提示收不回已经显示给用户的字，
+    只能在承诺下发之前拦（2026-11-10 事故的直接教训）。
+
+    只返回**第一处非条件语境**的承诺：像"如果没有预约成功，请…"这种
+    指导语不是完成态断言，不能拦（否则会把正常回答拦腰截断）。
+
+    Returns:
+        ("book"|"cancel", start, end) 或 None
+    """
+    if not text:
+        return None
+    best: Optional[Tuple[str, int, int]] = None
+    for kind, regex in (("cancel", _CANCEL_CONFIRMATION), ("book", _FALSE_CONFIRMATION)):
+        for match in regex.finditer(text):
+            if _is_conditional_context(text, match.start()):
+                continue
+            if best is None or match.start() < best[1]:
+                best = (kind, match.start(), match.end())
+    return best
+
+
+def claim_kind(text: str) -> Optional[str]:
+    """判断文本里的成功承诺属于哪类操作。
+
+    Returns:
+        "book" / "cancel" / None
+    """
+    span = claim_span(text)
+    return span[0] if span else None
+
+
+def corrective_prompt(kind: Optional[str]) -> str:
+    """按操作类型给出针对性的纠正提示"""
+    if kind == "cancel":
+        return CORRECTIVE_PROMPT_CANCEL
+    if kind == "action":
+        return CORRECTIVE_PROMPT_ACTION
+    if kind == "tool_call":
+        return CORRECTIVE_PROMPT_TOOL_CALL
+    return CORRECTIVE_PROMPT_BOOK
+
+
+# 工具失败类型 → 面向用户的说明。
+# 兜底文案必须**反映工具的真实反馈**，而不是笼统地说"没有生成记录"——
+# 用户明明已经约过号（工具返回"已有预约，请勿重复预约"）时说"没有生成记录"
+# 同样是误导。
+_FAILURE_HINTS: Dict[str, str] = {
+    "DuplicateAppointment": "您在同一科室、同一日期、同一时段已经有一条预约记录了，请勿重复预约。",
+    "NoSlotAvailable": "该医生在您选择的日期与时段不出诊，或号源已被约满。建议换一个日期、时段或医生。",
+    "ValidationError": "预约信息没有填写完整或格式有误，请核对姓名、身份证号、科室、日期和时段后重试。",
+    "PersistenceError": "预约记录写入失败，请稍后重试。",
+    "ApprovalRequired": "这次操作需要用户确认，但当前没有确认通道，请稍后重试。",
+    "PermissionDenied": "该操作被安全策略禁止，无法执行。",
+    "ToolNotFound": "所需的工具不存在，请稍后重试。",
+}
+
+
+def fallback_for(
+    kind: Optional[str],
+    tool_failure: Optional[Dict[str, Any]] = None,
+) -> str:
+    """纠正重试仍失败时的兜底文案。
+
+    ``tool_failure`` 是本请求内最近一次工具失败的信息
+    （``{"tool":…, "error_type":…, "content":…}``）。
+    有它就按工具的真实反馈说明原因，没有才用通用文案。
+    """
+    if kind == "cancel":
+        base = FALLBACK_CANCEL_NOT_DONE
+    else:
+        base = FALLBACK_BOOKING_NOT_DONE
+
+    if not tool_failure:
+        return base
+    error_type = str(tool_failure.get("error_type") or "")
+    hint = _FAILURE_HINTS.get(error_type)
+    if not hint:
+        return base
+    return f"抱歉，本次操作没有完成——{hint}"
 
 
 def booking_executed_in_history(history: Sequence[Any]) -> bool:
@@ -158,6 +332,30 @@ def detect_false_confirmation(
 def detect_textual_tool_call(text: str) -> bool:
     """工具调用被改写成纯文本输出"""
     return bool(_TEXTUAL_TOOL_CALL.search(text or ""))
+
+
+def textual_tool_call_span(text: str) -> Optional[Tuple[str, int, int]]:
+    """找出纯文本形式工具调用的位置，返回 (起点, 终点)。
+
+    流式拦截要用它来**精确切掉**那段 JSON —— 只知道"有"是不够的，
+    切割点不对就会把参数漏给用户。
+    """
+    match = _TEXTUAL_TOOL_CALL.search(text or "")
+    if match is None:
+        return None
+    return (match.start(), match.end())
+
+
+def detect_narrated_tool_call(text: str) -> bool:
+    """模型只是**说要**调工具，却在同一轮没有真的发出 tool_call。
+
+    与 ``detect_textual_tool_call`` 的区别：
+      * textual —— 把工具调用**写成了 JSON 文本**；
+      * narrated —— 用自然语言**承诺**要调工具（"我将调用预约挂号工具"）。
+
+    两者都会导致工具一次都没执行，用户却以为系统在办事。
+    """
+    return bool(_NARRATED_TOOL_CALL.search(text or ""))
 
 
 def inspect_turn(

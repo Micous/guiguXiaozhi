@@ -16,7 +16,10 @@ from xiaozhi.core.event import EventType  # noqa: E402
 from xiaozhi.core.message import Message, Role, ToolCall  # noqa: E402
 from xiaozhi.core.tool import ToolResult  # noqa: E402
 from xiaozhi.models.ollama import ChatTurn  # noqa: E402
-from xiaozhi.models.quality import FALSE_CONFIRMATION_NOTICE  # noqa: E402
+from xiaozhi.models.quality import (  # noqa: E402
+    FALLBACK_BOOKING_NOT_DONE,
+    FALSE_CONFIRMATION_NOTICE,
+)
 from xiaozhi.ops.metrics import MetricsCollector  # noqa: E402
 from xiaozhi.reliability.resilience import CircuitBreaker, RetryConfig  # noqa: E402
 from xiaozhi.runtime.engine import AgentEngine  # noqa: E402
@@ -189,14 +192,22 @@ async def test_open_model_circuit_returns_rule_based_fallback():
 
 
 async def test_false_confirmation_falls_back_to_honest_answer_after_retry():
-    """纠正重试后模型给出诚实回答（未调工具、未编造） → 不追加免责提示"""
+    """虚假承诺必须在**下发前**被截断，纠正重试后模型给出诚实回答。
+
+    2026-11-10 事故的根因就是"事后追加免责提示"——提示挂在"预约成功"后面，
+    用户先读到的仍然是"预约成功"。所以新契约是：假话根本不进入流式输出。
+    """
     model = FakeChatModel(
-        [{"chunks": ["已为您预约成功"], "turn": ChatTurn(text="已为您预约成功")}]
+        [
+            {"chunks": ["已为您预约成功"], "turn": ChatTurn(text="已为您预约成功")},
+            {"chunks": ["抱歉，我刚才没有真正执行预约。"], "turn": ChatTurn(text="抱歉，我刚才没有真正执行预约。")},
+        ]
     )
     engine, metrics = make_engine(model)
     text, _ = await collect(engine)
 
-    assert "已为您预约成功" in text
+    assert "已为您预约成功" not in text  # 假话没被下发
+    assert "抱歉，我刚才没有真正执行预约。" in text  # 纠正后是诚实回答
     assert FALSE_CONFIRMATION_NOTICE not in text
     counters = metrics.snapshot()["counters"]
     assert counters["false_confirmation_retries"] == 1
@@ -221,7 +232,7 @@ async def test_false_confirmation_corrective_retry_forces_real_tool_call():
     engine, metrics = make_engine(model)
     text, _ = await collect(engine, "帮我预约神经内科")
 
-    assert "已为您预约成功" in text  # 第一轮假话已流式下发，无法撤回
+    assert "已为您预约成功" not in text  # 第一轮假话在下发前就被截断
     assert "预约手续已完成" in text  # 纠正后真正执行了工具
     assert FALSE_CONFIRMATION_NOTICE not in text  # 纠正成功 → 不再追加免责提示
     counters = metrics.snapshot()["counters"]
@@ -229,8 +240,12 @@ async def test_false_confirmation_corrective_retry_forces_real_tool_call():
     assert counters["hallucination_suspected"] == 1
 
 
-async def test_corrective_retry_still_false_then_notice_appended():
-    """纠正重试后模型仍编造成功 → 追加免责提示兜底"""
+async def test_corrective_retry_still_false_then_fallback_replaces_text():
+    """纠正重试后模型仍编造成功 → 整段作废，换成陈述事实的兜底文案。
+
+    注意：不是"追加"免责提示（那样用户仍会先读到"预约成功"），
+    而是**替换**成"没有办理成功"的诚实结论。
+    """
     model = FakeChatModel(
         [
             {"chunks": ["已为您预约成功"], "turn": ChatTurn(text="已为您预约成功")},
@@ -243,10 +258,14 @@ async def test_corrective_retry_still_false_then_notice_appended():
     engine, metrics = make_engine(model)
     text, _ = await collect(engine, "帮我预约神经内科")
 
-    assert FALSE_CONFIRMATION_NOTICE in text
+    assert "已为您预约成功" not in text
+    assert "预约好了" not in text
+    assert FALLBACK_BOOKING_NOT_DONE in text
+    assert FALSE_CONFIRMATION_NOTICE not in text
     counters = metrics.snapshot()["counters"]
     assert counters["false_confirmation_retries"] == 1
     assert counters["hallucination_suspected"] == 2  # 两轮都被判定
+    assert counters["hallucination_fallbacks"] == 1
 
 
 async def test_prior_booking_in_history_suppresses_notice_and_retry():
@@ -309,8 +328,181 @@ async def test_cancelled_booking_in_history_still_flags_false_confirmation():
     engine, metrics = make_engine(model, store=FakeStore(history))
     text, _ = await collect(engine, "挂号成功了吗？")
 
+    assert "预约好了" not in text  # 取消过号后再说"已经预约好了"仍是幻觉 → 截断
+    assert "已重新预约" in text  # 纠正重试后真正调用了工具
     assert FALSE_CONFIRMATION_NOTICE not in text  # 纠正重试成功
     assert metrics.snapshot()["counters"]["false_confirmation_retries"] == 1
+
+
+async def test_false_confirmation_is_not_partially_leaked():
+    """回看窗口：承诺的**开头几个字**也不能漏给用户。
+
+    "已为您预约成功"要等到"预约"两个字出现才命中正则，起点却在更早的"已"。
+    没有回看窗口就会先漏出"已"再被截断 —— 用户看到半截承诺。
+    """
+    model = FakeChatModel(
+        [
+            {
+                # 逐字下发，模拟真实流式的分块边界
+                "chunks": ["好", "的", "，", "我", "已", "为", "您", "预", "约", "成", "功"],
+                "turn": ChatTurn(text="好的，我已为您预约成功"),
+            },
+            {
+                "turn": ChatTurn(
+                    tool_calls=[ToolCall(id="1", name="预约挂号", arguments={})]
+                )
+            },
+            {"chunks": ["已受理"], "turn": ChatTurn(text="已受理")},
+        ]
+    )
+    engine, metrics = make_engine(model)
+    text, _ = await collect(engine, "帮我预约神经内科")
+
+    assert "预约成功" not in text
+    assert "我已为您预约" not in text
+    assert "已受理" in text
+
+
+async def test_long_prefix_before_claim_is_kept():
+    """承诺之前的正常内容应当保留（不能整段丢掉）"""
+    prefix = "好的，我已经仔细核对过您的全部信息，包括姓名、身份证号、就诊日期和时段，"
+    model = FakeChatModel(
+        [
+            {
+                "chunks": [prefix, "已为您预约成功"],
+                "turn": ChatTurn(text=prefix + "已为您预约成功"),
+            },
+            {
+                "turn": ChatTurn(
+                    tool_calls=[ToolCall(id="1", name="预约挂号", arguments={})]
+                )
+            },
+            {"chunks": ["已受理"], "turn": ChatTurn(text="已受理")},
+        ]
+    )
+    engine, metrics = make_engine(model)
+    text, _ = await collect(engine, "帮我预约神经内科")
+
+    assert "已经仔细核对过您的全部信息" in text
+    assert "预约成功" not in text
+
+
+async def test_truncated_prefix_is_trimmed_to_sentence_boundary():
+    """截断后不能留下半截句子（"…上午" + 兜底 → 读起来像病句）"""
+    model = FakeChatModel(
+        [
+            {
+                "chunks": [
+                    "很遗憾，您在2026年11月11日上午",
+                    "已为您预约成功，请按时就诊。",
+                ],
+                "turn": ChatTurn(
+                    text="很遗憾，您在2026年11月11日上午已为您预约成功，请按时就诊。"
+                ),
+            },
+            {
+                "turn": ChatTurn(
+                    tool_calls=[ToolCall(id="1", name="预约挂号", arguments={})]
+                )
+            },
+            {
+                "chunks": ["抱歉，本次预约没有办理成功——系统没有生成对应的预约记录。"],
+                "turn": ChatTurn(text="抱歉，本次预约没有办理成功——系统没有生成对应的预约记录。"),
+            },
+        ]
+    )
+    engine, metrics = make_engine(model)
+    text, _ = await collect(engine, "帮我预约神经内科")
+
+    assert "预约成功" not in text
+    assert "上午" not in text  # 半截句子不能留在正文里
+    # 纠正重试后模型给出了诚实答复（不是引擎兜底文案）
+    assert "没有办理成功" in text
+
+
+async def test_textual_tool_call_is_intercepted_before_user():
+    """模型把工具调用写成纯文本 JSON → 原始参数不能漏给用户，且要纠正重试。
+
+    实测（qwen2.5:7b）：模型不发出结构化 tool_call，而是把
+    `预约挂号 {"username": "张三", ...}` 当正文吐出来 ——
+    用户看到一坨 JSON，而且工具一次都没执行。
+    """
+    json_text = (
+        '预约挂号 {"username": "张三", "id_card": "110101199005054322",'
+        ' "department": "神经内科", "date": "2026-11-20", "time": "上午"}'
+    )
+    model = FakeChatModel(
+        [
+            {"chunks": [json_text], "turn": ChatTurn(text=json_text)},
+            {
+                "turn": ChatTurn(
+                    tool_calls=[ToolCall(id="1", name="预约挂号", arguments={})]
+                )
+            },
+            {"chunks": ["已受理"], "turn": ChatTurn(text="已受理")},
+        ]
+    )
+    engine, metrics = make_engine(model)
+    text, _ = await collect(engine, "帮我预约神经内科")
+
+    assert "id_card" not in text  # 原始参数不能漏给用户
+    assert "110101199005054322" not in text
+    assert "已受理" in text
+    counters = metrics.snapshot()["counters"]
+    assert counters["textual_tool_call_truncated"] == 1
+
+
+async def test_narrated_tool_call_triggers_corrective_retry():
+    """模型只说"我将调用预约挂号工具"却没真调 → 必须逼它真的调一次。
+
+    2026-11-10 真实前端联调实测：用户看到一句"我将调用预约挂号工具"，
+    然后什么都没发生，工具一次都没执行（trace tool_call_count=0）。
+    """
+    model = FakeChatModel(
+        [
+            {
+                "chunks": ["好的，我将为您提交预约请求。请稍等，我将调用预约挂号工具。"],
+                "turn": ChatTurn(
+                    text="好的，我将为您提交预约请求。请稍等，我将调用预约挂号工具。"
+                ),
+            },
+            {
+                "turn": ChatTurn(
+                    tool_calls=[ToolCall(id="1", name="预约挂号", arguments={})]
+                )
+            },
+            {"chunks": ["预约已办好"], "turn": ChatTurn(text="预约已办好")},
+        ]
+    )
+    engine, metrics = make_engine(model)
+    text, _ = await collect(engine, "帮我预约神经内科")
+
+    counters = metrics.snapshot()["counters"]
+    assert counters["narrated_tool_call_retries"] == 1
+    assert "预约已办好" in text
+
+
+async def test_narrated_tool_call_only_retried_once():
+    """纠正重试后仍只是口头承诺 → 不再无限重试，保留模型的说明文字"""
+    model = FakeChatModel(
+        [
+            {
+                "chunks": ["我这就调用预约挂号工具。"],
+                "turn": ChatTurn(text="我这就调用预约挂号工具。"),
+            },
+            {
+                "chunks": ["我还是调用预约挂号工具。"],
+                "turn": ChatTurn(text="我还是调用预约挂号工具。"),
+            },
+        ]
+    )
+    engine, metrics = make_engine(model)
+    text, _ = await collect(engine, "帮我预约神经内科")
+
+    counters = metrics.snapshot()["counters"]
+    assert counters["narrated_tool_call_retries"] == 1
+    assert model.calls == 2  # 只重试了一轮
+    assert "调用预约挂号工具" in text
 
 
 async def test_request_metrics_are_recorded():
