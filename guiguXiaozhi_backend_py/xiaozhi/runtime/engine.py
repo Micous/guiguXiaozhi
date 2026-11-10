@@ -41,12 +41,10 @@ from xiaozhi.memory.store import ConversationStore
 from xiaozhi.models.quality import (
     booking_executed_in_history,
     claim_kind,
-    claim_span,
     corrective_prompt,
     detect_narrated_tool_call,
     detect_textual_tool_call,
     fallback_for,
-    textual_tool_call_span,
     inspect_turn,
 )
 from xiaozhi.ops.metrics import MetricsCollector
@@ -58,18 +56,19 @@ from xiaozhi.reliability.resilience import (
 from xiaozhi.reliability.tracing import get_trace_id, trace_span
 from xiaozhi.runtime.intent import should_inject_knowledge
 from xiaozhi.runtime.state import TurnState
+from xiaozhi.runtime.stream_filter import (
+    LOOKBEHIND,
+    StreamFilter,
+    safe_prefix as _safe_prefix,
+    trim_to_sentence as _trim_to_sentence,
+)
 from xiaozhi.security.secure_executor import SecureToolExecutor, ToolCall as SecureToolCall
 from xiaozhi.tools.registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
 
-# 流式下发的**回看窗口**（字）。
-#
-# 承诺正则要等匹配文本完整出现才命中，而命中点比承诺**起点**晚十几个字
-# （"已为您预约成功"要等到"预约"出现才命中，起点却在更早的"已"）。
-# 不留窗口就会先漏出"已"再被截断 —— 用户看到半截承诺。
-# 窗口必须 >= 最长承诺正则的长度（当前最长约 20 字），取 40 留足余量。
-LOOKBEHIND = 40
+# 回看窗口 / 句子裁剪 / 截断前缀已迁至 runtime/stream_filter.py（E3）；
+# 这里保留旧名字导入，兼容既有引用（特征测试从 engine 导入这些名字）。
 
 
 class _TurnView:
@@ -80,61 +79,6 @@ class _TurnView:
     def __init__(self, text: str, tool_calls: Any) -> None:
         self.text = text
         self.tool_calls = tool_calls
-
-
-# 句子边界（截断时保留到这里为止，避免留下半截句子）
-_SENTENCE_END = "。！？!?\n"
-# 次级边界：没有完整句子时，裁到最近的逗号，至少保留已经说清的信息
-_CLAUSE_END = "，,、;；"
-
-
-def _trim_to_sentence(text: str) -> str:
-    """把文本裁到最后一个完整句子的边界。
-
-    截断承诺时，承诺之前的前缀往往停在半句上
-    （"很遗憾，您在2026年11月11日上午" + 兜底文案 → 读起来像病句）。
-
-    裁剪策略：
-      1. 有完整句子 → 裁到最后一个句末标点；
-      2. 只有逗号分句 → 裁到最后一个逗号（保留已经说清的信息）；
-      3. 连逗号都没有 → 整段丢弃（半句话比不完整更糟）。
-
-    **保留标点**：裁出来的"很遗憾，"要带着逗号，
-    后面接下一句时读起来才通顺（"很遗憾，抱歉，本次预约…"）。
-    """
-    if not text:
-        return ""
-    cut = -1
-    for index, char in enumerate(text):
-        if char in _SENTENCE_END:
-            cut = index + 1
-    if cut >= 0:
-        return text[:cut].rstrip()
-    for index, char in enumerate(text):
-        if char in _CLAUSE_END:
-            cut = index + 1
-    if cut < 0:
-        return ""
-    return text[:cut].rstrip()
-
-
-def _safe_prefix(turn_buffer: str, full_text: str) -> str:
-    """从完整输出里切出"实际下发给用户"的那一段（去掉被截断的承诺及其后续）。
-
-    ``turn_buffer`` 是流式拼出来的完整文本，``full_text`` 是 holder 里的
-    同一段文本；两者一致时直接按承诺起点裁剪，不一致时保守返回空串。
-
-    裁剪后再裁到句子边界 —— 承诺前的半截句子对用户没有意义。
-    """
-    if not full_text:
-        return ""
-    if turn_buffer.startswith(full_text):
-        span = claim_span(full_text)
-        if span is None:
-            return full_text
-        return _trim_to_sentence(full_text[: span[1]])
-    # 兜底：holder 文本与流式缓冲不一致（理论上不该发生）→ 宁可丢也别漏
-    return ""
 
 
 def _last_assistant_text(history: Sequence[Any]) -> str:
@@ -329,141 +273,63 @@ class AgentEngine:
                         holder: Dict[str, Any] = {}
                         emitted = False
                         attempt_error: Optional[Exception] = None
-                        # 放在 try 外面：流异常时也能把已收到的内容补发出去
-                        turn_buffer = ""
-                        pending_start = 0
-                        suppressed = False
-                        truncated_claim: Optional[str] = None
-                        textual_tool_call = False
                         detected_text = ""
+                        # ---- 虚假承诺的**下发前**拦截 ----
+                        # 2026-11-10 事故：模型没调任何工具，却两次输出"预约成功"，
+                        # 而事后追加的免责提示是挂在"预约成功"后面的 —— 用户先读到的
+                        # 仍然是"预约成功"。所以必须在承诺**流式下发之前**截断，
+                        # 事后补救（追加提示 / 兜底文案）无法收回已显示的字。
+                        # 只有"承诺不成立"时才拦截：挂号/取消工具**真的成功执行过**，
+                        # 或本会话早前确实挂过号 —— 这时"已经预约好了"是真话。
+                        # 注意不能只看 successful_tool_calls：查询号源也算工具调用，
+                        # 但"查询成功"不等于"预约成功"。
+                        # （E3：回看窗口/claim 拦截/textual 切割收敛进 StreamFilter）
+                        stream_filter = StreamFilter(
+                            claim_is_legit=state.claim_is_legit(prior_booking),
+                            query_executed_success=state.query_executed_success,
+                            metrics=self.metrics,
+                            trace_id=trace_id,
+                        )
                         try:
-                            # ---- 虚假承诺的**下发前**拦截 ----
-                            # 2026-11-10 事故：模型没调任何工具，却两次输出"预约成功"，
-                            # 而事后追加的免责提示是挂在"预约成功"后面的 —— 用户先读到的
-                            # 仍然是"预约成功"。所以必须在承诺**流式下发之前**截断，
-                            # 事后补救（追加提示 / 兜底文案）无法收回已显示的字。
-                            #
-                            # **回看窗口**：承诺的正则要等"匹配文本完整出现"才能命中，
-                            # 而它的**起点**可能比命中点早十几个字（"已为您预约成功"
-                            # 要等到"预约"两个字出现才命中，起点却在更早的"已"）。
-                            # 所以这里留出 LOOKBEHIND 个字不立即下发，
-                            # 承诺就能在"露头"之前被拦下来。
-                            # 只有"承诺不成立"时才拦截：挂号/取消工具**真的成功执行过**，
-                            # 或本会话早前确实挂过号 —— 这时"已经预约好了"是真话。
-                            # 注意不能只看 successful_tool_calls：查询号源也算工具调用，
-                            # 但"查询成功"不等于"预约成功"。
-                            claim_is_legit = state.claim_is_legit(prior_booking)
                             async for delta in self.chat_model.stream_chat(
                                 messages, tools=tools, result_holder=holder
                             ):
-                                if not delta:
-                                    continue
-                                turn_buffer += delta
-                                if suppressed:
-                                    # 承诺之后的内容一律不下发（但**继续读完流**，
-                                    # 否则拿不到 tool_calls，工具就永远不会被执行）
-                                    continue
-                                # 「把工具调用写成纯文本 JSON」也要拦在下发之前：
-                                # 原始参数漏给用户是一方面，更关键的是
-                                # 工具一次都没执行 —— 用户以为在办事，其实什么都没发生。
-                                textual_span = (
-                                    None
-                                    if claim_is_legit
-                                    else textual_tool_call_span(turn_buffer)
-                                )
-                                if textual_span is not None:
-                                    textual_tool_call = True
-                                    suppressed = True
-                                    # 精确切掉"工具名 + JSON"这一段，
-                                    # 切割点不对就会把参数漏给用户
-                                    safe = _trim_to_sentence(
-                                        turn_buffer[pending_start : textual_span[0]]
-                                    )
-                                    if safe:
-                                        result.text += safe
-                                        emitted = True
-                                        emitted_this_turn = True
-                                        yield TextResponseEvent(
-                                            trace_id=trace_id, metadata={"delta": safe}
-                                        )
-                                    pending_start = len(turn_buffer)
-                                    self.metrics.inc("textual_tool_call_truncated")
-                                    logger.warning(
-                                        "模型把工具调用写成了纯文本，就地截断：trace=%s",
-                                        trace_id,
-                                    )
-                                    continue
-                                match = None if claim_is_legit else claim_span(turn_buffer)
-                                if (
-                                    match is not None
-                                    and match[0] == "query"
-                                    and state.query_executed_success
-                                ):
-                                    # 查询工具真的执行过 → "查询结果显示…"是真话
-                                    match = None
-                                if match is not None:
-                                    kind, start, _end = match
-                                    truncated_claim = kind
-                                    suppressed = True
-                                    # 承诺之前的前缀无害，补发出去（承诺本身被丢掉）
-                                    safe = _trim_to_sentence(turn_buffer[pending_start:start])
-                                    if safe:
-                                        result.text += safe
-                                        emitted = True
-                                        emitted_this_turn = True
-                                        yield TextResponseEvent(
-                                            trace_id=trace_id, metadata={"delta": safe}
-                                        )
-                                    pending_start = len(turn_buffer)
-                                    self.metrics.inc("false_confirmation_truncated")
-                                    logger.warning(
-                                        "模型输出中出现虚假成功承诺，就地截断：trace=%s kind=%s",
-                                        trace_id,
-                                        kind,
-                                    )
-                                    continue
-                                # 回看窗口：末尾 LOOKBEHIND 个字先留着不下发，
-                                # 等下一段文本来了再判断它是不是承诺的开头
-                                flush_upto = len(turn_buffer) - LOOKBEHIND
-                                if flush_upto > pending_start:
-                                    chunk = turn_buffer[pending_start:flush_upto]
-                                    pending_start = flush_upto
-                                    result.text += chunk
+                                safe = stream_filter.feed(delta)
+                                if safe:
+                                    result.text += safe
                                     emitted = True
                                     emitted_this_turn = True
                                     yield TextResponseEvent(
-                                        trace_id=trace_id, metadata={"delta": chunk}
+                                        trace_id=trace_id, metadata={"delta": safe}
                                     )
                             # 本轮结束：把回看窗口里剩下的字补发出去
-                            if not suppressed and pending_start < len(turn_buffer):
-                                chunk = turn_buffer[pending_start:]
-                                result.text += chunk
+                            safe = stream_filter.flush()
+                            if safe:
+                                result.text += safe
                                 emitted = True
                                 emitted_this_turn = True
                                 yield TextResponseEvent(
-                                    trace_id=trace_id, metadata={"delta": chunk}
+                                    trace_id=trace_id, metadata={"delta": safe}
                                 )
                             candidate = holder.get("turn") or _empty_turn()
                             # 检测用**完整**文本（含被截断的承诺）；
                             # 下发给用户 / 写进历史的是**裁剪后**的文本。
                             # 两者分开，才不会因为"先把谎话删掉"而检测不到它。
                             detected_text = candidate.text
-                            if truncated_claim is not None:
-                                candidate.text = _safe_prefix(turn_buffer, detected_text)
+                            stream_filter.apply_truncation(candidate)
                         except Exception as exc:
                             attempt_error = exc
                             candidate = _empty_turn()
                             detected_text = ""
                             # 流中断：把已经收到、但还压在回看窗口里的内容补发出去，
                             # 否则用户会凭空少看到一截
-                            if not suppressed and pending_start < len(turn_buffer):
-                                chunk = turn_buffer[pending_start:]
-                                pending_start = len(turn_buffer)
-                                result.text += chunk
+                            safe = stream_filter.flush()
+                            if safe:
+                                result.text += safe
                                 emitted = True
                                 emitted_this_turn = True
                                 yield TextResponseEvent(
-                                    trace_id=trace_id, metadata={"delta": chunk}
+                                    trace_id=trace_id, metadata={"delta": safe}
                                 )
 
                         finding = inspect_turn(
@@ -473,6 +339,7 @@ class AgentEngine:
                         )
                         # 结构化事件：谎话被就地截断也是"走了兜底路径"，
                         # events 通道要能看到（裸文本模式不消费此事件，前端零改动）
+                        truncated_claim = stream_filter.truncated_claim
                         if truncated_claim is not None:
                             yield DegradedEvent(
                                 trace_id=trace_id,
