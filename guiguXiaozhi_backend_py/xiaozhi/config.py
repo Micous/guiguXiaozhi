@@ -79,10 +79,25 @@ class Settings(BaseSettings):
     #   deny  —— 拒绝（更严格，适合生产环境按需开启）
     permission_no_ui: str = "allow"
 
+    # ---------- 可靠性 ----------
+    retry_backoff_base: float = 0.1
+    circuit_failure_threshold: int = 3
+    circuit_recovery_timeout: float = 30.0
+    tool_failure_threshold: int = 3  # 单请求内某工具连续失败 N 次即熔断该工具
+    drain_timeout: float = 10.0
+
+    # ---------- 限流 ----------
+    enable_rate_limit: bool = True
+    rate_limit_max_requests: int = 30
+    rate_limit_window_seconds: float = 60.0
+
     # ---------- 可观测 ----------
     log_level: str = "INFO"
+    json_logs: bool = True
+    enable_metrics: bool = True
     trace_max: int = 500
     trace_persist_dir: str = str(ROOT / "logs" / "traces")
+    audit_log_path: str = str(ROOT / "logs" / "audit.jsonl")
 
     @property
     def mysql_url(self) -> str:

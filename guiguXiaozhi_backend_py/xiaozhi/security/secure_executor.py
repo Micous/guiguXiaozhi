@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, Optional
 
 from xiaozhi.core.tool import Tool, ToolResult
+from xiaozhi.ops.audit import AuditLogger
 from xiaozhi.security.injection import detect_injection
 from xiaozhi.security.permissions import (
     Decision,
@@ -41,10 +42,16 @@ class SecureToolExecutor:
         permission_engine: PermissionDecisionEngine,
         no_ui_policy: str = "allow",
         approval_callback: Optional[Callable[[str, ToolCall], Awaitable[bool]]] = None,
+        audit_logger: Optional[AuditLogger] = None,
     ) -> None:
         self.permission_engine = permission_engine
         self.no_ui_policy = no_ui_policy
         self.approval_callback = approval_callback
+        self.audit_logger = audit_logger
+
+    def _audit(self, event_type: str, **fields: Any) -> None:
+        if self.audit_logger is not None:
+            self.audit_logger.record(event_type, **fields)
 
     async def execute(self, tool_call: ToolCall, tool: Tool) -> ToolResult:
         """执行一次工具调用（四层安全流）"""
@@ -53,6 +60,14 @@ class SecureToolExecutor:
         # ---- L1 权限决策 ----
         decision = self.permission_engine.decide(
             tool_call.tool_name, tool_call.user_id, scope, tool_call.trace_id
+        )
+        self._audit(
+            "permission_decision",
+            decision=decision.value,
+            tool_name=tool_call.tool_name,
+            user_id=tool_call.user_id,
+            trace_id=tool_call.trace_id,
+            args=tool_call.args,
         )
         if decision == Decision.DENY:
             return ToolResult.fail(
@@ -106,14 +121,25 @@ class SecureToolExecutor:
                     error_type="PromptInjection",
                 )
 
-        # ---- L4 执行 ----
+        # ---- L4 执行 + 审计 ----
         try:
-            return await tool.timed_call(tool_call.args)
+            result = await tool.timed_call(tool_call.args)
         except Exception as exc:  # 兜底：工具异常不外泄
             logger.exception("工具执行异常")
-            return ToolResult.fail(
+            result = ToolResult.fail(
                 f"工具执行异常：{type(exc).__name__}: {exc}", error_type="ToolExecutionError"
             )
+        self._audit(
+            "tool_execution",
+            tool_name=tool_call.tool_name,
+            user_id=tool_call.user_id,
+            trace_id=tool_call.trace_id,
+            success=result.success,
+            error_type=result.error_type,
+            duration_ms=round(result.execution_time * 1000, 2),
+            result_preview=result.content[:200],
+        )
+        return result
 
     @staticmethod
     def _validate_generic(tool_call: ToolCall) -> Optional[str]:

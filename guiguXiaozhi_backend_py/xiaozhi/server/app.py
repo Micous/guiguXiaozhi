@@ -29,12 +29,17 @@ def create_app() -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        app.state.container = await get_application()
-        logger.info("应用已就绪，模型=%s", app.state.container.chat_model.model)
+        container = await get_application()
+        app.state.container = container
+        logger.info("应用已就绪，模型=%s", container.chat_model.model)
         try:
             yield
         finally:
-            await app.state.container.aclose()
+            # SIGTERM：停止收新请求 → 等在途请求完成 → 释放连接
+            container.shutdown.begin()
+            drained = await container.shutdown.wait_until_drained()
+            logger.info("优雅停机：在途请求排空=%s", drained)
+            await container.aclose()
 
     app.router.lifespan_context = lifespan
 

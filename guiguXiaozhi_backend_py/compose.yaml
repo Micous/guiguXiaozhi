@@ -1,0 +1,30 @@
+# Python 版后端容器。
+# MySQL / MongoDB / Milvus / Ollama 仍由宿主机的 ./start-local.sh 启动，
+# 容器通过 host.docker.internal 回连，避免与现有容器编排冲突。
+#
+#   cd guiguXiaozhi_backend_py && docker compose up --build -d
+#   curl http://localhost:8081/health
+#
+# Linux 上 host.docker.internal 由下面的 extra_hosts 映射；
+# macOS / Windows 的 Docker Desktop 原生支持。
+
+services:
+  xiaozhi-py:
+    build: .
+    image: guigu-xiaozhi-py:local
+    container_name: guigu-xiaozhi-py
+    ports:
+      - "8081:8081"
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8081
+      OLLAMA_BASE_URL: http://host.docker.internal:11434
+      MILVUS_URI: http://host.docker.internal:19530
+      MYSQL_HOST: host.docker.internal
+      MYSQL_PORT: 3306
+      MONGO_URI: mongodb://host.docker.internal:27017
+      LOG_LEVEL: INFO
+      JSON_LOGS: "true"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped

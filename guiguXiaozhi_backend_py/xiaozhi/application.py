@@ -21,6 +21,11 @@ from xiaozhi.memory.store import (
     ResilientConversationStore,
 )
 from xiaozhi.models.ollama import OllamaChatModel, OllamaEmbeddingModel
+from xiaozhi.ops.audit import AuditLogger
+from xiaozhi.ops.lifecycle import GracefulShutdown, HealthChecker, RateLimiter
+from xiaozhi.ops.metrics import MetricsCollector
+from xiaozhi.reliability.logging import configure_logging
+from xiaozhi.reliability.resilience import CircuitBreaker, RetryConfig
 from xiaozhi.reliability.trace_store import TraceStore, set_default_store
 from xiaozhi.repositories.appointment_repo import (
     AppointmentRepository,
@@ -65,12 +70,18 @@ class Application:
     secure_executor: SecureToolExecutor
     engine: AgentEngine
     trace_store: TraceStore
+    metrics: MetricsCollector
+    audit: AuditLogger
+    health: HealthChecker
+    rate_limiter: RateLimiter
+    shutdown: GracefulShutdown
 
     async def aclose(self) -> None:
         """优雅停机：释放连接"""
         await self.chat_model.aclose()
         await self.embedding_model.aclose()
         await self.conversation_store.close()
+        self.audit.close()
 
 
 def load_system_prompt() -> str:
@@ -91,10 +102,7 @@ def load_system_prompt() -> str:
 async def get_application(settings: Optional[Settings] = None) -> Application:
     """装配整个应用"""
     settings = settings or get_settings()
-    logging.basicConfig(
-        level=getattr(logging, settings.log_level.upper(), logging.INFO),
-        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-    )
+    configure_logging(settings.log_level, json_output=settings.json_logs)
 
     # ---- 追踪 ----
     trace_store = TraceStore(
@@ -102,6 +110,14 @@ async def get_application(settings: Optional[Settings] = None) -> Application:
     )
     trace_store.load_from_disk()
     set_default_store(trace_store)
+
+    # ---- 运维组件 ----
+    metrics = MetricsCollector()
+    audit = AuditLogger(settings.audit_log_path)
+    rate_limiter = RateLimiter(
+        settings.rate_limit_max_requests, settings.rate_limit_window_seconds
+    )
+    shutdown = GracefulShutdown(settings.drain_timeout)
 
     # ---- 模型 ----
     chat_model = OllamaChatModel(
@@ -183,10 +199,47 @@ async def get_application(settings: Optional[Settings] = None) -> Application:
         ]
     )
 
+    # ---- 健康检查 ----
+    health = HealthChecker()
+
+    async def _probe_model() -> dict:
+        try:
+            resp = await chat_model.client.get(
+                f"{chat_model.base_url}/api/tags", timeout=3.0
+            )
+            return {"ok": resp.status_code == 200, "name": chat_model.model}
+        except Exception as exc:
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    def _probe_milvus() -> dict:
+        # 只查元数据可达性。不要用 count()：它内部会 flush（Milvus 的重操作，
+        # 实测 >2s），拿来做存活探针会把 /ready 拖慢甚至超时。
+        client = vector_store.client
+        has_alias = client.has_collection(vector_store.alias)
+        versioned = [
+            name
+            for name in client.list_collections()
+            if name.startswith(f"{vector_store.alias}_v")
+        ]
+        return {
+            "ok": bool(has_alias or versioned),
+            "alias": vector_store.alias,
+            "collections": versioned[:3],
+        }
+
+    def _probe_mysql() -> dict:
+        return {"ok": repository.list_all(limit=1) is not None}
+
+    health.register("model", _probe_model)
+    health.register("milvus", _probe_milvus)
+    health.register("mysql", _probe_mysql)
+
     # ---- 权限 ----
     permission_engine = PermissionDecisionEngine.from_yaml(Path(settings.permissions_file))
     secure_executor = SecureToolExecutor(
-        permission_engine, no_ui_policy=settings.permission_no_ui
+        permission_engine,
+        no_ui_policy=settings.permission_no_ui,
+        audit_logger=audit,
     )
 
     # ---- 运行时 ----
@@ -200,6 +253,18 @@ async def get_application(settings: Optional[Settings] = None) -> Application:
         retriever=rag,
         max_turns=settings.max_turns,
         max_tool_calls=settings.max_tool_calls,
+        metrics=metrics,
+        retry_config=RetryConfig(
+            max_attempts=settings.ollama_max_retries + 1,
+            base_delay=settings.retry_backoff_base,
+        ),
+        circuit_breaker=CircuitBreaker(
+            "ollama",
+            failure_threshold=settings.circuit_failure_threshold,
+            recovery_timeout=settings.circuit_recovery_timeout,
+        ),
+        request_timeout=settings.request_timeout,
+        tool_failure_threshold=settings.tool_failure_threshold,
     )
 
     return Application(
@@ -216,4 +281,9 @@ async def get_application(settings: Optional[Settings] = None) -> Application:
         secure_executor=secure_executor,
         engine=engine,
         trace_store=trace_store,
+        metrics=metrics,
+        audit=audit,
+        health=health,
+        rate_limiter=rate_limiter,
+        shutdown=shutdown,
     )
