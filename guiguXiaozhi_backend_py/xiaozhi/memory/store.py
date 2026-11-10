@@ -13,12 +13,36 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from xiaozhi.core.message import Message
+
+logger = logging.getLogger(__name__)
+
+
+def _decode_messages(raw: Any, memory_id: str) -> List[Message]:
+    """安全解码消息列表：损坏条目跳过并告警，绝不让整段历史加载失败。
+
+    此前用 Message.from_dict 直接解码 —— Mongo 里一条未知 role 的脏消息
+    会让整个会话 load 失败（返回 []），用户视角就是"对话失忆"。
+    """
+    if not isinstance(raw, list):
+        return []
+    messages: List[Message] = []
+    skipped = 0
+    for item in raw:
+        message = Message.from_dict_safe(item)
+        if message is None:
+            skipped += 1
+            continue
+        messages.append(message)
+    if skipped:
+        logger.warning("会话 %s 有 %d 条损坏消息被跳过", memory_id, skipped)
+    return messages
 
 
 class ConversationStore(ABC):
@@ -102,8 +126,7 @@ class MongoConversationStore(ConversationStore):
             raw = json.loads(doc.get("content") or "[]")
         except json.JSONDecodeError:
             return []
-        messages = [Message.from_dict(item) for item in raw]
-        return messages[-limit:]
+        return _decode_messages(raw, str(memory_id))[-limit:]
 
     async def save(self, memory_id: str, messages: List[Message]) -> None:
         payload = json.dumps([m.to_dict() for m in messages], ensure_ascii=False, default=str)
@@ -149,7 +172,7 @@ class FileConversationStore(ConversationStore):
             return []
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
-            return [Message.from_dict(item) for item in raw][-limit:]
+            return _decode_messages(raw, memory_id)[-limit:]
         except Exception:
             return []
 

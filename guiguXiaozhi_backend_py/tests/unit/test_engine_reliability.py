@@ -514,3 +514,59 @@ async def test_request_metrics_are_recorded():
     assert snapshot["counters"]["requests_total"] == 1
     assert snapshot["counters"]["llm_calls_total"] == 1
     assert snapshot["histograms"]["request_duration_ms"]["count"] == 1
+
+
+async def test_tool_results_are_persisted_with_assistant_message():
+    """落库必须包含工具结果消息 —— 此前只存 assistant(tool_calls)，
+    下一请求的历史里"发起了调用"却找不到对应结果，序列残缺
+    （2026-11-10 审计发现）。"""
+    model = FakeChatModel(
+        [
+            {
+                "turn": ChatTurn(
+                    tool_calls=[
+                        ToolCall(id="t1", name="查询是否有号源", arguments={})
+                    ]
+                )
+            },
+            {"chunks": ["查到了"], "turn": ChatTurn(text="查到了")},
+        ]
+    )
+    store = FakeStore()
+    engine, _ = make_engine(model, store=store)
+    await collect(engine, "帮我查号源")
+
+    saved = store.saved
+    assert any(m.role == Role.TOOL for m in saved), "工具结果消息没有落库"
+    assistant_idx = next(i for i, m in enumerate(saved) if m.tool_calls)
+    tool_idx = next(i for i, m in enumerate(saved) if m.role == Role.TOOL)
+    assert tool_idx == assistant_idx + 1  # 结果紧跟发起调用的 assistant
+    assert saved[tool_idx].tool_call_id == saved[assistant_idx].tool_calls[0].id
+
+
+async def test_persisted_history_is_complete_sequence():
+    """落库序列完整性：每个 assistant(tool_calls) 的每个调用都有配对结果"""
+    model = FakeChatModel(
+        [
+            {
+                "turn": ChatTurn(
+                    tool_calls=[
+                        ToolCall(id="t1", name="查询是否有号源", arguments={}),
+                        ToolCall(id="t2", name="查询科室专家", arguments={}),
+                    ]
+                )
+            },
+            {"chunks": ["都查到了"], "turn": ChatTurn(text="都查到了")},
+        ]
+    )
+    store = FakeStore()
+    engine, _ = make_engine(model, store=store)
+    await collect(engine, "查号源和专家")
+
+    saved = store.saved
+    call_ids = {c.id for m in saved if m.tool_calls for c in m.tool_calls}
+    result_ids = {
+        m.tool_call_id for m in saved if m.role == Role.TOOL
+    }
+    assert {"t1", "t2"} <= call_ids
+    assert {"t1", "t2"} <= result_ids

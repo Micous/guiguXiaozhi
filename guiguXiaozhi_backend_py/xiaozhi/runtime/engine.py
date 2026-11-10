@@ -276,6 +276,10 @@ class AgentEngine:
             # （booking/cancel 的 legit 标记不覆盖查询，需要单独跟踪）。
             query_executed_success = False
             tool_results: List[Message] = []
+            # 请求级留档：本轮全部工具结果消息（跨轮累积）。
+            # 此前落库只存 assistant(tool_calls)，结果消息丢失 ——
+            # 下一请求的历史里"发起了调用"却找不到对应结果，序列残缺。
+            persisted_tool_results: List[Message] = []
             tool_failures: Dict[str, int] = {}
             # 最近一次工具失败（工具名 / 错误类型 / 原始反馈），
             # 用于生成**与事实相符**的兜底文案
@@ -718,15 +722,15 @@ class AgentEngine:
                         },
                     )
 
-                    tool_results.append(
-                        Message.tool_result(
-                            tool_result.content,
-                            call.id,
-                            call.name,
-                            is_error=tool_result.is_error,
-                            error_type=tool_result.error_type,
-                        )
+                    result_message = Message.tool_result(
+                        tool_result.content,
+                        call.id,
+                        call.name,
+                        is_error=tool_result.is_error,
+                        error_type=tool_result.error_type,
                     )
+                    tool_results.append(result_message)
+                    persisted_tool_results.append(result_message)
                     result.tool_calls.append(call)
 
                 # ---- 工具结果回填，继续下一轮 ----
@@ -758,6 +762,10 @@ class AgentEngine:
                             metadata=outcome_meta,
                         )
                     )
+                    # 工具结果按序落库：assistant(tool_calls) 之后必须跟得上
+                    # 对应的 tool 消息（tool_call_id 配对），否则下一请求
+                    # 组装出的历史是模型无法理解的残缺序列
+                    new_messages.extend(persisted_tool_results)
                     await self.conversation_store.save(memory_id, new_messages)
                 except Exception as exc:
                     write_span.set_error(f"{type(exc).__name__}: {exc}")

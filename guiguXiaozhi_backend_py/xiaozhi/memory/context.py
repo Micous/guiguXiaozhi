@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from dataclasses import dataclass, field
@@ -27,6 +28,57 @@ _COMPLETION_CLAIM_RE = re.compile(
 
 
 NEUTRAL_HISTORY_REPLY = "好的，我已了解您的需求。"
+
+
+def _estimate_message_tokens(message: Message) -> int:
+    """**完整消息**的 token 估算（content + tool_calls 参数 JSON）。
+
+    只算 content 会低估带工具调用的消息——参数 JSON（身份证号、科室、日期）
+    同样占预算；低估会让实际注入超出模型上下文窗口。
+    """
+    total = estimate_tokens_approx(message.content)
+    if message.tool_calls:
+        try:
+            payload = json.dumps(
+                [call.to_dict() for call in message.tool_calls],
+                ensure_ascii=False,
+                default=str,
+            )
+            total += estimate_tokens_approx(payload)
+        except (TypeError, ValueError):  # pragma: no cover - 防御性
+            pass
+    return total
+
+
+def _build_atomic_blocks(history: List[Message]) -> List[List[Message]]:
+    """把历史切成**原子块**：``assistant(tool_calls)`` 与其后的 tool 结果不可拆分。
+
+    发给 Ollama 的序列里，tool 结果必须紧跟在发起调用的 assistant 之后
+    （靠 tool_call_id 配对）。按单条消息裁剪会把两者切开，
+    产生模型无法理解的残缺序列 —— 这是 2026-11-10 审计发现的裁剪缺陷。
+
+    块的划分：
+      * ``assistant`` 带 tool_calls → 开启新块，其后连续的 ``tool`` 消息并入；
+      * 其余（user / 纯文本 assistant / 孤儿 tool）各自成块。
+    """
+    blocks: List[List[Message]] = []
+    pending: List[Message] = []  # 当前工具调用块（assistant + 其 tool 结果）
+    for message in history:
+        if message.role == Role.ASSISTANT and message.tool_calls:
+            if pending:
+                blocks.append(pending)
+                pending = []
+            pending.append(message)
+        elif message.role == Role.TOOL and pending:
+            pending.append(message)
+        else:
+            if pending:
+                blocks.append(pending)
+                pending = []
+            blocks.append([message])
+    if pending:
+        blocks.append(pending)
+    return blocks
 
 
 def neutralize_history_reply(text: str) -> str:
@@ -161,16 +213,22 @@ class ContextAssembler:
             else:
                 dropped += 1
 
-        # 短期历史：从最早的开始裁剪
-        kept: List[Message] = list(history)
-        while kept:
-            oldest = kept[0]
-            oldest_tokens = estimate_tokens_approx(oldest.content)
-            if used + oldest_tokens <= self.token_budget:
+        # 短期历史：按**原子块**从最早开始裁剪。
+        # assistant(tool_calls) 与其 tool 结果永不拆开 —— 拆开会发给 Ollama
+        # 一个 tool_call_id 配不上的残缺序列（2026-11-10 审计修复）。
+        # token 计量含 tool_calls 参数 JSON，不再只算 content（防低估超预算）。
+        blocks = _build_atomic_blocks(history)
+        sizes = [sum(_estimate_message_tokens(m) for m in block) for block in blocks]
+        suffix = sum(sizes)
+        start = len(blocks)
+        for index, size in enumerate(sizes):
+            if used + suffix <= self.token_budget:
+                start = index
                 break
-            kept.pop(0)
-            dropped += 1
-        used += sum(estimate_tokens_approx(m.content) for m in kept)
+            suffix -= size
+        kept = [message for block in blocks[start:] for message in block]
+        dropped += sum(len(block) for block in blocks[:start])
+        used += suffix
 
         return AssembledContext(
             system_prompt=system_prompt,

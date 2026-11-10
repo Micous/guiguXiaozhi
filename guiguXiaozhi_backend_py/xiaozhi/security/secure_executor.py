@@ -44,6 +44,11 @@ class SecureToolExecutor:
         approval_callback: Optional[Callable[[str, ToolCall], Awaitable[bool]]] = None,
         audit_logger: Optional[AuditLogger] = None,
     ) -> None:
+        # no_ui_policy 是安全兜底开关，拼错字符串等于静默改策略 —— 启动即报错
+        if no_ui_policy not in ("allow", "deny"):
+            raise ValueError(
+                f"no_ui_policy 只能是 'allow' 或 'deny'，收到：{no_ui_policy!r}"
+            )
         self.permission_engine = permission_engine
         self.no_ui_policy = no_ui_policy
         self.approval_callback = approval_callback

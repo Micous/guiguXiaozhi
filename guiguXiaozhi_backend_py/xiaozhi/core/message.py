@@ -77,12 +77,19 @@ class Message:
         return cls(role=Role.USER, content=content, metadata=metadata)
 
     @classmethod
-    def assistant(cls, content: str = "", tool_calls: Optional[List[ToolCall]] = None) -> "Message":
+    def assistant(
+        cls,
+        content: str = "",
+        tool_calls: Optional[List[ToolCall]] = None,
+        **metadata: Any,
+    ) -> "Message":
+        """构造助手消息；metadata 供落库时打结果标记（booking_executed 等）"""
         return cls(
             role=Role.ASSISTANT,
             content=content,
             type=MessageType.TOOL_CALL if tool_calls else MessageType.TEXT,
             tool_calls=list(tool_calls or []),
+            metadata=metadata,
         )
 
     @classmethod
@@ -143,6 +150,46 @@ class Message:
             if data.get("timestamp")
             else datetime.now(),
         )
+
+    @classmethod
+    def from_dict_safe(cls, data: Any) -> Optional["Message"]:
+        """容错反序列化：脏数据返回 ``None`` 而不是抛异常。
+
+        Mongo / 文件里的一条坏消息（未知 role、坏 timestamp、非 dict 结构）
+        不该让**整段会话历史**加载失败 —— load 返回 [] 等于会话失忆
+        （2026-11-10 审计发现的存储缺陷）。存储层应配合本方法，
+        跳过损坏条目并记录数量。
+        """
+        if not isinstance(data, dict):
+            return None
+        try:
+            role = Role(str(data.get("role") or ""))
+        except ValueError:
+            return None
+        try:
+            timestamp = (
+                datetime.fromisoformat(data["timestamp"])
+                if data.get("timestamp")
+                else datetime.now()
+            )
+            return cls(
+                role=role,
+                content=str(data.get("content") or ""),
+                type=MessageType(data.get("type", "text")),
+                message_id=data.get("message_id") or uuid.uuid4().hex,
+                parent_id=data.get("parent_id"),
+                tool_calls=[
+                    ToolCall.from_dict(c)
+                    for c in data.get("tool_calls", [])
+                    if isinstance(c, dict)
+                ],
+                tool_call_id=data.get("tool_call_id"),
+                tool_name=data.get("tool_name"),
+                metadata=dict(data.get("metadata") or {}),
+                timestamp=timestamp,
+            )
+        except (ValueError, TypeError, KeyError):
+            return None
 
     def __str__(self) -> str:  # pragma: no cover - 便于日志排查
         return f"[{self.role.value}/{self.type.value}] {self.content[:120]}"

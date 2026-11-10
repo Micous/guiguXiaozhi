@@ -8,10 +8,11 @@ from __future__ import annotations
 import hashlib
 import json
 import threading
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 
@@ -72,9 +73,18 @@ class PermissionDecisionEngine:
 
     DEFAULT_SCOPE = "__tool__"
 
-    def __init__(self, policies: Optional[Dict[str, PermissionLevel]] = None) -> None:
+    def __init__(
+        self,
+        policies: Optional[Dict[str, PermissionLevel]] = None,
+        approval_ttl_seconds: float = 300.0,
+    ) -> None:
         self._policies: Dict[str, PermissionLevel] = dict(policies or {})
-        self._approvals: Set[Tuple[str, str, str]] = set()
+        # 授权缓存：(user_id, tool_name, 参数指纹) -> 授权时刻（monotonic）。
+        # 2026-11-10 审计修复：此前 _approvals 只在 record_approval 里写入、
+        # decide() 从不查询 —— 授权是死数据，ASK 工具每次都要重新确认。
+        # 现在缓存授权带 TTL，过期自动失效。
+        self._approvals: Dict[Tuple[str, str, str], float] = {}
+        self.approval_ttl_seconds = max(0.0, float(approval_ttl_seconds))
         self._audit: List[AuditEntry] = []
         self._lock = threading.Lock()
 
@@ -97,6 +107,9 @@ class PermissionDecisionEngine:
         if not path.exists():
             return engine
         data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        ttl = data.get("approval_ttl_seconds")
+        if ttl is not None:
+            engine.approval_ttl_seconds = max(0.0, float(ttl))
         for name, spec in (data.get("tools") or {}).items():
             level = spec.get("level", "ask") if isinstance(spec, dict) else str(spec)
             try:
@@ -131,6 +144,13 @@ class PermissionDecisionEngine:
             self._log(user_id, tool_name, Decision.ALLOW, "策略：自动放行", trace_id)
             return Decision.ALLOW
 
+        # ASK：先查缓存授权（同 user + 同工具 + 同参数指纹，且未过 TTL）
+        # —— 此前这段查询缺失，授权记录成了死数据（2026-11-10 审计修复）
+        if self._was_approved_before(user_id, tool_name, scope):
+            self._log(
+                user_id, tool_name, Decision.ALLOW, "命中缓存授权（参数指纹一致）", trace_id
+            )
+            return Decision.ALLOW
         self._log(user_id, tool_name, Decision.ASK_USER, "策略：需确认", trace_id)
         return Decision.ASK_USER
 
@@ -141,18 +161,30 @@ class PermissionDecisionEngine:
         approval_scope: Optional[str] = None,
         trace_id: str = "",
     ) -> None:
-        """记录一次用户授权"""
+        """记录一次用户授权（带 TTL，过期自动失效）"""
         scope = approval_scope or self.DEFAULT_SCOPE
         with self._lock:
-            self._approvals.add((user_id, tool_name, scope))
+            self._approvals[(user_id, tool_name, scope)] = time.monotonic()
         self._log(user_id, tool_name, Decision.ALLOW, "用户已授权", trace_id)
 
     def _was_approved_before(
         self, user_id: str, tool_name: str, approval_scope: Optional[str] = None
     ) -> bool:
         scope = approval_scope or self.DEFAULT_SCOPE
+        key = (user_id, tool_name, scope)
         with self._lock:
-            return (user_id, tool_name, scope) in self._approvals
+            granted_at = self._approvals.get(key)
+            if granted_at is None:
+                return False
+            if time.monotonic() - granted_at > self.approval_ttl_seconds:
+                del self._approvals[key]
+                return False
+            return True
+
+    def clear_approvals(self) -> None:
+        """清空授权缓存（测试 / 运维用）"""
+        with self._lock:
+            self._approvals.clear()
 
     # ---------- 审计 ----------
 
