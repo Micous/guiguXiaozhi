@@ -129,3 +129,34 @@ def test_status_inquiry_detected():
         assert is_status_inquiry(msg), msg
     for msg in ("帮我预约神经内科", "预约挂号", "取消预约"):
         assert not is_status_inquiry(msg), msg
+
+
+def test_booking_flow_short_answers_are_operation():
+    """预约流程中的科室/人名短回复是操作延续，不能注入 RAG。
+
+    2026-11-10 第十轮事故（memoryId 287312）：模型问"您想预约哪个科室"，
+    用户回"外科"/"心脏外科" —— 被当知识问答注入 RAG（通用医学资料），
+    模型推荐"普外科、心脏外科"等本院根本没有的科室，用户照着预约被
+    工具校验拦截；用户报医生姓名"李四"也同理漏判，导致叙述承诺没被门控。
+    """
+    dept_ask = "请问您具体需要预约哪个科室的医生呢？请提供您的姓名、身份证号、预约的科室、日期、时段。"
+    for msg in ("外科", "心脏外科", "呼吸内科", "内科"):
+        assert is_operation_request(msg, dept_ask), msg
+        assert not should_inject_knowledge(msg, dept_ask), msg
+    doctor_ask = "请问您需要预约心脏外科的哪位医生？"
+    assert is_operation_request("李四", doctor_ask)
+    assert not should_inject_knowledge("李四", doctor_ask)
+
+
+def test_booking_flow_questions_stay_knowledge():
+    """预约流程中的疑问句（怎么选科室/多少钱/李四是谁）不被误判成选科室"""
+    dept_ask = "请问您具体需要预约哪个科室的医生呢？"
+    for msg in ("怎么选择科室", "多少钱", "周末可以吗", "李四是谁", "内科和心内科有什么区别？"):
+        assert not is_operation_request(msg, dept_ask), msg
+
+
+def test_short_answers_without_booking_context_unchanged():
+    """上一轮不在谈预约时，短回复维持原判定（不因新规则误伤）"""
+    assert not is_operation_request("外科", "您好！我是硅谷小智，很高兴为您服务。")
+    assert not is_operation_request("李四", "")
+    assert not is_operation_request("心脏外科", "")

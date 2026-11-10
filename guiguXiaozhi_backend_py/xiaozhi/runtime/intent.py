@@ -122,7 +122,44 @@ def is_operation_request(text: str, last_assistant_text: str = "") -> bool:
         last_assistant_text
     ):
         return True
+    # 2026-11-10 第十轮事故补充：预约流程中的**短补全回复**是操作延续，
+    # 不能当知识问答注入 RAG。真实链路（memoryId 287312）：模型问
+    # "您想预约哪个科室"，用户回"外科"/"心脏外科" —— 被当知识问答
+    # 注入 RAG（通用医学资料），模型答出"普外科、泌尿外科、胸外科、
+    # 心脏外科、整形外科"等**本院根本没有的科室**，用户照着约"心脏外科"
+    # 被工具校验拦截，白绕一大圈。同理"李四"这类报医生姓名的短回复。
+    if last_assistant_text and mentions_operation(last_assistant_text):
+        if _is_department_answer(text) or _is_bare_name_answer(text):
+            return True
     return False
+
+
+# 预约流程中的**科室短回复**（"外科" / "心脏外科" / "呼吸内科"）：
+# 上一轮在谈预约/挂号时，这类回复是在选科室，不是在问医学知识。
+_DEPT_ANSWER_RE = re.compile(r"^[？?，,。！!~\s…]*[\u4e00-\u9fa5]{1,6}科室?[？?，,。！!~\s…]*$")
+
+# 预约流程中的**人名短回复**（"李四" / "王新勃"）：报患者或医生姓名。
+# 排除疑问词（"多少钱" "周末呢"仍是提问，按知识问答处理）。
+_QUESTIONISH_RE = re.compile(r"吗|呢|嘛|吧|什么|怎么|如何|多少|哪|谁|？|\?")
+_BARE_NAME_EXCLUDE_RE = _QUESTIONISH_RE
+
+
+def _is_department_answer(text: str) -> bool:
+    t = (text or "").strip()
+    if not t or len(t) > 12:
+        return False
+    if _QUESTIONISH_RE.search(t):
+        return False
+    return "科" in t and bool(_DEPT_ANSWER_RE.match(t))
+
+
+def _is_bare_name_answer(text: str) -> bool:
+    t = (text or "").strip()
+    if not t or len(t) > 4:
+        return False
+    if _BARE_NAME_EXCLUDE_RE.search(t):
+        return False
+    return bool(re.match(r"^[\u4e00-\u9fa5]{2,4}$", t))
 
 
 # ---------------------------------------------------------------------------

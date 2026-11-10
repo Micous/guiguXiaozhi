@@ -812,8 +812,18 @@ class AgentEngine:
                             )
                         )
                     else:
+                        # 2026-11-10 第十轮事故：纠正重试后 result.text 累积了
+                        # **两轮**文本（第一轮幻觉承诺 + 重试轮回答），用户在
+                        # 前端看到两段回复无缝拼接，历史里也存了拼接文本教坏
+                        # 下一轮。落库只存**最后一轮**的回复（final_reply_text
+                        # 在每个无 tool_calls 轮更新）；第一轮文本已流出无法
+                        # 撤回，但绝不能再进历史。
                         new_messages.append(
-                            Message(role=Role.ASSISTANT, content=result.text, metadata=outcome_meta)
+                            Message(
+                                role=Role.ASSISTANT,
+                                content=final_reply_text or result.text,
+                                metadata=outcome_meta,
+                            )
                         )
                     # 工具结果按序落库：assistant(tool_calls) 之后必须跟得上
                     # 对应的 tool 消息（tool_call_id 配对），否则下一请求

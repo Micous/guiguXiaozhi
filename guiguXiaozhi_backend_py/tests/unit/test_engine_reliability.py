@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import pytest
 import sys
 from pathlib import Path
 
@@ -688,3 +689,47 @@ async def test_agent_end_reports_corrective_retries():
     _, events = await collect(engine, "帮我预约神经内科")
     end = [e for e in events if e.event_type == EventType.AGENT_END][0]
     assert end.metadata["corrective_retries"] == 1
+
+
+@pytest.mark.asyncio
+async def test_corrective_retry_does_not_merge_rounds_into_history():
+    """纠正重试后落库只保留最后一轮回复，叙述承诺不得进历史。
+
+    2026-11-10 第十轮事故（memoryId 287312 [19]）：轮1输出叙述承诺被门控
+    拦截 → 轮2裸 tool_call（空文本）→ 轮3最终回复。result.text 跨轮累积，
+    落库把轮1+轮3拼成一条 assistant content，历史里留下"承诺+回答"的
+    拼接文本，用户端也看到两段回复无缝粘在一起。
+    """
+    narration = "好的，我将为您预约心脏外科的李四医生。请稍等，我将为您完成预约。"
+    final = "您好，本院没有心脏外科这个科室。"
+    model = FakeChatModel(
+        [
+            {"chunks": [narration], "turn": ChatTurn(text=narration)},
+            {
+                "chunks": [],
+                "turn": ChatTurn(
+                    text="",
+                    tool_calls=[
+                        ToolCall(id="c1", name="预约挂号", arguments={"username": "李四"})
+                    ],
+                ),
+            },
+            {"chunks": [final], "turn": ChatTurn(text=final)},
+        ]
+    )
+
+    class FailExecutor:
+        async def execute(self, call, tool):
+            return ToolResult.fail(
+                "参数校验未通过：本院没有【心脏外科】", error_type="ValidationError"
+            )
+
+    engine, _ = make_engine(model, executor=FailExecutor())
+    await collect(engine, "我要预约的医生是李四")
+
+    saved = engine.conversation_store.saved
+    joined = "".join((m.content or "") for m in saved)
+    assert narration not in joined, "叙述承诺文本泄漏进了历史"
+    closing = [m for m in saved if m.role == Role.ASSISTANT and not m.tool_calls]
+    assert closing, "最终回复没有落库"
+    assert closing[-1].content == final, "落库的最终回复应只含最后一轮文本"
