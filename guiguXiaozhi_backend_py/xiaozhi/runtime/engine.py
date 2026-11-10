@@ -57,6 +57,7 @@ from xiaozhi.reliability.resilience import (
 )
 from xiaozhi.reliability.tracing import get_trace_id, trace_span
 from xiaozhi.runtime.intent import should_inject_knowledge
+from xiaozhi.runtime.state import TurnState
 from xiaozhi.security.secure_executor import SecureToolExecutor, ToolCall as SecureToolCall
 from xiaozhi.tools.registry import ToolRegistry
 
@@ -274,39 +275,14 @@ class AgentEngine:
             known_tool_names = [d.name for d in tools]
 
             turn = 0
-            tool_call_count = 0
-            successful_tool_calls = 0  # 请求级：用于抑制"工具已执行后的总结轮"误报
-            # 请求级工具真实执行结果：打在持久化消息上，供下一请求的
-            # booking_executed_in_history 判定"历史里是否真的成功预约过"。
-            # 只看 tool_calls 会把失败调用也当成已预约（2026-11-10 事故根因）。
-            booking_executed_success = False
-            cancel_executed_success = False
-            # 本请求里查询工具（号源/科室专家）真实执行成功过 →
-            # 模型转述"查询结果显示…"是真话，不能当编造拦截
-            # （booking/cancel 的 legit 标记不覆盖查询，需要单独跟踪）。
-            query_executed_success = False
-            tool_results: List[Message] = []
-            # 请求级留档：本轮全部工具结果消息（跨轮累积）。
-            # 此前落库只存 assistant(tool_calls)，结果消息丢失 ——
-            # 下一请求的历史里"发起了调用"却找不到对应结果，序列残缺。
-            persisted_tool_results: List[Message] = []
-            tool_failures: Dict[str, int] = {}
-            # 最近一次工具失败（工具名 / 错误类型 / 原始反馈），
-            # 用于生成**与事实相符**的兜底文案
-            last_tool_failure: Optional[Dict[str, Any]] = None
+            # ---- 请求级跨轮状态（E2 收敛）----
+            # 工具执行跟踪、纠正重试、文本账本全部收进 TurnState：
+            # 写入只经方法（不变量在方法内维护），读取直接访问字段。
+            # 第十轮"纠正重试拼接"事故的根源就是状态没有单一事实来源。
+            state = TurnState()
             # 历史里是否真的执行过预约（本次会话早前请求成功挂过号且未取消）。
             # 是真话依据：模型说"已经预约好了"时不算幻觉，也不做纠正重试。
             prior_booking = booking_executed_in_history(history)
-            corrective_used = 0     # 已做过的纠正重试次数（每请求至多 1 次）
-            corrective_pending = False  # 本轮检测到幻觉且待纠正
-            corrective_kind: Optional[str] = None  # 幻觉承诺的操作类型（book/cancel）
-            # 2026-11-10 第七轮事故：落库把**所有轮次**的流式文本合并成一条
-            # assistant content，"好的，我将为您预约内科。请稍等，我正在查询…"
-            # 这类叙述段进了历史 → 下一轮模型**原样照抄**句式、零工具调用。
-            # 拆开记录：叙述段（带 tool_calls 轮的文本）与最终回复
-            # （最后一个无 tool_calls 轮的文本）分开落库。
-            narrative_text = ""     # 带 tool_calls 轮的模型文本（叙述段）
-            final_reply_text = ""   # 最后一个无 tool_calls 轮的文本（真正给用户的最终回复）
 
             while turn < self.max_turns:
                 # ---- 请求级时间预算 ----
@@ -376,11 +352,7 @@ class AgentEngine:
                             # 或本会话早前确实挂过号 —— 这时"已经预约好了"是真话。
                             # 注意不能只看 successful_tool_calls：查询号源也算工具调用，
                             # 但"查询成功"不等于"预约成功"。
-                            claim_is_legit = (
-                                booking_executed_success
-                                or cancel_executed_success
-                                or prior_booking
-                            )
+                            claim_is_legit = state.claim_is_legit(prior_booking)
                             async for delta in self.chat_model.stream_chat(
                                 messages, tools=tools, result_holder=holder
                             ):
@@ -425,7 +397,7 @@ class AgentEngine:
                                 if (
                                     match is not None
                                     and match[0] == "query"
-                                    and query_executed_success
+                                    and state.query_executed_success
                                 ):
                                     # 查询工具真的执行过 → "查询结果显示…"是真话
                                     match = None
@@ -497,11 +469,7 @@ class AgentEngine:
                         finding = inspect_turn(
                             _TurnView(detected_text, candidate.tool_calls),
                             known_tool_names,
-                            tool_executed=(
-                                booking_executed_success
-                                or cancel_executed_success
-                                or prior_booking
-                            ),
+                            tool_executed=state.tool_executed_for_inspect(prior_booking),
                         )
                         # 结构化事件：谎话被就地截断也是"走了兜底路径"，
                         # events 通道要能看到（裸文本模式不消费此事件，前端零改动）
@@ -552,22 +520,21 @@ class AgentEngine:
                                 llm_span.set_attribute("textual_tool_call", True)
                                 # 已经在流式阶段截断过了，这里只需安排纠正重试，
                                 # 让模型用**结构化 tool_call** 重新发起
-                                if corrective_used == 0 and not corrective_pending:
-                                    corrective_pending = True
-                                    corrective_kind = "tool_call"
+                                if state.can_schedule_corrective():
+                                    state.schedule_corrective("tool_call")
                                     llm_span.set_attribute("corrective_retry_scheduled", True)
                             claim = truncated_claim or claim_kind(detected_text)
                             if finding.false_confirmation or (
-                                claim == "query" and not query_executed_success
+                                claim == "query" and not state.query_executed_success
                             ):
                                 self.metrics.inc("hallucination_suspected")
                                 llm_span.set_attribute("hallucination_suspected", True)
                                 llm_span.set_attribute("claim_kind", claim)
-                                if corrective_used == 0 and not prior_booking:
+                                if state.corrective_used == 0 and not prior_booking:
                                     # 先不追加免责提示——注入纠正提示重试一轮，
-                                    # 逼迫模型真正调用工具（比事后提示更能纠错）
-                                    corrective_pending = True
-                                    corrective_kind = claim
+                                    # 逼迫模型真正调用工具（比事后提示更能纠错）。
+                                    # pending 已置位时仍**覆盖** kind（旧行为）。
+                                    state.override_corrective(claim)
                                     llm_span.set_attribute(
                                         "corrective_retry_scheduled", True
                                     )
@@ -579,14 +546,14 @@ class AgentEngine:
                                 else:
                                     # 纠正重试后仍然编造成功：**丢弃**这段文本，
                                     # 换成陈述事实的兜底文案 —— 绝不能让"预约成功"显示给用户
-                                    fallback = fallback_for(claim, last_tool_failure)
+                                    fallback = fallback_for(claim, state.last_tool_failure)
                                     prefix = (result.text or "").rstrip()
                                     if prefix:
                                         prefix += "\n\n"
                                     result.text = prefix + fallback
                                     # 落库的最终回复也要跟着换成兜底文案，
                                     # 不能让被截掉的谎话文本进历史
-                                    final_reply_text = result.text
+                                    state.set_final_reply(result.text)
                                     yield TextResponseEvent(
                                         trace_id=trace_id,
                                         metadata={"delta": fallback},
@@ -632,18 +599,16 @@ class AgentEngine:
 
                 # ---- 没有工具调用 → 结束（或纠正重试一轮） ----
                 if not response.tool_calls:
-                    final_reply_text = response.text
+                    state.set_final_reply(response.text)
                     # 模型说"我这就调用预约挂号工具"却没真调 —— 逼它真的调一次。
                     # （2026-11-10 实测：用户看到"我将调用预约挂号工具"，
                     #   然后什么都没发生，工具一次都没执行。）
                     if (
-                        not corrective_pending
-                        and corrective_used == 0
+                        state.can_schedule_corrective()
                         and operation_request
                         and detect_narrated_tool_call(response.text)
                     ):
-                        corrective_pending = True
-                        corrective_kind = "action"
+                        state.schedule_corrective("action")
                         self.metrics.inc("narrated_tool_call_retries")
                         span.set_attribute("narrated_tool_call", True)
                         logger.warning(
@@ -651,9 +616,8 @@ class AgentEngine:
                             trace_id,
                         )
 
-                    if corrective_pending:
-                        corrective_pending = False
-                        corrective_used += 1
+                    corrective_fired, corrective_kind = state.consume_corrective()
+                    if corrective_fired:
                         if corrective_kind != "action":
                             self.metrics.inc("false_confirmation_retries")
                         messages.append(
@@ -672,13 +636,13 @@ class AgentEngine:
 
                 # ---- 执行工具 ----
                 assistant_message = Message.assistant(response.text, tool_calls=response.tool_calls)
-                narrative_text = response.text
+                state.set_narration(response.text)
                 messages.append(self._assistant_to_ollama(assistant_message))
 
                 for call in response.tool_calls:
-                    if tool_call_count >= self.max_tool_calls:
+                    if state.tool_call_count >= self.max_tool_calls:
                         logger.warning("工具调用次数达到上限，停止本轮工具调用")
-                        tool_results.append(
+                        state.tool_results.append(
                             Message.tool_result(
                                 "本轮工具调用次数已达上限，请直接给出建议。",
                                 call.id,
@@ -688,7 +652,7 @@ class AgentEngine:
                         )
                         break
 
-                    tool_call_count += 1
+                    state.tool_call_count += 1
                     yield ToolExecuteEvent(
                         trace_id=trace_id,
                         metadata={"tool_name": call.name, "tool_id": call.id},
@@ -704,7 +668,8 @@ class AgentEngine:
                                 f"工具【{call.name}】不存在。", error_type="ToolNotFound"
                             )
                         elif (
-                            tool_failures.get(call.name, 0) >= self.tool_failure_threshold
+                            state.failure_count(call.name)
+                            >= self.tool_failure_threshold
                         ):
                             tool_span.set_attribute("circuit_open", True)
                             tool_result = ToolResult.fail(
@@ -721,25 +686,9 @@ class AgentEngine:
                             tool_result = await self.secure_executor.execute(secure_call, tool)
 
                         if tool_result.success:
-                            tool_failures[call.name] = 0
-                            successful_tool_calls += 1
-                            if call.name == "预约挂号":
-                                booking_executed_success = True
-                            elif call.name == "取消预约挂号":
-                                cancel_executed_success = True
-                            elif call.name in ("查询是否有号源", "查询科室专家"):
-                                query_executed_success = True
+                            state.record_tool_success(call.name)
                         else:
-                            tool_failures[call.name] = tool_failures.get(call.name, 0) + 1
-                            # 记住**失败原因**：模型编造"预约成功"时，兜底文案要
-                            # 反映工具的真实反馈（"已有预约，请勿重复"），
-                            # 而不是笼统地说"没有生成记录" —— 后者在用户明明
-                            # 已经约过号时是误导。
-                            last_tool_failure = {
-                                "tool": call.name,
-                                "error_type": tool_result.error_type,
-                                "content": tool_result.content,
-                            }
+                            state.record_tool_failure(call.name, tool_result)
 
                         self.metrics.record_tool(call.name, tool_result.success)
                         self.metrics.observe(
@@ -772,14 +721,12 @@ class AgentEngine:
                         is_error=tool_result.is_error,
                         error_type=tool_result.error_type,
                     )
-                    tool_results.append(result_message)
-                    persisted_tool_results.append(result_message)
+                    state.add_tool_result(result_message)
                     result.tool_calls.append(call)
 
                 # ---- 工具结果回填，继续下一轮 ----
-                for message in tool_results:
+                for message in state.drain_tool_results():
                     messages.append(self._tool_to_ollama(message))
-                tool_results = []
 
                 turn += 1
                 yield TurnEndEvent(
@@ -793,9 +740,9 @@ class AgentEngine:
                     new_messages = list(history)
                     new_messages.append(Message.user(user_input))
                     outcome_meta: Dict[str, Any] = {}
-                    if booking_executed_success:
+                    if state.booking_executed_success:
                         outcome_meta["booking_executed"] = True
-                    if cancel_executed_success:
+                    if state.cancel_executed_success:
                         outcome_meta["cancel_executed"] = True
                     # 2026-11-10 第七轮事故修复：assistant 消息按轮次拆开落库。
                     # 旧逻辑把所有轮次的流式文本合并成一条 assistant content，
@@ -807,7 +754,7 @@ class AgentEngine:
                         new_messages.append(
                             Message(
                                 role=Role.ASSISTANT,
-                                content=narrative_text,
+                                content=state.narrative_text,
                                 tool_calls=result.tool_calls,
                             )
                         )
@@ -815,22 +762,22 @@ class AgentEngine:
                         # 2026-11-10 第十轮事故：纠正重试后 result.text 累积了
                         # **两轮**文本（第一轮幻觉承诺 + 重试轮回答），用户在
                         # 前端看到两段回复无缝拼接，历史里也存了拼接文本教坏
-                        # 下一轮。落库只存**最后一轮**的回复（final_reply_text
+                        # 下一轮。落库只存**最后一轮**的回复（state.final_reply_text
                         # 在每个无 tool_calls 轮更新）；第一轮文本已流出无法
                         # 撤回，但绝不能再进历史。
                         new_messages.append(
                             Message(
                                 role=Role.ASSISTANT,
-                                content=final_reply_text or result.text,
+                                content=state.final_or(result.text),
                                 metadata=outcome_meta,
                             )
                         )
                     # 工具结果按序落库：assistant(tool_calls) 之后必须跟得上
                     # 对应的 tool 消息（tool_call_id 配对），否则下一请求
                     # 组装出的历史是模型无法理解的残缺序列
-                    new_messages.extend(persisted_tool_results)
+                    new_messages.extend(state.persisted_tool_results)
                     if result.tool_calls:
-                        closing_text = final_reply_text or result.text
+                        closing_text = state.final_or(result.text)
                         if closing_text.strip():
                             new_messages.append(
                                 Message(
@@ -869,7 +816,7 @@ class AgentEngine:
                 "tool_calls": [c.name for c in result.tool_calls],
                 "text_length": len(result.text),
                 "degraded": result.degraded,
-                "corrective_retries": corrective_used,
+                "corrective_retries": state.corrective_used,
             },
         )
 
