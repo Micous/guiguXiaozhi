@@ -76,12 +76,19 @@ async def chat(request: Request):
     trace_id = new_trace_id()
     set_trace_id(trace_id)
 
+    # format=events：结构化 SSE（每事件一行 data: {json}），
+    # 供新前端/调试工具还原完整执行过程；默认裸文本，前端零改动
+    events_mode = (request.query_params.get("format") or "text").lower() == "events"
+
     async def generate():
         async with container.shutdown.inflight_request():
             try:
                 async for event in container.engine.run(
                     memory_id, message, user_id=user_id
                 ):
+                    if events_mode:
+                        yield event.to_sse()
+                        continue
                     if event.event_type == EventType.TEXT_RESPONSE:
                         delta = event.metadata.get("delta") or event.metadata.get("text") or ""
                         if delta:
@@ -90,11 +97,20 @@ async def chat(request: Request):
                         yield f"\n\n（出错了：{event.metadata.get('error')}）"
             except Exception as exc:  # 兜底：任何异常都要给用户一个可读的回复
                 logger.exception("对话异常")
-                yield f"\n\n（服务暂时异常：{type(exc).__name__}）"
+                if events_mode:
+                    from xiaozhi.core.event import ErrorEvent
+
+                    yield ErrorEvent(trace_id=trace_id, metadata={"error": f"{type(exc).__name__}"}).to_sse()
+                else:
+                    yield f"\n\n（服务暂时异常：{type(exc).__name__}）"
 
     return StreamingResponse(
         generate(),
-        media_type="text/stream;charset=utf-8",
+        media_type=(
+            "text/event-stream;charset=utf-8"
+            if events_mode
+            else "text/stream;charset=utf-8"
+        ),
         headers={
             "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",

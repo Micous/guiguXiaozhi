@@ -48,6 +48,14 @@ class Event:
     def to_json(self) -> str:
         return json.dumps(self.to_dict(), ensure_ascii=False, default=str)
 
+    def to_sse(self) -> str:
+        """SSE 单帧（``data: {json}\\n\\n``）—— 供 /xiaozhi/chat?format=events 使用。
+
+        默认裸文本流保持前端零改动；events 通道让新前端/调试工具
+        能还原完整执行过程（检索、工具调用、降级、纠正重试…）。
+        """
+        return f"data: {self.to_json()}\n\n"
+
 
 @dataclass
 class AgentStartEvent(Event):

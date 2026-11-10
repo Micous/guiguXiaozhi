@@ -124,3 +124,59 @@ def test_big_tool_call_arguments_get_trimmed():
     context = assembler.assemble("s", "hi", history)
     assert all(not m.tool_calls for m in context.history)  # 超预算被裁
     assert context.history and context.history[-1].content == "问题"
+
+
+# ---- 长历史压缩钩子（核心模块第 3 批 T12） ----
+
+from xiaozhi.memory.context import rule_based_summary  # noqa: E402
+
+
+def test_rule_based_summary_captures_tools_and_outcomes():
+    call = ToolCall(id="1", name="预约挂号", arguments={})
+    messages = [
+        Message.user("你好"),
+        Message.assistant("您好，请问有什么可以帮您？"),
+        Message.assistant("", tool_calls=[call], booking_executed=True),
+        Message.tool_result("预约成功。预约详情：神经内科", "1", "预约挂号"),
+    ]
+    text = rule_based_summary(messages)
+    assert "预约挂号" in text
+    assert "预约已成功" in text
+    assert "用户问过" in text
+
+
+def test_summarizer_prepends_summary_when_trimming():
+    """裁剪发生且摘要放得下 → 摘要消息塞回窗口头部"""
+    assembler = ContextAssembler(token_budget=120, summarizer=rule_based_summary)
+    context = assembler.assemble("s", "hi", _history())
+    assert context.history[0].role == Role.SYSTEM
+    assert "摘要" in context.history[0].content
+    # 被裁的长消息没有直接丢掉：摘要里保留了痕迹
+    assert "用户问过" in context.history[0].content
+
+
+def test_no_summarizer_keeps_pure_trimming():
+    assembler = ContextAssembler(token_budget=80)
+    context = assembler.assemble("s", "hi", _history())
+    assert all("摘要" not in m.content for m in context.history)
+
+
+def test_summarizer_exception_is_swallowed():
+    """钩子抛异常 → 退化为纯裁剪，绝不影响组装"""
+    def bad_summary(messages):
+        raise RuntimeError("llm down")
+
+    assembler = ContextAssembler(token_budget=80, summarizer=bad_summary)
+    context = assembler.assemble("s", "hi", _history())
+    assert context.history
+    assert all("摘要" not in m.content for m in context.history)
+
+
+def test_summary_not_added_when_it_does_not_fit():
+    """摘要本身超预算 → 跳过压缩，宁可丢失也不挤掉有效历史"""
+    def huge_summary(messages):
+        return "摘要" + "x" * 500
+
+    assembler = ContextAssembler(token_budget=120, summarizer=huge_summary)
+    context = assembler.assemble("s", "hi", _history())
+    assert all(not m.content.startswith("以下是本次对话更早部分") for m in context.history)

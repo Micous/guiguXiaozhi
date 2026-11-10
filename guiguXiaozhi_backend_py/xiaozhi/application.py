@@ -13,7 +13,7 @@ from typing import List, Optional
 
 from xiaozhi.config import Settings, get_settings
 from xiaozhi.core.tool import Tool
-from xiaozhi.memory.context import ContextAssembler
+from xiaozhi.memory.context import ContextAssembler, rule_based_summary
 from xiaozhi.memory.store import (
     ConversationStore,
     FileConversationStore,
@@ -252,7 +252,10 @@ async def get_application(settings: Optional[Settings] = None) -> Application:
         tool_registry=tool_registry,
         secure_executor=secure_executor,
         conversation_store=conversation_store,
-        context_assembler=ContextAssembler(token_budget=settings.memory_token_budget),
+        context_assembler=ContextAssembler(
+            token_budget=settings.memory_token_budget,
+            summarizer=rule_based_summary,
+        ),
         system_prompt=load_system_prompt(),
         retriever=rag,
         max_turns=settings.max_turns,

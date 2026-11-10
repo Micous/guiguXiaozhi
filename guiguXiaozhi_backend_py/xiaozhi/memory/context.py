@@ -96,6 +96,34 @@ def neutralize_history_reply(text: str) -> str:
     return text
 
 
+def rule_based_summary(messages: List[Message]) -> str:
+    """离线规则摘要：保留操作类信息（工具调用与结论），压缩寒暄与重复内容。
+
+    不接 LLM —— 作为 ``ContextAssembler`` summarizer 钩子的默认实现，
+    后续可无缝替换成 LLM 摘要（接口相同：List[Message] -> str）。
+    """
+    parts: List[str] = []
+    for message in messages:
+        if message.tool_calls:
+            metadata = message.metadata or {}
+            if metadata.get("booking_executed"):
+                outcome = "（预约已成功）"
+            elif metadata.get("cancel_executed"):
+                outcome = "（已取消预约）"
+            else:
+                outcome = ""
+            names = list(dict.fromkeys(call.name for call in message.tool_calls))
+            parts.append("已执行工具：" + "、".join(names) + outcome)
+        elif message.role == Role.TOOL:
+            if message.content.strip():
+                parts.append("工具结论：" + message.content[:80])
+        elif message.role == Role.USER and message.content.strip():
+            parts.append("用户问过：" + message.content[:60])
+        elif message.role == Role.ASSISTANT and message.content.strip():
+            parts.append("助手答过：" + message.content[:60])
+    return "；".join(parts)[:400]
+
+
 @dataclass
 class AssembledContext:
     """组装结果"""
@@ -180,8 +208,21 @@ class AssembledContext:
 class ContextAssembler:
     """上下文组装引擎"""
 
-    def __init__(self, token_budget: int = 4000) -> None:
+    def __init__(
+        self,
+        token_budget: int = 4000,
+        summarizer: Optional[Any] = None,
+    ) -> None:
+        """
+        Args:
+            token_budget: 注入模型的总 token 预算
+            summarizer:   可选的**历史压缩钩子**（List[Message] -> str）。
+                          裁剪丢弃最老消息时，用摘要把它们"浓缩"回窗口头部，
+                          保留更早的上下文。传 ``rule_based_summary`` 用离线
+                          规则实现，或自接 LLM 摘要；不传则维持纯裁剪行为。
+        """
         self.token_budget = token_budget
+        self.summarizer = summarizer
 
     def assemble(
         self,
@@ -230,6 +271,19 @@ class ContextAssembler:
         dropped += sum(len(block) for block in blocks[:start])
         used += suffix
 
+        # 长历史压缩：被裁掉的最老消息若可摘要且预算放得下，
+        # 浓缩成一条摘要消息塞回窗口头部（比"直接丢失"保留更多上下文）
+        dropped_messages = [message for block in blocks[:start] for message in block]
+        if dropped_messages and self.summarizer is not None:
+            summary = self._build_summary(dropped_messages)
+            if summary is not None:
+                summary_tokens = _estimate_message_tokens(summary)
+                if used + summary_tokens <= self.token_budget:
+                    kept = [summary] + kept
+                    used += summary_tokens
+                else:
+                    logger.debug("摘要放不下预算，本次跳过压缩")
+
         return AssembledContext(
             system_prompt=system_prompt,
             knowledge=knowledge,
@@ -237,3 +291,14 @@ class ContextAssembler:
             dropped_items=dropped,
             total_tokens=used,
         )
+
+    def _build_summary(self, dropped_messages: List[Message]) -> Optional[Message]:
+        """生成被裁历史的一条摘要消息；钩子异常或空摘要时返回 None（跳过）"""
+        try:
+            text = self.summarizer(dropped_messages)
+        except Exception:
+            logger.warning("历史摘要生成失败，本次跳过压缩", exc_info=True)
+            return None
+        if not text:
+            return None
+        return Message.system(f"以下是本次对话更早部分的摘要：{text}")

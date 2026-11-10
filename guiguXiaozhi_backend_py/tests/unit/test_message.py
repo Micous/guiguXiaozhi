@@ -100,3 +100,20 @@ def test_validate_user_message_must_not_carry_tool_calls():
     message = Message.user("问题")
     message.tool_calls = [ToolCall(id="1", name="预约挂号")]
     assert message.validate() is not None
+
+
+# ---- 事件 SSE 序列化（核心模块第 3 批 T10） ----
+
+
+def test_event_to_sse_frame_format():
+    import json
+
+    from xiaozhi.core.event import TextResponseEvent
+
+    event = TextResponseEvent(trace_id="t-1", metadata={"delta": "你好"})
+    frame = event.to_sse()
+    assert frame.startswith("data: ") and frame.endswith("\n\n")
+    payload = json.loads(frame[len("data: ") : -2])
+    assert payload["event_type"] == "text_response"
+    assert payload["trace_id"] == "t-1"
+    assert payload["metadata"]["delta"] == "你好"

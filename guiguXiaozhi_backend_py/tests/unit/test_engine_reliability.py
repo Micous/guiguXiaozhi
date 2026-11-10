@@ -101,7 +101,7 @@ def make_engine(model, **kwargs):
         conversation_store=kwargs.pop("store", None) or FakeStore(),
         context_assembler=FakeAssembler(),
         system_prompt="系统提示",
-        retriever=None,
+        retriever=kwargs.pop("retriever", None),
         metrics=metrics,
         retry_config=kwargs.pop("retry_config", None) or RetryConfig(max_attempts=1),
         circuit_breaker=kwargs.pop("breaker", None),
@@ -570,3 +570,81 @@ async def test_persisted_history_is_complete_sequence():
     }
     assert {"t1", "t2"} <= call_ids
     assert {"t1", "t2"} <= result_ids
+
+
+# ---- 事件补全（核心模块第 3 批 T11） ----
+
+
+async def test_retrieval_event_emitted_when_knowledge_injected():
+    """知识注入时必须发出结构化 RetrievalEvent（此前只进 trace）"""
+
+    class FakeHit:
+        text = "神经内科知识"
+        score = 0.9
+        metadata = {"heading_path": "科室/神经内科"}
+
+    class FakeRetriever:
+        async def retrieve(self, text, top_k=2):
+            return [FakeHit()]
+
+    engine, _ = make_engine(
+        FakeChatModel([{"chunks": ["好的"], "turn": ChatTurn(text="好的")}]),
+        retriever=FakeRetriever(),
+    )
+    _, events = await collect(engine, "头痛挂什么科")
+    retrieval = [e for e in events if e.event_type == EventType.RETRIEVAL]
+    assert len(retrieval) == 1
+    assert retrieval[0].metadata["hit_count"] == 1
+    assert retrieval[0].metadata["top_heading"] == "科室/神经内科"
+
+
+async def test_tool_result_event_carries_preview_and_duration():
+    model = FakeChatModel(
+        [
+            {
+                "turn": ChatTurn(
+                    tool_calls=[ToolCall(id="t1", name="查询是否有号源", arguments={})]
+                )
+            },
+            {"chunks": ["查到了"], "turn": ChatTurn(text="查到了")},
+        ]
+    )
+    engine, _ = make_engine(model, executor=FakeExecutor(ToolResult.ok("神经内科有号源")))
+    _, events = await collect(engine, "查号源")
+    results = [e for e in events if e.event_type == EventType.TOOL_RESULT]
+    assert results
+    assert results[0].metadata["result_preview"] == "神经内科有号源"
+    assert "duration_ms" in results[0].metadata
+
+
+async def test_claim_truncation_and_fallback_emit_quality_events():
+    """谎话截断与兜底替换都要发结构化事件 —— events 通道能看到质量防线动作"""
+    model = FakeChatModel(
+        [
+            {"chunks": ["已为您预约成功"], "turn": ChatTurn(text="已为您预约成功")},
+            {
+                "chunks": ["真的，您的挂号已经预约好了"],
+                "turn": ChatTurn(text="真的，您的挂号已经预约好了"),
+            },
+        ]
+    )
+    engine, _ = make_engine(model)
+    _, events = await collect(engine, "帮我预约神经内科")
+
+    degraded = [e for e in events if e.event_type == EventType.DEGRADED]
+    reasons = [e.metadata.get("reason") for e in degraded]
+    assert "claim_truncated" in reasons
+    assert "hallucination_fallback" in reasons
+
+
+async def test_agent_end_reports_corrective_retries():
+    model = FakeChatModel(
+        [
+            {"chunks": ["已为您预约成功"], "turn": ChatTurn(text="已为您预约成功")},
+            {"chunks": ["抱歉，没有真正执行。"], "turn": ChatTurn(text="抱歉，没有真正执行。")},
+        ]
+    )
+    engine, _ = make_engine(model)
+    _, events = await collect(engine, "帮我预约神经内科")
+    end = [e for e in events if e.event_type == EventType.AGENT_END][0]
+    assert end.metadata["corrective_retries"] == 1

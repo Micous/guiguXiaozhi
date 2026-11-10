@@ -27,6 +27,7 @@ from xiaozhi.core.event import (
     AgentStartEvent,
     DegradedEvent,
     Event,
+    RetrievalEvent,
     TextResponseEvent,
     ToolExecuteEvent,
     ToolResultEvent,
@@ -243,6 +244,15 @@ class AgentEngine:
                                 }
                                 for h in hits
                             ],
+                        )
+                        # 结构化事件：此前检索步骤只进 trace，
+                        # events 通道里看不到"知识是什么时候注入的"
+                        yield RetrievalEvent(
+                            trace_id=trace_id,
+                            metadata={
+                                "hit_count": len(hits),
+                                "top_heading": hits[0].metadata.get("heading_path", ""),
+                            },
                         )
 
             # ---- 组装上下文 ----
@@ -486,6 +496,17 @@ class AgentEngine:
                                 or prior_booking
                             ),
                         )
+                        # 结构化事件：谎话被就地截断也是"走了兜底路径"，
+                        # events 通道要能看到（裸文本模式不消费此事件，前端零改动）
+                        if truncated_claim is not None:
+                            yield DegradedEvent(
+                                trace_id=trace_id,
+                                metadata={
+                                    "component": "quality",
+                                    "reason": "claim_truncated",
+                                    "claim_kind": truncated_claim,
+                                },
+                            )
                         # 关键：只有"一个字都没下发"时才允许重试，避免前端出现重复文本
                         retryable = (not emitted) and (
                             attempt_error is not None or finding.needs_retry
@@ -559,6 +580,14 @@ class AgentEngine:
                                     yield TextResponseEvent(
                                         trace_id=trace_id,
                                         metadata={"delta": fallback},
+                                    )
+                                    yield DegradedEvent(
+                                        trace_id=trace_id,
+                                        metadata={
+                                            "component": "quality",
+                                            "reason": "hallucination_fallback",
+                                            "claim_kind": claim,
+                                        },
                                     )
                                     self.metrics.inc("hallucination_fallbacks")
                                     llm_span.set_attribute("hallucination_fallback", True)
@@ -719,6 +748,8 @@ class AgentEngine:
                             "tool_name": call.name,
                             "is_error": tool_result.is_error,
                             "content_length": len(tool_result.content),
+                            "result_preview": tool_result.content[:160],
+                            "duration_ms": round(tool_result.execution_time * 1000, 2),
                         },
                     )
 
@@ -796,6 +827,7 @@ class AgentEngine:
                 "tool_calls": [c.name for c in result.tool_calls],
                 "text_length": len(result.text),
                 "degraded": result.degraded,
+                "corrective_retries": corrective_used,
             },
         )
 
