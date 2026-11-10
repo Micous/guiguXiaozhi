@@ -193,7 +193,7 @@ async def get_application(settings: Optional[Settings] = None) -> Application:
     tool_registry.register_all(
         [
             BookAppointmentTool(repository, slot_service, doctor_service),
-            QuerySlotTool(slot_service),
+            QuerySlotTool(slot_service, doctor_service),
             QueryDoctorsTool(doctor_service),
             CancelAppointmentTool(repository),
         ]

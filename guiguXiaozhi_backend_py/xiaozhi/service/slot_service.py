@@ -88,8 +88,19 @@ class MockSlotService(SlotService):
 
         doctors = self.doctor_service.list_doctors(department)
         if not doctors:
+            # 把本院真实科室清单一起回传：模型拿到权威清单才不会自己编造科室名
+            # （2026-11-10 真实联调：模型被拒后编了个"呼吸科"，真名是"呼吸内科"）
+            try:
+                available = sorted(self.doctor_service.list_departments() or [])
+            except Exception:
+                available = []
+            hint = (
+                f"本院科室有：{'、'.join(available)}。"
+                if available
+                else "请确认科室名称，或让我帮你推荐合适的科室。"
+            )
             return SlotAvailability.none(
-                f"本院暂无【{department}】这个科室，请确认科室名称，或让我帮你推荐合适的科室。"
+                f"本院暂无【{department}】这个科室。{hint}"
             )
 
         # 出诊：同一科室按顺序轮流值上午 / 下午

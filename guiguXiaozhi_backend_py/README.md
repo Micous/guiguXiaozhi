@@ -82,7 +82,7 @@ python run.py
 
 ```bash
 python scripts/eval_rag.py                # 检索召回评估（纯向量 vs 混合检索）
-pytest tests/ -q                          # 全量单测：106 passed / 6 skipped
+pytest tests/ -q                          # 全量单测：110 passed / 6 skipped
 python scripts/compare.py --help          # Java vs Python A/B 对比用法
 python scripts/e2e_appointment.py --help  # 挂号 → MySQL → 取消 端到端联调
 ```

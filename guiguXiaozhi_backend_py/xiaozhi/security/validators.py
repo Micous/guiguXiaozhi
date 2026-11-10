@@ -97,16 +97,37 @@ def validate_username(value: str) -> ValidationResult:
     return ValidationResult.success(username=value)
 
 
+# 科室名的常见**门诊类型**修饰语，去掉后再比对。
+# 注意：不能剥掉"科" —— "儿科"剥掉就变成"儿"，会跟任何以"儿"结尾的名字撞上。
+_DEPARTMENT_SUFFIXES = ("专家门诊", "普通门诊", "门诊")
+
+
+def _normalize_department(value: str) -> str:
+    """把科室名归一化：去掉"专家门诊/普通门诊/门诊"等门诊类型修饰语"""
+    cleaned = (value or "").strip()
+    for suffix in _DEPARTMENT_SUFFIXES:
+        cleaned = cleaned.replace(suffix, "")
+    return cleaned.strip()
+
+
 def validate_department(value: str, known: Optional[List[str]] = None) -> ValidationResult:
-    """科室校验（known 为空时只做非空校验）"""
+    """科室校验（known 为空时只做非空校验）
+
+    **必须与实际能挂号的名录精确比对**（2026-11-10 真实联调踩到）：
+    旧实现用双向子串匹配 `"内科" in "神经内科"` 判定通过，
+    于是"内科"这种**本院并不存在的科室**放过了校验，
+    工具白跑一次才在号源服务那里失败（用户白等一轮）。
+    现在改成"归一化后精确相等"，让校验层与号源服务的判定**保持一致**。
+    """
     value = (value or "").strip()
     if not value:
         return ValidationResult.failure("预约科室不能为空")
     if known:
-        cleaned = value.replace("门诊", "").replace("专家", "").replace("普通", "")
-        if not any(cleaned == k or cleaned in k or k in cleaned for k in known):
+        cleaned = _normalize_department(value)
+        candidates = {_normalize_department(k) for k in known}
+        if cleaned not in candidates:
             return ValidationResult.failure(
-                f"本院没有【{value}】这个科室，可选科室有：{'、'.join(known)}"
+                f"本院没有【{value}】这个科室，可选科室有：{'、'.join(sorted(known))}"
             )
     return ValidationResult.success(department=value)
 

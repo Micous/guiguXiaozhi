@@ -20,6 +20,28 @@ from xiaozhi.service.slot_service import SlotService
 from xiaozhi.tools.argument_normalizer import normalize_arguments
 
 
+def build_department_hint(doctor_service: DoctorService) -> str:
+    """列出本院真实科室，供工具描述里给模型参考。
+
+    2026-11-10 真实联调：用户问"内科"，本院没有泛化的"内科"，
+    模型被拒后**编了一个"呼吸科"**（真名是"呼吸内科"），
+    用户确认"可以"后才被工具再拒一次 —— 用户白等两轮。
+    把清单给模型，它就不需要猜了。
+    """
+    try:
+        departments = sorted(doctor_service.list_departments() or [])
+    except Exception:
+        departments = []
+    if not departments:
+        return ""
+    return (
+        "本院科室有："
+        + "、".join(departments)
+        + "。请从中选择最接近的一个；用户说的若不是其中之一（如“内科”），"
+        "应先向用户说明本院没有该科室并推荐最接近的科室，让用户确认后再预约。"
+    )
+
+
 class BookAppointmentTool(Tool):
     """提交预约"""
 
@@ -32,11 +54,16 @@ class BookAppointmentTool(Tool):
                 "入参：患者姓名、身份证号、预约科室、预约日期(格式如2026-11-20)、预约时段(上午或下午)、预约医生(可选)。"
                 "本工具内部会先查询号源，号源充足才会写入预约记录。"
                 "如果用户只是询问有没有号源而尚未要求提交预约，请改用“查询是否有号源”。"
+                + self._department_hint
             ),
             parameters=[
                 ToolParameter("username", "string", "患者姓名"),
                 ToolParameter("id_card", "string", "患者身份证号"),
-                ToolParameter("department", "string", "预约科室名称，例如：神经内科"),
+                ToolParameter(
+                    "department",
+                    "string",
+                    "预约科室名称，必须是本院真实科室名（见下方清单），不要自己编造或简写",
+                ),
                 ToolParameter("date", "string", "预约日期，格式：2026-11-20"),
                 ToolParameter("time", "string", "预约时段，只能是：上午 或 下午"),
                 ToolParameter("doctor_name", "string", "预约医生姓名，可选；用户没指定时可留空", required=False),
@@ -54,6 +81,15 @@ class BookAppointmentTool(Tool):
         self.repository = repository
         self.slot_service = slot_service
         self.doctor_service = doctor_service
+        # 本院真实科室清单 —— 注入工具描述，避免模型自己编科室名。
+        # 2026-11-10 真实联调：用户问"内科"，本院没有泛化的"内科"，
+        # 模型被拒后**编了一个"呼吸科"**（真名是"呼吸内科"），
+        # 用户确认"可以"后才被工具再拒一次，用户白等两轮。
+        self._department_hint = self._build_department_hint()
+
+    def _build_department_hint(self) -> str:
+        """列出本院科室，供模型选择"""
+        return build_department_hint(self.doctor_service)
 
     async def call(self, params: Dict[str, Any]) -> Any:
         from xiaozhi.core.tool import ToolResult
@@ -165,7 +201,11 @@ class CancelAppointmentTool(Tool):
             parameters=[
                 ToolParameter("username", "string", "患者姓名"),
                 ToolParameter("id_card", "string", "患者身份证号"),
-                ToolParameter("department", "string", "预约科室名称，例如：神经内科"),
+                ToolParameter(
+                    "department",
+                    "string",
+                    "预约科室名称，必须是本院真实科室名（见本工具描述里的科室清单），不要自己编造或简写",
+                ),
                 ToolParameter("date", "string", "预约日期，格式：2026-11-20"),
                 ToolParameter("time", "string", "预约时段，只能是：上午 或 下午"),
             ],
@@ -223,9 +263,14 @@ class QuerySlotTool(Tool):
                 "**并且没有表达要提交预约**时，调用本工具查询。"
                 "入参：科室名称、日期(格式如2026-11-20)、时段(上午或下午)、医生姓名(可选)。"
                 "如果用户已经说了“我要预约/帮我挂号”，请改用“预约挂号”。"
+                + build_department_hint(self.doctor_service)
             ),
             parameters=[
-                ToolParameter("department", "string", "科室名称，例如：神经内科"),
+                ToolParameter(
+                    "department",
+                    "string",
+                    "科室名称，必须是本院真实科室名（见本工具描述里的科室清单）",
+                ),
                 ToolParameter("date", "string", "日期，格式：2026-11-20"),
                 ToolParameter("time", "string", "时段，只能是：上午 或 下午"),
                 ToolParameter("doctor_name", "string", "医生姓名，可选", required=False),
@@ -234,8 +279,13 @@ class QuerySlotTool(Tool):
             permissions_required=[],
         )
 
-    def __init__(self, slot_service: SlotServiceProtocol) -> None:
+    def __init__(
+        self,
+        slot_service: SlotServiceProtocol,
+        doctor_service: DoctorService,
+    ) -> None:
         self.slot_service = slot_service
+        self.doctor_service = doctor_service
 
     async def call(self, params: Dict[str, Any]) -> Any:
         from xiaozhi.core.tool import ToolResult
@@ -266,7 +316,11 @@ class QueryDoctorsTool(Tool):
                 "入参：科室名称，擅长方向关键词(可选)。"
             ),
             parameters=[
-                ToolParameter("department", "string", "科室名称，例如：神经内科"),
+                ToolParameter(
+                    "department",
+                    "string",
+                    "科室名称，必须是本院真实科室名（见本工具描述里的科室清单）",
+                ),
                 ToolParameter("keyword", "string", "擅长方向关键词，可选，例如：脑血管病", required=False),
             ],
             risk_level=RiskLevel.READ_ONLY,
