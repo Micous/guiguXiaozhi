@@ -49,9 +49,23 @@ _CANCEL_CONFIRMATION = re.compile(
     r"|(?:成功|已经)(?:为您|替您|帮你)?取消(?:了)?(?:预约|挂号)?"
 )
 
-# 工具调用被当成纯文本输出（形如「预约挂号\n{...}」）
+# 工具调用被当成纯文本输出。
+#
+# 小模型有两种吐法，**两种都要防**：
+#   A. 工具名在前：「预约挂号 {"username": "张三"}」
+#   B. JSON 在前  ：「{"name": "预约挂号", "arguments": {"username": "张三"}}」
+#
+# 2026-11-10 第五轮事故：只防住了 A，模型改用 B 之后，
+# **原始 JSON 直接漏给用户**（用户看到一坨参数），且工具一次都没执行。
+# 教训：防一种格式 ≠ 防住这个问题，枚举要按"模型实际会吐什么"来，不是按自己想得到的。
+_TOOL_NAMES_PATTERN = r"(预约挂号|取消预约|查询是否有号源|查询科室专家)"
+
 _TEXTUAL_TOOL_CALL = re.compile(
-    r"(预约挂号|取消预约|查询是否有号源|查询科室专家)\s*[{\n\r]"
+    # A 格式：工具名在前，后跟 JSON
+    _TOOL_NAMES_PATTERN + r"\s*[{\n\r]"
+    # B 格式：JSON 在前，里面带 name 字段（引号可能是英文/中文/无）
+    r"|\{\s*[\"\u201c\u2018']?name[\"\u201d\u2019']?\s*:\s*"
+    r"[\"\u201c\u2018']?" + _TOOL_NAMES_PATTERN
 )
 
 # 模型**用文字描述**自己要调工具，但同一轮并没有真的发出 tool_call。
@@ -337,13 +351,68 @@ def detect_textual_tool_call(text: str) -> bool:
 def textual_tool_call_span(text: str) -> Optional[Tuple[str, int, int]]:
     """找出纯文本形式工具调用的位置，返回 (起点, 终点)。
 
-    流式拦截要用它来**精确切掉**那段 JSON —— 只知道"有"是不够的，
+    流式拦截要用它来**精确切掉**那一整段 —— 只知道"有"是不够的，
     切割点不对就会把参数漏给用户。
+
+    切法分两种：
+      * A 格式（工具名在前）：从工具名切到 **JSON 块结束**；
+      * B 格式（JSON 在前）  ：从 ``{`` 切到 **JSON 块结束**。
+
+    "JSON 块结束"的判定：从起始的 ``{`` 开始做**括号配对**，
+    跳过字符串字面量里的括号。这样 ``{"arguments": {"a": "}"}}`` 也能正确收尾。
     """
-    match = _TEXTUAL_TOOL_CALL.search(text or "")
+    text = text or ""
+    match = _TEXTUAL_TOOL_CALL.search(text)
     if match is None:
         return None
-    return (match.start(), match.end())
+
+    # B 格式：JSON 在前 → 从 match.start()（那个 "{"）开始配对
+    if text[match.start() : match.start() + 1] == "{":
+        start = match.start()
+    else:
+        # A 格式：工具名在前 → 工具名本身也不该给用户看，
+        # 所以从工具名处切，JSON 块整体丢弃
+        start = match.start()
+
+    if text[start : start + 1] == "{":
+        end = _json_block_end(text, start)
+    else:
+        # A 格式：切掉工具名 + 紧随其后的 JSON 块
+        brace = text.find("{", start)
+        end = _json_block_end(text, brace) if brace >= 0 else match.end()
+    return (start, end)
+
+
+def _json_block_end(text: str, start: int) -> int:
+    """从 ``text[start] == '{'`` 开始做括号配对，返回该 JSON 块的结束位置（不含）。
+
+    需要跳过字符串字面量内部的括号（``{"a": "}"}``）。
+    找不到配对的 ``}`` 时返回 len(text) —— 流式场景下 JSON 还没吐完，
+    此时应当把**剩余全部**都拦掉，等下一轮再判断。
+    """
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return index + 1
+    # 没配平：JSON 未吐完，整段拦掉
+    return len(text)
 
 
 def detect_narrated_tool_call(text: str) -> bool:
