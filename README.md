@@ -238,7 +238,7 @@ guiguXiaozhi/
 │       ├── App.vue                          # 应用入口
 │       ├── components/ChatWindow.vue        # ★ 核心聊天组件（流式渲染 / 会话管理）
 │       └── main.js                          # Element Plus 注册
-├── start-local.sh                           # ★ 本地一键启动（支持 --python / --with-python / --compare）
+├── start-local.sh                           # ★ 本地一键启动（默认 Python 后端；--java / --with-java / --compare）
 ├── stop-local.sh                            # 停止本地服务
 ├── 改造进度与后续规划.md                     # ★ 两套后端的实施状态与交接文档
 └── logs/                                    # 运行日志（backend.log / backend-py.log / frontend.log）
@@ -255,11 +255,13 @@ guiguXiaozhi/
 
 ```bash
 # 1. 准备依赖（仅首次）
-brew install maven                       # 后端构建
+cd guiguXiaozhi_backend_py
+python3 -m venv .venv && ./.venv/bin/pip install -r requirements.txt
+cd ..
 ollama pull qwen2.5:7b                  # 对话 / 流式对话模型（支持 Function Calling）
 ollama pull andersc/qwen3-embedding:0.6b # 向量化模型（1024 维）
 
-# 2. 一键启动（自动拉起 MySQL / MongoDB 容器、建表、启动前后端）
+# 2. 一键启动（自动拉起 MySQL / MongoDB / Milvus 容器、建表、灌 RAG 索引、启动前后端）
 ./start-local.sh
 
 # 3. 打开浏览器
@@ -270,12 +272,12 @@ open http://localhost:5173
 
 | 步骤 | 说明 |
 |------|------|
-| 环境检查 | 校验 Java / Node / Maven / Ollama / Docker |
-| 中间件 | 启动 `guigu-mysql`（3306）与 `guigu-mongo`（27017）容器，并初始化 `appointment` 表 |
+| 环境检查 | 校验 Python venv / Node / Ollama / Docker |
+| 中间件 | 启动 `guigu-mysql`（3306）、`guigu-mongo`（27017）容器，并初始化 `appointment` 表 |
+| 向量库 | 启动 Milvus standalone（19530）+ etcd + minio |
 | 大模型 | 校验 Ollama 服务与所需模型是否就绪 |
-| 后端 | `mvn spring-boot:run` → http://localhost:8080 |
-| Python 版后端（可选） | `--python` / `--with-python` 时启动 `run.py` → http://localhost:8081；`--compare` 额外产出 A/B 报告 |
-| 前端 | `npm run dev` → http://localhost:5173 |
+| **后端（正式）** | `run.py`（FastAPI，自研 Harness）→ http://localhost:8081 |
+| 前端 | `npm run dev` → http://localhost:5173（`/api` 代理指向 8081） |
 
 停止所有服务：
 
@@ -286,17 +288,24 @@ open http://localhost:5173
 启动后的访问地址：
 
 - 前端页面：<http://localhost:5173>
-- 后端接口：<http://localhost:8080/xiaozhi/chat>
-- 接口文档：<http://localhost:8080/doc.html>
-- 日志目录：`logs/backend.log`、`logs/frontend.log`
+- 后端接口：<http://localhost:8081/xiaozhi/chat>
+- 接口文档：<http://localhost:8081/docs>
+- 链路追踪：<http://localhost:8081/trace>
+- 运行指标：<http://localhost:8081/metrics>
+- 日志目录：`logs/backend-py.log`、`logs/frontend.log`
 
-### Python 版后端（自研 Harness）
+> **Java 版已降级为遗留实现**（`guiguXiaozhi_backend/`，LangChain4j，8080），
+> 保留用于 A/B 对比与回归参考。需要它时用 `./start-local.sh --java`（单跑）或
+> `--with-java` / `--compare`（双跑）。
+
+### Python 版后端（自研 Harness）★ 正式后端
 
 > 方案原文见 `guiguXiaozhi_backend_py/PLAN.md`，实施状态与交接结论见根目录
 > `改造进度与后续规划.md`。**方案是开工前文档，阈值与文件名以代码为准。**
 
-仓库里有两套**可独立运行**的后端，接口协议完全一致（`/xiaozhi/chat` 返回
-`text/stream;charset=utf-8` 裸文本分块），因此前端业务代码零改动即可切换：
+**Python 版是当前的正式后端**；Java 版作为遗留实现保留。两者接口协议完全一致
+（`/xiaozhi/chat` 返回 `text/stream;charset=utf-8` 裸文本分块），因此前端业务代码
+零改动即可切换：
 
 | | Java 版 | Python 版 |
 |---|---|---|
@@ -310,8 +319,8 @@ open http://localhost:5173
 #### 启动
 
 ```bash
-# 方式一：只起 Python 版 + 前端（/api 代理自动指向 8081）
-./start-local.sh --python
+# 默认就是 Python 版 + 前端（/api 代理指向 8081）
+./start-local.sh
 
 # 方式二：双后端并存 + 自动生成 A/B 对比报告
 ./start-local.sh --compare
@@ -324,8 +333,9 @@ cp .env.example .env          # 可选；默认值即可直接运行
 ```
 
 > **前端切换原理**：`guiguXiaozhi_frontend/vite.config.js` 的 `/api` 代理读取
-> `VITE_API_TARGET`（默认 `http://localhost:8080`）。`--python` 模式注入
-> `VITE_API_TARGET=http://localhost:8081`，`ChatWindow.vue` 一行都不用改。
+> `VITE_API_TARGET`（默认 `http://localhost:8081`，即 Python 版）。
+> `--java` 模式会注入 `VITE_API_TARGET=http://localhost:8080`，
+> `ChatWindow.vue` 一行都不用改。
 > Vite 只在启动时读配置，切换端口需重启前端 dev server。
 
 #### Python 版专属端点

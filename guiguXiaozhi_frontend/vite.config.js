@@ -10,9 +10,13 @@ export default defineConfig({
   server: {
     proxy: {
       '/api': {
-        // 默认仍指向 Java 版；start-local.sh --python 会注入 VITE_API_TARGET
-        // 切到 Python 版。业务代码（ChatWindow.vue）不需要任何改动。
-        target: process.env.VITE_API_TARGET || 'http://localhost:8080',
+        // 默认指向 Python 版后端（正式实现，:8081）。
+        // 需要切到遗留 Java 版时：start-local.sh --java 会注入 VITE_API_TARGET。
+        // 业务代码（ChatWindow.vue）不需要任何改动。
+        //
+        // 注意用 127.0.0.1 而不是 localhost：Node 会把 localhost 优先解析成 IPv6 ::1，
+        // 而 uvicorn 默认只监听 IPv4 127.0.0.1，结果是 ECONNREFUSED ::1:8081。
+        target: process.env.VITE_API_TARGET || 'http://127.0.0.1:8081',
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/api/, ''), // 去掉 /api 前缀
       },

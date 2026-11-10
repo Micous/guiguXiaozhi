@@ -1,8 +1,13 @@
-# 硅谷小智 · Python 后端
+# 硅谷小智 · Python 后端 ★ 正式后端
 
 Spring Boot + LangChain4j 后端的 Python 重写版，**不使用 LangChain / LangGraph 等 Agent 框架**：
 智能体循环、工具调用、RAG 检索、对话记忆全部自研，架构与代码风格对齐
 `参考项目/lab/mini_harness`。
+
+> 这是**当前的正式后端**，默认监听 `:8081`，`./start-local.sh` 默认启动它，
+> 前端 `/api` 代理默认指向 8081。
+> Java 版（`../guiguXiaozhi_backend/`，LangChain4j，:8080）已降级为**遗留实现**，
+> 仅用于 A/B 对比与回归参考（`./start-local.sh --java` / `--with-java` / `--compare`）。
 
 > 📖 方案与踩坑记录：[PLAN.md](PLAN.md) · [踩坑与优化记录.md](../踩坑与优化记录.md) ·
 > [改造进度与后续规划.md](../改造进度与后续规划.md)

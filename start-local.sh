@@ -2,17 +2,21 @@
 # ============================================================
 # 硅谷小智 —— 本地一键启动脚本
 #
+# 当前正式后端是 **Python 版**（guiguXiaozhi_backend_py，自研 Harness，不依赖 Agent 框架）；
+# Java 版（guiguXiaozhi_backend，LangChain4j）保留为**遗留实现**，仅用于 A/B 对比与回归参考。
+#
 # 依赖：
-#   - JDK 17+ / Maven      (Java 版后端)
-#   - Python 3.10+ / venv  (Python 版后端，仅 --python / --with-python 需要)
+#   - Python 3.10+ / venv  (正式后端，默认模式需要)
 #   - Node.js 18+ / npm    (前端)
 #   - Ollama               (本地大模型)
 #   - Docker               (MySQL / MongoDB / Milvus)
+#   - JDK 17+ / Maven      (仅 --java / --with-java / --compare 需要)
 #
 # 用法：
-#   ./start-local.sh                 仅 Java 版 + 前端（默认，行为不变）
-#   ./start-local.sh --python        仅 Python 版 + 前端（/api 代理指向 8081）
-#   ./start-local.sh --with-python   Java + Python 双后端 + 前端（代理仍指 8080）
+#   ./start-local.sh                 Python 后端 + 前端（默认，/api 代理指向 8081）
+#   ./start-local.sh --python        同上（兼容旧写法）
+#   ./start-local.sh --java          仅 Java 版 + 前端（遗留实现，代理指向 8080）
+#   ./start-local.sh --with-java     Java + Python 双后端 + 前端（代理指 8081）
 #   ./start-local.sh --compare       双后端 + 前端 + 自动生成 A/B 对比报告
 # ============================================================
 set -euo pipefail
@@ -24,20 +28,22 @@ FRONTEND="$ROOT/guiguXiaozhi_frontend"
 LOG_DIR="$ROOT/logs"
 mkdir -p "$LOG_DIR"
 
-# 启动模式：java（默认） / python / both
-MODE="java"
+# 启动模式：python（默认，正式后端） / java（遗留） / both
+MODE="python"
 RUN_COMPARE=0
 for arg in "$@"; do
   case "$arg" in
-    --python)      MODE="python" ;;
-    --with-python) MODE="both" ;;
+    --python)      MODE="python" ;;         # 兼容旧写法（现已等同默认）
+    --java)        MODE="java" ;;           # 仅遗留 Java 版
+    --with-java)   MODE="both" ;;           # 双后端
+    --with-python) MODE="both" ;;           # 兼容旧写法
     --compare)     MODE="both"; RUN_COMPARE=1 ;;
     -h|--help)
-      echo "用法: ./start-local.sh [--python | --with-python | --compare]"
+      echo "用法: ./start-local.sh [--python | --java | --with-java | --compare]"
       exit 0
       ;;
     *)
-      echo "未知参数: ${arg}（可用：--python / --with-python / --compare）" >&2
+      echo "未知参数: ${arg}（可用：--python / --java / --with-java / --compare）" >&2
       exit 1
       ;;
   esac
@@ -75,8 +81,8 @@ PYEOF
 check_deps() {
   local missing=0
   local -a required=(node npm curl ollama)
-  # 纯 Python 模式不需要 Java / Maven
-  if [ "$MODE" != "python" ]; then
+  # 只有跑 Java 版（遗留实现）才需要 Java / Maven
+  if [ "$MODE" = "java" ] || [ "$MODE" = "both" ]; then
     required+=(java)
   fi
   for cmd in "${required[@]}"; do
@@ -87,7 +93,7 @@ check_deps() {
       missing=1
     fi
   done
-  if [ "$MODE" != "python" ] && ! command -v mvn >/dev/null 2>&1; then
+  if { [ "$MODE" = "java" ] || [ "$MODE" = "both" ]; } && ! command -v mvn >/dev/null 2>&1; then
     warn "! 未找到 mvn，请执行: brew install maven  （或解压 Maven 到 ~/tools 并加入 PATH）"
     missing=1
   fi
@@ -300,10 +306,12 @@ run_compare() {
 
 # ---------- 5. 前端 ----------
 start_frontend() {
-  # 只切换代理目标，前端业务代码零改动；默认仍指向 Java 版
-  local api_target="http://localhost:8080"
-  if [ "$MODE" = "python" ]; then
-    api_target="http://localhost:8081"
+  # 只切换代理目标，前端业务代码零改动；默认指向 Python 版（正式后端）
+  # 用 127.0.0.1（IPv4 字面量）：Node 把 localhost 优先解析成 ::1，
+  # 而 uvicorn / Spring 默认只监听 IPv4，会导致 ECONNREFUSED ::1:8081
+  local api_target="http://127.0.0.1:8081"
+  if [ "$MODE" = "java" ]; then
+    api_target="http://127.0.0.1:8080"
   fi
   export VITE_API_TARGET="$api_target"
   ok "前端 /api 代理 → $api_target"
@@ -346,9 +354,9 @@ start_middleware
 check_ollama
 start_milvus
 case "$MODE" in
-  java)   start_backend ;;
   python) start_backend_py ;;
-  both)   start_backend; start_backend_py ;;
+  java)   start_backend ;;
+  both)   start_backend_py; start_backend ;;
 esac
 start_frontend
 if [ "$RUN_COMPARE" -eq 1 ]; then
@@ -370,8 +378,8 @@ case "$MODE" in
     echo "    运行指标 : http://localhost:8081/metrics"
     ;;
   both)
-    echo "    Java 后端 : http://localhost:8080/xiaozhi/chat"
-    echo "    Python 后端: http://localhost:8081/xiaozhi/chat"
+    echo "    Python 后端: http://localhost:8081/xiaozhi/chat  ← 前端代理指向这里"
+    echo "    Java 后端 : http://localhost:8080/xiaozhi/chat  （遗留实现）"
     echo "    追踪 / 指标: http://localhost:8081/trace  · /metrics"
     echo "    A/B 对比  : $LOG_DIR/ab-report.md"
     ;;
