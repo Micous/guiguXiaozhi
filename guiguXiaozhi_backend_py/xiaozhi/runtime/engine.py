@@ -40,11 +40,8 @@ from xiaozhi.memory.context import ContextAssembler
 from xiaozhi.memory.store import ConversationStore
 from xiaozhi.models.quality import (
     booking_executed_in_history,
-    claim_kind,
     corrective_prompt,
-    detect_narrated_tool_call,
     detect_textual_tool_call,
-    fallback_for,
     inspect_turn,
 )
 from xiaozhi.ops.metrics import MetricsCollector
@@ -55,6 +52,7 @@ from xiaozhi.reliability.resilience import (
 )
 from xiaozhi.reliability.tracing import get_trace_id, trace_span
 from xiaozhi.runtime.intent import should_inject_knowledge
+from xiaozhi.runtime.interceptors import TurnFacts, quality_gate
 from xiaozhi.runtime.state import TurnState
 from xiaozhi.runtime.stream_filter import (
     LOOKBEHIND,
@@ -223,10 +221,13 @@ class AgentEngine:
             # 工具执行跟踪、纠正重试、文本账本全部收进 TurnState：
             # 写入只经方法（不变量在方法内维护），读取直接访问字段。
             # 第十轮"纠正重试拼接"事故的根源就是状态没有单一事实来源。
-            state = TurnState()
             # 历史里是否真的执行过预约（本次会话早前请求成功挂过号且未取消）。
             # 是真话依据：模型说"已经预约好了"时不算幻觉，也不做纠正重试。
             prior_booking = booking_executed_in_history(history)
+            state = TurnState(
+                prior_booking=prior_booking,
+                operation_request=operation_request,
+            )
 
             while turn < self.max_turns:
                 # ---- 请求级时间预算 ----
@@ -385,56 +386,76 @@ class AgentEngine:
                                     "模型把工具调用写成了纯文本：trace=%s", trace_id
                                 )
                                 llm_span.set_attribute("textual_tool_call", True)
-                                # 已经在流式阶段截断过了，这里只需安排纠正重试，
-                                # 让模型用**结构化 tool_call** 重新发起
-                                if state.can_schedule_corrective():
-                                    state.schedule_corrective("tool_call")
-                                    llm_span.set_attribute("corrective_retry_scheduled", True)
-                            claim = truncated_claim or claim_kind(detected_text)
-                            if finding.false_confirmation or (
-                                claim == "query" and not state.query_executed_success
-                            ):
+
+                            # ---- 质量防线拦截器链（E4）----
+                            # 判定全部收敛在 interceptors.QualityGate；
+                            # engine 只执行决定（指标/span/事件/兜底替换）。
+                            gate_verdict = quality_gate.evaluate(
+                                TurnFacts(
+                                    detected_text=detected_text,
+                                    response_text=response.text,
+                                    tool_calls=response.tool_calls,
+                                    finding=finding,
+                                    truncated_claim=truncated_claim,
+                                ),
+                                state,
+                            )
+                            if gate_verdict.hallucination_suspected:
                                 self.metrics.inc("hallucination_suspected")
                                 llm_span.set_attribute("hallucination_suspected", True)
-                                llm_span.set_attribute("claim_kind", claim)
-                                if state.corrective_used == 0 and not prior_booking:
-                                    # 先不追加免责提示——注入纠正提示重试一轮，
-                                    # 逼迫模型真正调用工具（比事后提示更能纠错）。
-                                    # pending 已置位时仍**覆盖** kind（旧行为）。
-                                    state.override_corrective(claim)
+                                llm_span.set_attribute(
+                                    "claim_kind", gate_verdict.claim_for_span
+                                )
+                            if gate_verdict.corrective_mode != "none":
+                                if gate_verdict.corrective_mode == "override":
+                                    state.override_corrective(gate_verdict.corrective_kind)
+                                else:
+                                    state.schedule_corrective(gate_verdict.corrective_kind)
+                                if not gate_verdict.narrated:
                                     llm_span.set_attribute(
                                         "corrective_retry_scheduled", True
                                     )
                                     logger.warning(
                                         "检测到未调工具的预约/取消承诺，准备纠正重试：trace=%s kind=%s",
                                         trace_id,
-                                        claim,
+                                        gate_verdict.corrective_kind,
                                     )
-                                else:
-                                    # 纠正重试后仍然编造成功：**丢弃**这段文本，
-                                    # 换成陈述事实的兜底文案 —— 绝不能让"预约成功"显示给用户
-                                    fallback = fallback_for(claim, state.last_tool_failure)
-                                    prefix = (result.text or "").rstrip()
-                                    if prefix:
-                                        prefix += "\n\n"
-                                    result.text = prefix + fallback
-                                    # 落库的最终回复也要跟着换成兜底文案，
-                                    # 不能让被截掉的谎话文本进历史
-                                    state.set_final_reply(result.text)
-                                    yield TextResponseEvent(
-                                        trace_id=trace_id,
-                                        metadata={"delta": fallback},
-                                    )
-                                    yield DegradedEvent(
-                                        trace_id=trace_id,
-                                        metadata={
-                                            "component": "quality",
-                                            "reason": "hallucination_fallback",
-                                            "claim_kind": claim,
-                                        },
-                                    )
-                                    self.metrics.inc("hallucination_fallbacks")
-                                    llm_span.set_attribute("hallucination_fallback", True)
+                            if gate_verdict.narrated:
+                                # 模型说"我这就调用预约挂号工具"却没真调 —— 逼它真的调一次。
+                                # （2026-11-10 实测：用户看到"我将调用预约挂号工具"，
+                                #   然后什么都没发生，工具一次都没执行。）
+                                self.metrics.inc("narrated_tool_call_retries")
+                                span.set_attribute("narrated_tool_call", True)
+                                logger.warning(
+                                    "模型只说要调工具却没调，准备纠正重试：trace=%s",
+                                    trace_id,
+                                )
+                            if gate_verdict.fallback_claim is not None:
+                                # 纠正重试后仍然编造成功：**丢弃**这段文本，
+                                # 换成陈述事实的兜底文案 —— 绝不能让"预约成功"显示给用户
+                                claim = gate_verdict.fallback_claim
+                                fallback = gate_verdict.fallback_text
+                                prefix = (result.text or "").rstrip()
+                                if prefix:
+                                    prefix += "\n\n"
+                                result.text = prefix + fallback
+                                # 落库的最终回复也要跟着换成兜底文案，
+                                # 不能让被截掉的谎话文本进历史
+                                state.set_final_reply(result.text)
+                                yield TextResponseEvent(
+                                    trace_id=trace_id,
+                                    metadata={"delta": fallback},
+                                )
+                                yield DegradedEvent(
+                                    trace_id=trace_id,
+                                    metadata={
+                                        "component": "quality",
+                                        "reason": "hallucination_fallback",
+                                        "claim_kind": claim,
+                                    },
+                                )
+                                self.metrics.inc("hallucination_fallbacks")
+                                llm_span.set_attribute("hallucination_fallback", True)
                         break
 
                     self.metrics.record_llm((time.monotonic() - llm_started) * 1000)
@@ -467,21 +488,7 @@ class AgentEngine:
                 # ---- 没有工具调用 → 结束（或纠正重试一轮） ----
                 if not response.tool_calls:
                     state.set_final_reply(response.text)
-                    # 模型说"我这就调用预约挂号工具"却没真调 —— 逼它真的调一次。
-                    # （2026-11-10 实测：用户看到"我将调用预约挂号工具"，
-                    #   然后什么都没发生，工具一次都没执行。）
-                    if (
-                        state.can_schedule_corrective()
-                        and operation_request
-                        and detect_narrated_tool_call(response.text)
-                    ):
-                        state.schedule_corrective("action")
-                        self.metrics.inc("narrated_tool_call_retries")
-                        span.set_attribute("narrated_tool_call", True)
-                        logger.warning(
-                            "模型只说要调工具却没调，准备纠正重试：trace=%s",
-                            trace_id,
-                        )
+                    # （narrated 叙述承诺检测已收敛进拦截器链，见上方 gate_verdict）
 
                     corrective_fired, corrective_kind = state.consume_corrective()
                     if corrective_fired:

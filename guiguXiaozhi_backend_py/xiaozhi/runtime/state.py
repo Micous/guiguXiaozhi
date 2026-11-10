@@ -59,6 +59,12 @@ class TurnState:
     narrative_text: str = ""
     final_reply_text: str = ""
 
+    # ---- 请求级上下文（拦截器只读）----
+    # 历史里是否真的执行过预约（真话依据：说"已经预约好了"不算幻觉）
+    prior_booking: bool = False
+    # 本请求是否为操作类（决定叙述门控是否启用）
+    operation_request: bool = False
+
     # ---- 查询能力 ----
 
     def tool_can_execute(self) -> bool:
