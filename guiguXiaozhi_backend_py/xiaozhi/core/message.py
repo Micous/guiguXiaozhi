@@ -117,6 +117,21 @@ class Message:
     def is_error(self) -> bool:
         return bool(self.metadata.get("is_error", False))
 
+    def validate(self) -> Optional[str]:
+        """消息序列约束校验。返回错误描述，合法返回 None。
+
+        落库前调用（engine 的 memory.write）：残缺的 tool 消息入库后，
+        下一请求组装出的历史是 Ollama 无法配对的残缺序列。
+        """
+        if self.role == Role.TOOL and not self.tool_call_id:
+            return "tool 消息缺少 tool_call_id"
+        for call in self.tool_calls:
+            if not call.id or not call.name:
+                return "tool_call 缺少 id/name"
+        if self.role != Role.ASSISTANT and self.tool_calls:
+            return f"{self.role.value} 消息不应携带 tool_calls"
+        return None
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "message_id": self.message_id,

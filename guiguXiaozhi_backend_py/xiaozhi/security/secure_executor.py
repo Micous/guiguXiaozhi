@@ -20,6 +20,10 @@ from xiaozhi.security.permissions import (
     PermissionDecisionEngine,
     approval_scope_for_args,
 )
+from xiaozhi.tools.argument_normalizer import (
+    normalize_arguments_by_schema,
+    validate_arguments,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -103,7 +107,14 @@ class SecureToolExecutor:
                 )
 
         # ---- L2 参数校验（注入防护在 L3）----
-        # 校验放在工具内部完成（工具知道自己要什么），这里只做**通用**入参体检
+        # 先按 schema 归一化（参数名/camel/中文描述别名/位置兜底），再校验
+        # required/type/enum，最后做通用体检。工具内部的旧版归一化保持
+        # 幂等兼容 —— 双层归一化结果一致。
+        definition = tool.definition()
+        tool_call.args = normalize_arguments_by_schema(tool_call.args, definition)
+        invalid = validate_arguments(tool_call.args, definition)
+        if invalid:
+            return ToolResult.fail(invalid, error_type="ValidationError")
         invalid = self._validate_generic(tool_call)
         if invalid:
             return ToolResult.fail(invalid, error_type="ValidationError")

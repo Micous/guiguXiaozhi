@@ -766,6 +766,10 @@ class AgentEngine:
                     # 对应的 tool 消息（tool_call_id 配对），否则下一请求
                     # 组装出的历史是模型无法理解的残缺序列
                     new_messages.extend(persisted_tool_results)
+                    for appended in new_messages[len(history):]:
+                        problem = appended.validate()
+                        if problem:
+                            logger.warning("落库消息未通过序列校验：%s", problem)
                     await self.conversation_store.save(memory_id, new_messages)
                 except Exception as exc:
                     write_span.set_error(f"{type(exc).__name__}: {exc}")

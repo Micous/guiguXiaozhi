@@ -76,3 +76,27 @@ def test_assistant_accepts_metadata():
     """engine 落库要往 assistant 消息上打 outcome 标记（此前只能绕过构造器）"""
     message = Message.assistant("预约成功", booking_executed=True)
     assert message.metadata == {"booking_executed": True}
+
+
+# ---- 消息序列约束校验（核心模块第 2 批 T9） ----
+
+
+def test_validate_tool_message_requires_call_id():
+    message = Message.tool_result("结果", tool_call_id="", tool_name="工具")
+    assert message.validate() is not None
+    ok = Message.tool_result("结果", tool_call_id="t1", tool_name="工具")
+    assert ok.validate() is None
+
+
+def test_validate_assistant_tool_calls_require_id_and_name():
+    ok = Message.assistant("", tool_calls=[ToolCall(id="1", name="预约挂号")])
+    assert ok.validate() is None
+
+    bad = Message.assistant("", tool_calls=[ToolCall(id="", name="预约挂号")])
+    assert bad.validate() is not None
+
+
+def test_validate_user_message_must_not_carry_tool_calls():
+    message = Message.user("问题")
+    message.tool_calls = [ToolCall(id="1", name="预约挂号")]
+    assert message.validate() is not None

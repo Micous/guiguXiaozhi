@@ -236,6 +236,10 @@ async def get_application(settings: Optional[Settings] = None) -> Application:
 
     # ---- 权限 ----
     permission_engine = PermissionDecisionEngine.from_yaml(Path(settings.permissions_file))
+    # 未在 YAML 显式配置的工具按风险等级推导默认策略（显式配置优先）——
+    # 新增只读工具不再需要手动改 permissions.yaml
+    for definition in tool_registry.list_definitions():
+        permission_engine.register_tool_default(definition.name, definition.risk_level)
     secure_executor = SecureToolExecutor(
         permission_engine,
         no_ui_policy=settings.permission_no_ui,

@@ -68,6 +68,21 @@ def approval_scope_for_args(args: Dict[str, Any]) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
+def default_level_for_risk(risk_level: Any) -> "PermissionLevel":
+    """按工具风险等级推导默认策略（YAML 未显式配置时）。
+
+    READ_ONLY → AUTO（只读查询直接放行）；WRITE → ASK（写业务库必须确认）；
+    DESTRUCTIVE → DENY（默认拒绝原则，破坏性操作必须显式开启）。
+    """
+    from xiaozhi.core.tool import RiskLevel
+
+    if risk_level == RiskLevel.READ_ONLY:
+        return PermissionLevel.AUTO
+    if risk_level == RiskLevel.WRITE:
+        return PermissionLevel.ASK
+    return PermissionLevel.DENY
+
+
 class PermissionDecisionEngine:
     """基于策略的权限决策引擎"""
 
@@ -95,6 +110,16 @@ class PermissionDecisionEngine:
     ) -> None:
         with self._lock:
             self._policies[tool_name] = level
+
+    def register_tool_default(self, tool_name: str, risk_level: Any) -> None:
+        """登记工具的**默认策略**（按风险等级推导）。
+
+        供装配层在注册工具时调用：YAML 显式配置永远优先，
+        这里只补未登记的工具 —— 新增只读工具不用再手动改 YAML。
+        """
+        with self._lock:
+            if tool_name not in self._policies:
+                self._policies[tool_name] = default_level_for_risk(risk_level)
 
     def policy_of(self, tool_name: str) -> PermissionLevel:
         """未登记的工具默认 DENY —— 默认拒绝原则（纵深防御）"""

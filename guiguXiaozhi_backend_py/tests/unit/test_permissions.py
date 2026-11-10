@@ -111,3 +111,27 @@ def test_no_ui_policy_must_be_allow_or_deny():
     # 合法值正常构造
     SecureToolExecutor(permission_engine=_engine(), no_ui_policy="deny")
     SecureToolExecutor(permission_engine=_engine(), no_ui_policy="allow")
+
+
+# ---- 按风险等级推导默认策略（核心模块第 2 批 T7） ----
+
+from xiaozhi.core.tool import RiskLevel  # noqa: E402
+
+
+def test_unregistered_tool_defaults_to_risk_level_policy():
+    """未登记工具按 risk_level 推导：READ_ONLY→auto / WRITE→ask / DESTRUCTIVE→deny"""
+    engine = PermissionDecisionEngine()
+    engine.register_tool_default("新只读工具", RiskLevel.READ_ONLY)
+    engine.register_tool_default("新写工具", RiskLevel.WRITE)
+    engine.register_tool_default("危险工具2", RiskLevel.DESTRUCTIVE)
+
+    assert engine.policy_of("新只读工具") == PermissionLevel.AUTO
+    assert engine.policy_of("新写工具") == PermissionLevel.ASK
+    assert engine.policy_of("危险工具2") == PermissionLevel.DENY
+
+
+def test_explicit_yaml_policy_beats_risk_derivation():
+    """YAML 显式配置永远优先，register_tool_default 不覆盖"""
+    engine = PermissionDecisionEngine(policies={"预约挂号": PermissionLevel.DENY})
+    engine.register_tool_default("预约挂号", RiskLevel.WRITE)
+    assert engine.policy_of("预约挂号") == PermissionLevel.DENY
