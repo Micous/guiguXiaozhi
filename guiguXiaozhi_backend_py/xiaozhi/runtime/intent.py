@@ -125,6 +125,30 @@ def is_operation_request(text: str, last_assistant_text: str = "") -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# 纯问候语（"你好" / "嗨" / "在吗" …）
+#
+# 2026-11-10 真实联调：用户发"你好"，被当成知识问答注入 RAG（命中科室
+# 知识块），模型对着打招呼输出一大段科室分诊科普 + Markdown 列表，
+# 答非所问。纯问候不注入知识，让模型自然回应。
+# ---------------------------------------------------------------------------
+_GREETING_RE = re.compile(
+    r"^(?:[你您]好[呀啊嘛~！!。]*|嗨+|哈喽|Hello+|Hi+|在吗|在么"
+    r"|早上好|中午好|下午好|晚上好)[，,。！!~\s…]*$",
+    re.IGNORECASE,
+)
+
+
+def is_greeting(text: str) -> bool:
+    """是否是**纯问候语**（仅寒暄，不含实质问题）"""
+    t = (text or "").strip()
+    if not t or len(t) > 12:
+        return False
+    return bool(_GREETING_RE.match(t))
+
+
 def should_inject_knowledge(text: str, last_assistant_text: str = "") -> bool:
     """是否应该注入 RAG 知识"""
+    if is_greeting(text):
+        return False
     return not is_operation_request(text, last_assistant_text)

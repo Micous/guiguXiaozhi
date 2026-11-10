@@ -58,14 +58,26 @@ def test_department_smalltalk_not_operation():
 
 def test_plain_questions_are_not_operation():
     for msg in (
-        "你好",
         "医院地址在哪里",
         "头痛挂什么科",
         "抽血检查需要空腹吗",
         "今天天气怎么样",
     ):
         assert not is_operation_request(msg), msg
-        assert should_inject_knowledge(msg)
+        assert should_inject_knowledge(msg), msg
+
+
+def test_greeting_does_not_inject_knowledge():
+    """纯问候不注入 RAG（2026-11-10 联调："你好"命中科室知识块，
+    模型对着打招呼输出一大段科室分诊科普，答非所问）。"""
+    from xiaozhi.runtime.intent import is_greeting
+
+    for msg in ("你好", "您好！", "你好呀", "嗨", "在吗", "早上好", "hi"):
+        assert is_greeting(msg), msg
+        assert not should_inject_knowledge(msg), msg
+    # 带实质内容的消息不是纯问候，照常走知识/操作判定
+    for msg in ("你好，我想预约内科", "你好呀，头痛挂什么科", "大家好"):
+        assert not is_greeting(msg), msg
 
 
 def test_existing_operation_keywords_still_match():
