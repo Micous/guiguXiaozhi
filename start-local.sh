@@ -316,10 +316,18 @@ start_frontend() {
   local frontend_pid
   frontend_pid="$(start_detached "$LOG_DIR/frontend.log" npm run dev)"
   echo "$frontend_pid" > "$LOG_DIR/frontend.pid"
-  for i in $(seq 1 30); do
-    if grep -q "ready in\|Local:" "$LOG_DIR/frontend.log" 2>/dev/null; then
+  # 以「页面实际可访问」为就绪判据，不依赖日志关键字：
+  # npm 的输出可能带缓冲，日志里出现 "ready in" 的时间会晚于服务真正可用。
+  # Vite 默认只监听 IPv6 ::1，因此这里必须用 localhost 而不是 127.0.0.1。
+  for i in $(seq 1 45); do
+    if curl -s --noproxy '*' --max-time 2 http://localhost:5173/ >/dev/null 2>&1; then
       ok "✔ 前端启动成功 → http://localhost:5173"
       return 0
+    fi
+    if ! kill -0 "$frontend_pid" 2>/dev/null; then
+      err "✘ 前端进程已退出，日志：$LOG_DIR/frontend.log"
+      tail -30 "$LOG_DIR/frontend.log"
+      exit 1
     fi
     sleep 1
   done
@@ -348,7 +356,7 @@ if [ "$RUN_COMPARE" -eq 1 ]; then
 fi
 
 echo ""
-ok "全部服务已启动 🚀（模式：$MODE）"
+ok "全部服务已启动 🚀（模式：${MODE}）"
 echo "    前端页面 : http://localhost:5173"
 case "$MODE" in
   java)
