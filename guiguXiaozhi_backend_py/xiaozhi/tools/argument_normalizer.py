@@ -40,6 +40,26 @@ for _canonical, _aliases in _ALIASES.items():
         _ALIAS_TO_CANONICAL.setdefault(_alias, _canonical)
 
 
+def _coerce_scalar(value: Any) -> Any:
+    """值级自愈：修小模型的常见参数形态错误（事故 2026-11-10）。
+
+    * 嵌套单键 dict（``{"date": "2026-11-11"}``）→ 解包出字符串；
+    * int/float（``20261111``）→ 转字符串（工具层全部按字符串处理）；
+    * 其余（list、多键 dict 等）原样保留，交给上层校验报错。
+    """
+    if isinstance(value, dict):
+        if len(value) == 1:
+            inner = next(iter(value.values()))
+            if isinstance(inner, str):
+                return _coerce_scalar(inner)
+        return value
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return str(value)
+    return value
+
+
 def normalize_arguments(
     args: Dict[str, Any],
     canonical_order: List[str],
@@ -59,7 +79,7 @@ def normalize_arguments(
     for key, value in args.items():
         canonical = _ALIAS_TO_CANONICAL.get(str(key).strip())
         if canonical and canonical not in normalized:
-            normalized[canonical] = value
+            normalized[canonical] = _coerce_scalar(value)
         else:
             leftovers.append(value)
 

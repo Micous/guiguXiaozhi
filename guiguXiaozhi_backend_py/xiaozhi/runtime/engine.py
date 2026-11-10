@@ -174,6 +174,11 @@ class AgentEngine:
             turn = 0
             tool_call_count = 0
             successful_tool_calls = 0  # 请求级：用于抑制"工具已执行后的总结轮"误报
+            # 请求级工具真实执行结果：打在持久化消息上，供下一请求的
+            # booking_executed_in_history 判定"历史里是否真的成功预约过"。
+            # 只看 tool_calls 会把失败调用也当成已预约（2026-11-10 事故根因）。
+            booking_executed_success = False
+            cancel_executed_success = False
             tool_results: List[Message] = []
             tool_failures: Dict[str, int] = {}
             # 历史里是否真的执行过预约（本次会话早前请求成功挂过号且未取消）。
@@ -399,6 +404,10 @@ class AgentEngine:
                         if tool_result.success:
                             tool_failures[call.name] = 0
                             successful_tool_calls += 1
+                            if call.name == "预约挂号":
+                                booking_executed_success = True
+                            elif call.name == "取消预约挂号":
+                                cancel_executed_success = True
                         else:
                             tool_failures[call.name] = tool_failures.get(call.name, 0) + 1
 
@@ -451,8 +460,18 @@ class AgentEngine:
                 try:
                     new_messages = list(history)
                     new_messages.append(Message.user(user_input))
+                    outcome_meta: Dict[str, Any] = {}
+                    if booking_executed_success:
+                        outcome_meta["booking_executed"] = True
+                    if cancel_executed_success:
+                        outcome_meta["cancel_executed"] = True
                     new_messages.append(
-                        Message.assistant(result.text, tool_calls=result.tool_calls)
+                        Message(
+                            role=Role.ASSISTANT,
+                            content=result.text,
+                            tool_calls=result.tool_calls,
+                            metadata=outcome_meta,
+                        )
                     )
                     await self.conversation_store.save(memory_id, new_messages)
                 except Exception as exc:

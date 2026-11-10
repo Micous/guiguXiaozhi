@@ -23,6 +23,11 @@ _FALSE_CONFIRMATION = re.compile(
     r"|挂号(成功|已完成)"
     r"|已(成功)?取消(预约|挂号)"
     r"|预约号[:：]\s*[A-Za-z0-9-]+"
+    # 2026-11-10 事故新增：「我为您预约了…以下是预约信息」——不带"成功/已"字样
+    # 的完成态声明，原来的正则全部漏报（工具失败后模型仍谎报预约成功）。
+    r"|[为帮](您|你)(成功)?预约了"
+    r"|预约好了(?![吗么再之])"
+    r"|挂号好了(?![吗么再之])"
 )
 
 # 取消类承诺单独处理：真实联调里模型会写「您的预约已成功取消」，
@@ -59,26 +64,30 @@ CORRECTIVE_PROMPT = (
 
 
 def booking_executed_in_history(history: Sequence[Any]) -> bool:
-    """历史会话里是否真的执行过预约挂号（且之后未被取消）。
+    """历史会话里是否真的**成功**执行过预约挂号（且之后未被取消）。
 
     用途有二：
     * 抑制误报——用户在**上一个请求**里成功挂号后问"挂号成功了吗？"，
       模型回答"已经预约好了"是真话，不应追加免责提示，也不应纠正重试；
-    * 纠正重试的前提——历史里从未执行过预约工具，才能逼迫模型调工具
+    * 纠正重试的前提——历史里从未成功执行过预约工具，才能逼迫模型调工具
       （否则可能造成重复预约，虽然工具层已有 find_duplicate 兜底）。
 
-    判定依据是历史 assistant 消息上的 ``tool_calls``（会话持久化会保留它们）：
-    最后一次相关工具调用是"预约挂号"则视为已预约；若其后又调用过
-    "取消预约挂号"则视为已取消。
+    判定依据是历史消息上的 ``metadata`` 标记（engine 在工具真实执行成功后
+    打在持久化的 assistant 消息上）：``booking_executed`` / ``cancel_executed``。
+
+    **不能只看 tool_calls**：2026-11-10 事故里，三次失败的预约调用
+    （日期已过、参数类型错）的 tool_calls 都进了历史，裸看 tool_calls 会把
+    "失败"当成"已预约"，进而把幻觉检测整体抑制——模型谎报"预约已经成功"
+    却没有任何拦截。没有标记的历史（旧会话）一律视为未预约：宁可信其无，
+    由纠正重试兜底（工具层 find_duplicate 防重复预约）。
     """
     booked = False
     for message in history or []:
-        for call in getattr(message, "tool_calls", None) or []:
-            name = str(getattr(call, "name", "") or "")
-            if name == "预约挂号":
-                booked = True
-            elif name == "取消预约挂号":
-                booked = False
+        meta = getattr(message, "metadata", None) or {}
+        if meta.get("cancel_executed"):
+            booked = False
+        elif meta.get("booking_executed"):
+            booked = True
     return booked
 
 

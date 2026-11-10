@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from xiaozhi.core.event import EventType  # noqa: E402
-from xiaozhi.core.message import Message, ToolCall  # noqa: E402
+from xiaozhi.core.message import Message, Role, ToolCall  # noqa: E402
 from xiaozhi.core.tool import ToolResult  # noqa: E402
 from xiaozhi.models.ollama import ChatTurn  # noqa: E402
 from xiaozhi.models.quality import FALSE_CONFIRMATION_NOTICE  # noqa: E402
@@ -250,11 +250,13 @@ async def test_corrective_retry_still_false_then_notice_appended():
 
 
 async def test_prior_booking_in_history_suppresses_notice_and_retry():
-    """上一个请求里真的挂过号 → "已经预约好了"是真话，不应误报也不应纠正重试"""
+    """上一个请求里真的挂过号（有成功标记）→ "已经预约好了"是真话，不应误报也不应纠正重试"""
     history = [
-        Message.assistant(
-            "预约成功",
+        Message(
+            role=Role.ASSISTANT,
+            content="预约成功",
             tool_calls=[ToolCall(id="9", name="预约挂号", arguments={})],
+            metadata={"booking_executed": True},
         )
     ]
     model = FakeChatModel(
@@ -277,11 +279,17 @@ async def test_prior_booking_in_history_suppresses_notice_and_retry():
 async def test_cancelled_booking_in_history_still_flags_false_confirmation():
     """取消过号之后再说"已经预约好了" → 仍然是幻觉"""
     history = [
-        Message.assistant(
-            "预约成功", tool_calls=[ToolCall(id="9", name="预约挂号", arguments={})]
+        Message(
+            role=Role.ASSISTANT,
+            content="预约成功",
+            tool_calls=[ToolCall(id="9", name="预约挂号", arguments={})],
+            metadata={"booking_executed": True},
         ),
-        Message.assistant(
-            "已取消", tool_calls=[ToolCall(id="10", name="取消预约挂号", arguments={})]
+        Message(
+            role=Role.ASSISTANT,
+            content="已取消",
+            tool_calls=[ToolCall(id="10", name="取消预约挂号", arguments={})],
+            metadata={"cancel_executed": True},
         ),
     ]
     model = FakeChatModel(

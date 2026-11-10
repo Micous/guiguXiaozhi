@@ -8,7 +8,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from xiaozhi.core.message import Message, ToolCall  # noqa: E402
+from xiaozhi.core.message import Message, Role, ToolCall  # noqa: E402
 from xiaozhi.models.ollama import ChatTurn  # noqa: E402
 from xiaozhi.models.quality import (  # noqa: E402
     CORRECTIVE_PROMPT,
@@ -109,28 +109,74 @@ def test_tool_executed_suppresses_false_positive_on_summary_turn():
 # ---- 纠正重试（2026-11-10 真实前端联调新增） ----
 
 def test_booking_executed_in_history():
-    """历史里真的执行过预约工具 → "已经预约好了"是真话"""
+    """历史里真的**成功执行过**预约（有 metadata 标记）→ "已经预约好了"是真话"""
     assert not booking_executed_in_history([])
     assert not booking_executed_in_history(None)
 
     booked = [
-        Message.assistant(
-            "预约成功", tool_calls=[ToolCall(id="1", name="预约挂号", arguments={})]
+        Message(
+            role=Role.ASSISTANT,
+            content="预约成功",
+            tool_calls=[ToolCall(id="1", name="预约挂号", arguments={})],
+            metadata={"booking_executed": True},
         )
     ]
     assert booking_executed_in_history(booked)
 
     # 预约后又取消 → 不算已预约
     booked_then_cancelled = booked + [
-        Message.assistant(
-            "已取消",
+        Message(
+            role=Role.ASSISTANT,
+            content="已取消",
             tool_calls=[ToolCall(id="2", name="取消预约挂号", arguments={})],
+            metadata={"cancel_executed": True},
         )
     ]
     assert not booking_executed_in_history(booked_then_cancelled)
 
-    # 普通文本历史不含工具调用 → False
+    # 普通文本历史不含标记 → False
     assert not booking_executed_in_history([Message.assistant("已为您预约成功")])
+
+
+def test_failed_booking_calls_in_history_do_not_suppress_gate():
+    """2026-11-10 事故回归：失败的工具调用不该被当成"已预约"。
+
+    旧实现只看 tool_calls —— 失败的预约调用也把 prior_booking 置 True，
+    幻觉检测被整体抑制，模型谎报"预约已经成功"畅通无阻。
+    新实现只认 engine 打的成功标记，无标记一律视为未预约（宁可信其无）。
+    """
+    failed_booking_history = [
+        Message.user("内科，王新勃，610121199401032831，2026.11.11，上午"),
+        Message.assistant(
+            "您好，经过查询…您的预约已经成功。",
+            tool_calls=[ToolCall(id="c1", name="预约挂号", arguments={"date": {"date": "2026-11-11"}})],
+        ),
+        Message.user("预约成功了吗？有没有预约信息"),
+        Message.assistant("您好，我为您预约了2026年11月11日上午的内科…"),
+    ]
+    assert not booking_executed_in_history(failed_booking_history)
+
+
+def test_new_completion_claim_phrasings_detected():
+    """「我为您预约了…以下是预约信息」这类不带"成功/已"的完成态声明也要拦。"""
+    for text in (
+        "您好，我为您预约了2026年11月11日上午的内科，以下是您的预约信息",
+        "已经帮您预约了神经内科门诊",
+        "您的预约手续都预约好了，请按时就诊",
+        "您好，经过查询，您的预约已经成功",
+    ):
+        assert detect_false_confirmation(text), text
+
+
+def test_completion_claim_questions_not_flagged():
+    """疑问句不是完成态声明，不能触发纠正重试。"""
+    for text in (
+        "您是想问预约好了吗？",
+        "等您预约好了再告诉我",
+        "需要我为您预约吗？",
+        "我可以帮您预约，请提供信息",
+    ):
+        assert not detect_false_confirmation(text), text
 
 
 def test_corrective_prompt_exists():
