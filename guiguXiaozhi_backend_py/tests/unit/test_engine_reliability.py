@@ -544,6 +544,46 @@ async def test_tool_results_are_persisted_with_assistant_message():
     assert saved[tool_idx].tool_call_id == saved[assistant_idx].tool_calls[0].id
 
 
+async def test_narrative_and_final_reply_are_persisted_separately():
+    """叙述段与最终回复拆开落库（2026-11-10 第七轮事故）。
+
+    旧逻辑把所有轮次文本合并进一条 assistant content，
+    "请稍等，我正在查询…"的叙述句进了历史，模型下一轮**原样照抄**
+    该句式且零工具调用。新结构：assistant(tool_calls,叙述段) → tool →
+    assistant(最终回复)，与真实对话流一致。
+    """
+    narrative = "好的，我将为您预约内科。请稍等，我正在查询是否有可用号源。"
+    model = FakeChatModel(
+        [
+            {
+                "chunks": [narrative],
+                "turn": ChatTurn(
+                    text=narrative,
+                    tool_calls=[
+                        ToolCall(id="t7", name="查询是否有号源", arguments={})
+                    ],
+                ),
+            },
+            {"chunks": ["本院没有内科，请换科室"], "turn": ChatTurn(text="本院没有内科，请换科室")},
+        ]
+    )
+    store = FakeStore()
+    engine, _ = make_engine(model, store=store)
+    await collect(engine, "王新勃，610121199401032831，内科，2026.11.11")
+
+    saved = store.saved
+    assistant_idx = next(i for i, m in enumerate(saved) if m.tool_calls)
+    tool_idx = next(i for i, m in enumerate(saved) if m.role == Role.TOOL)
+    # 叙述段独立保留在 assistant(tool_calls) 里
+    assert "正在查询" in saved[assistant_idx].content
+    # 最终回复是 tool 结果之后的独立 assistant 消息，不含叙述句
+    closing = saved[tool_idx + 1]
+    assert closing.role == Role.ASSISTANT
+    assert not closing.tool_calls
+    assert closing.content == "本院没有内科，请换科室"
+    assert "正在查询" not in closing.content
+
+
 async def test_persisted_history_is_complete_sequence():
     """落库序列完整性：每个 assistant(tool_calls) 的每个调用都有配对结果"""
     model = FakeChatModel(

@@ -279,3 +279,28 @@ def test_narrated_query_promise_is_detected():
 
     assert detect_narrated_tool_call("好的，我将查询2026年11月11日内科是否有号源。")
     assert not detect_narrated_tool_call("建议您挂神经内科，注意休息。")
+
+
+def test_narrated_renamed_promise_variants_are_detected():
+    """第七轮事故（2026-11-10）：模型换皮句式，旧正则全部漏判。
+
+    真实流量实测：用户确认"需要"后模型输出
+    「为了方便您，我将为您预约【呼吸内科】。请稍等，我正在查询是否有可用号源。」
+    零工具调用——且历史里上一轮的叙述文本被模型**原样照抄**。
+    """
+    from xiaozhi.models.quality import detect_narrated_tool_call
+
+    # 事故原文两句都必须拦住
+    assert detect_narrated_tool_call(
+        "为了方便您，我将为您预约【呼吸内科】。请稍等，我正在查询是否有可用号源。"
+    )
+    assert detect_narrated_tool_call("请稍等，我正在查询是否有可用号源。")
+    assert detect_narrated_tool_call("为了方便您，我将为您预约【呼吸内科】。")
+    assert detect_narrated_tool_call("正在为您办理预约挂号。")
+    assert detect_narrated_tool_call("马上为您取消预约。")
+    # 旧句式回归：仍然能拦
+    assert detect_narrated_tool_call("我将为您查询呼吸内科的号源。")
+    # 教学句式不误伤（解释流程，不是承诺执行）
+    assert not detect_narrated_tool_call("我将为您介绍预约挂号的流程。")
+    assert not detect_narrated_tool_call("我为您讲解一下如何查询就诊记录。")
+    assert not detect_narrated_tool_call("本院预约放号时间为每天早上7点。")

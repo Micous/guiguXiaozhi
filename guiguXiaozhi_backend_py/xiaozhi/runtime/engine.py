@@ -300,6 +300,13 @@ class AgentEngine:
             corrective_used = 0     # 已做过的纠正重试次数（每请求至多 1 次）
             corrective_pending = False  # 本轮检测到幻觉且待纠正
             corrective_kind: Optional[str] = None  # 幻觉承诺的操作类型（book/cancel）
+            # 2026-11-10 第七轮事故：落库把**所有轮次**的流式文本合并成一条
+            # assistant content，"好的，我将为您预约内科。请稍等，我正在查询…"
+            # 这类叙述段进了历史 → 下一轮模型**原样照抄**句式、零工具调用。
+            # 拆开记录：叙述段（带 tool_calls 轮的文本）与最终回复
+            # （最后一个无 tool_calls 轮的文本）分开落库。
+            narrative_text = ""     # 带 tool_calls 轮的模型文本（叙述段）
+            final_reply_text = ""   # 最后一个无 tool_calls 轮的文本（真正给用户的最终回复）
 
             while turn < self.max_turns:
                 # ---- 请求级时间预算 ----
@@ -577,6 +584,9 @@ class AgentEngine:
                                     if prefix:
                                         prefix += "\n\n"
                                     result.text = prefix + fallback
+                                    # 落库的最终回复也要跟着换成兜底文案，
+                                    # 不能让被截掉的谎话文本进历史
+                                    final_reply_text = result.text
                                     yield TextResponseEvent(
                                         trace_id=trace_id,
                                         metadata={"delta": fallback},
@@ -622,6 +632,7 @@ class AgentEngine:
 
                 # ---- 没有工具调用 → 结束（或纠正重试一轮） ----
                 if not response.tool_calls:
+                    final_reply_text = response.text
                     # 模型说"我这就调用预约挂号工具"却没真调 —— 逼它真的调一次。
                     # （2026-11-10 实测：用户看到"我将调用预约挂号工具"，
                     #   然后什么都没发生，工具一次都没执行。）
@@ -661,6 +672,7 @@ class AgentEngine:
 
                 # ---- 执行工具 ----
                 assistant_message = Message.assistant(response.text, tool_calls=response.tool_calls)
+                narrative_text = response.text
                 messages.append(self._assistant_to_ollama(assistant_message))
 
                 for call in response.tool_calls:
@@ -785,18 +797,38 @@ class AgentEngine:
                         outcome_meta["booking_executed"] = True
                     if cancel_executed_success:
                         outcome_meta["cancel_executed"] = True
-                    new_messages.append(
-                        Message(
-                            role=Role.ASSISTANT,
-                            content=result.text,
-                            tool_calls=result.tool_calls,
-                            metadata=outcome_meta,
+                    # 2026-11-10 第七轮事故修复：assistant 消息按轮次拆开落库。
+                    # 旧逻辑把所有轮次的流式文本合并成一条 assistant content，
+                    # 叙述段（"我将为您预约…请稍等，我正在查询…"）进了历史后，
+                    # 模型下一轮会原样照抄这种句式并零工具调用。
+                    # 新结构（与真实对话流一致）：
+                    #   assistant(tool_calls, content=叙述段) → tool 结果 → assistant(最终回复)
+                    if result.tool_calls:
+                        new_messages.append(
+                            Message(
+                                role=Role.ASSISTANT,
+                                content=narrative_text,
+                                tool_calls=result.tool_calls,
+                            )
                         )
-                    )
+                    else:
+                        new_messages.append(
+                            Message(role=Role.ASSISTANT, content=result.text, metadata=outcome_meta)
+                        )
                     # 工具结果按序落库：assistant(tool_calls) 之后必须跟得上
                     # 对应的 tool 消息（tool_call_id 配对），否则下一请求
                     # 组装出的历史是模型无法理解的残缺序列
                     new_messages.extend(persisted_tool_results)
+                    if result.tool_calls:
+                        closing_text = final_reply_text or result.text
+                        if closing_text.strip():
+                            new_messages.append(
+                                Message(
+                                    role=Role.ASSISTANT,
+                                    content=closing_text,
+                                    metadata=outcome_meta,
+                                )
+                            )
                     for appended in new_messages[len(history):]:
                         problem = appended.validate()
                         if problem:
