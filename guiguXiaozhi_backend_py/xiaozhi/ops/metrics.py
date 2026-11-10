@@ -23,6 +23,7 @@ DEFAULT_COUNTERS = (
     "tool_calls_failed",
     "llm_calls_total",
     "empty_response_retries",
+    "false_confirmation_retries",
     "degraded_total",
     "rate_limited_total",
     "hallucination_suspected",

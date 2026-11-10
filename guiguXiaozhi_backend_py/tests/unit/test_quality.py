@@ -8,10 +8,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from xiaozhi.core.message import ToolCall  # noqa: E402
+from xiaozhi.core.message import Message, ToolCall  # noqa: E402
 from xiaozhi.models.ollama import ChatTurn  # noqa: E402
 from xiaozhi.models.quality import (  # noqa: E402
+    CORRECTIVE_PROMPT,
     FALSE_CONFIRMATION_NOTICE,
+    booking_executed_in_history,
     detect_false_confirmation,
     detect_textual_tool_call,
     inspect_turn,
@@ -102,3 +104,35 @@ def test_tool_executed_suppresses_false_positive_on_summary_turn():
     finding = inspect_turn(ChatTurn(text="已为您预约成功"), tool_executed=True)
     assert not finding.false_confirmation
     assert finding.ok
+
+
+# ---- 纠正重试（2026-11-10 真实前端联调新增） ----
+
+def test_booking_executed_in_history():
+    """历史里真的执行过预约工具 → "已经预约好了"是真话"""
+    assert not booking_executed_in_history([])
+    assert not booking_executed_in_history(None)
+
+    booked = [
+        Message.assistant(
+            "预约成功", tool_calls=[ToolCall(id="1", name="预约挂号", arguments={})]
+        )
+    ]
+    assert booking_executed_in_history(booked)
+
+    # 预约后又取消 → 不算已预约
+    booked_then_cancelled = booked + [
+        Message.assistant(
+            "已取消",
+            tool_calls=[ToolCall(id="2", name="取消预约挂号", arguments={})],
+        )
+    ]
+    assert not booking_executed_in_history(booked_then_cancelled)
+
+    # 普通文本历史不含工具调用 → False
+    assert not booking_executed_in_history([Message.assistant("已为您预约成功")])
+
+
+def test_corrective_prompt_exists():
+    assert "工具" in CORRECTIVE_PROMPT
+    assert "不得再声称成功" in CORRECTIVE_PROMPT

@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from xiaozhi.core.event import EventType  # noqa: E402
-from xiaozhi.core.message import ToolCall  # noqa: E402
+from xiaozhi.core.message import Message, ToolCall  # noqa: E402
 from xiaozhi.core.tool import ToolResult  # noqa: E402
 from xiaozhi.models.ollama import ChatTurn  # noqa: E402
 from xiaozhi.models.quality import FALSE_CONFIRMATION_NOTICE  # noqa: E402
@@ -58,8 +58,11 @@ class FakeAssembler:
 
 
 class FakeStore:
+    def __init__(self, history=None):
+        self.history = history or []
+
     async def load(self, memory_id, limit=20):
-        return []
+        return list(self.history)
 
     async def save(self, memory_id, messages):
         self.saved = messages
@@ -92,7 +95,7 @@ def make_engine(model, **kwargs):
         chat_model=model,
         tool_registry=FakeRegistry(),
         secure_executor=kwargs.pop("executor", None) or FakeExecutor(),
-        conversation_store=FakeStore(),
+        conversation_store=kwargs.pop("store", None) or FakeStore(),
         context_assembler=FakeAssembler(),
         system_prompt="系统提示",
         retriever=None,
@@ -185,15 +188,121 @@ async def test_open_model_circuit_returns_rule_based_fallback():
     assert metrics.snapshot()["counters"]["degraded_total"] == 1
 
 
-async def test_false_confirmation_appends_notice_and_records_metric():
+async def test_false_confirmation_falls_back_to_honest_answer_after_retry():
+    """纠正重试后模型给出诚实回答（未调工具、未编造） → 不追加免责提示"""
     model = FakeChatModel(
         [{"chunks": ["已为您预约成功"], "turn": ChatTurn(text="已为您预约成功")}]
     )
     engine, metrics = make_engine(model)
     text, _ = await collect(engine)
 
+    assert "已为您预约成功" in text
+    assert FALSE_CONFIRMATION_NOTICE not in text
+    counters = metrics.snapshot()["counters"]
+    assert counters["false_confirmation_retries"] == 1
+    assert counters["hallucination_suspected"] == 1
+
+
+async def test_false_confirmation_corrective_retry_forces_real_tool_call():
+    """真实前端联调（2026-11-10）暴露的场景：模型口头说"预约挂号中"却不调工具，
+    下一轮还编造"预约挂号结果显示成功"。纠正重试应逼出真正的工具调用。"""
+    model = FakeChatModel(
+        [
+            {"chunks": ["已为您预约成功"], "turn": ChatTurn(text="已为您预约成功")},
+            # 收到纠正提示后，模型真正发起工具调用
+            {
+                "turn": ChatTurn(
+                    tool_calls=[ToolCall(id="1", name="预约挂号", arguments={})]
+                )
+            },
+            {"chunks": ["预约手续已完成"], "turn": ChatTurn(text="预约手续已完成")},
+        ]
+    )
+    engine, metrics = make_engine(model)
+    text, _ = await collect(engine, "帮我预约神经内科")
+
+    assert "已为您预约成功" in text  # 第一轮假话已流式下发，无法撤回
+    assert "预约手续已完成" in text  # 纠正后真正执行了工具
+    assert FALSE_CONFIRMATION_NOTICE not in text  # 纠正成功 → 不再追加免责提示
+    counters = metrics.snapshot()["counters"]
+    assert counters["false_confirmation_retries"] == 1
+    assert counters["hallucination_suspected"] == 1
+
+
+async def test_corrective_retry_still_false_then_notice_appended():
+    """纠正重试后模型仍编造成功 → 追加免责提示兜底"""
+    model = FakeChatModel(
+        [
+            {"chunks": ["已为您预约成功"], "turn": ChatTurn(text="已为您预约成功")},
+            {
+                "chunks": ["真的，您的挂号已经预约好了"],
+                "turn": ChatTurn(text="真的，您的挂号已经预约好了"),
+            },
+        ]
+    )
+    engine, metrics = make_engine(model)
+    text, _ = await collect(engine, "帮我预约神经内科")
+
     assert FALSE_CONFIRMATION_NOTICE in text
-    assert metrics.snapshot()["counters"]["hallucination_suspected"] == 1
+    counters = metrics.snapshot()["counters"]
+    assert counters["false_confirmation_retries"] == 1
+    assert counters["hallucination_suspected"] == 2  # 两轮都被判定
+
+
+async def test_prior_booking_in_history_suppresses_notice_and_retry():
+    """上一个请求里真的挂过号 → "已经预约好了"是真话，不应误报也不应纠正重试"""
+    history = [
+        Message.assistant(
+            "预约成功",
+            tool_calls=[ToolCall(id="9", name="预约挂号", arguments={})],
+        )
+    ]
+    model = FakeChatModel(
+        [
+            {
+                "chunks": ["您的挂号已经预约好了"],
+                "turn": ChatTurn(text="您的挂号已经预约好了"),
+            }
+        ]
+    )
+    engine, metrics = make_engine(model, store=FakeStore(history))
+    text, _ = await collect(engine, "挂号成功了吗？")
+
+    assert "已经预约好了" in text
+    assert FALSE_CONFIRMATION_NOTICE not in text
+    assert model.calls == 1  # 没有纠正重试
+    assert metrics.snapshot()["counters"]["hallucination_suspected"] == 0
+
+
+async def test_cancelled_booking_in_history_still_flags_false_confirmation():
+    """取消过号之后再说"已经预约好了" → 仍然是幻觉"""
+    history = [
+        Message.assistant(
+            "预约成功", tool_calls=[ToolCall(id="9", name="预约挂号", arguments={})]
+        ),
+        Message.assistant(
+            "已取消", tool_calls=[ToolCall(id="10", name="取消预约挂号", arguments={})]
+        ),
+    ]
+    model = FakeChatModel(
+        [
+            {
+                "chunks": ["您的挂号已经预约好了"],
+                "turn": ChatTurn(text="您的挂号已经预约好了"),
+            },
+            {
+                "turn": ChatTurn(
+                    tool_calls=[ToolCall(id="11", name="预约挂号", arguments={})]
+                )
+            },
+            {"chunks": ["已重新预约"], "turn": ChatTurn(text="已重新预约")},
+        ]
+    )
+    engine, metrics = make_engine(model, store=FakeStore(history))
+    text, _ = await collect(engine, "挂号成功了吗？")
+
+    assert FALSE_CONFIRMATION_NOTICE not in text  # 纠正重试成功
+    assert metrics.snapshot()["counters"]["false_confirmation_retries"] == 1
 
 
 async def test_request_metrics_are_recorded():

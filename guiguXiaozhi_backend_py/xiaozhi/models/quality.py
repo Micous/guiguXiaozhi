@@ -47,6 +47,40 @@ FALSE_CONFIRMATION_NOTICE = (
     "不要视为预约或取消已办理成功。）"
 )
 
+# 幻觉纠正提示：检测到"没调工具却声称成功"时注入一轮，逼迫模型真正调工具。
+# 实测（2026-11-10 真实前端联调）：仅追加免责提示时，7B 模型下一轮仍会
+# 编造"预约挂号结果显示成功"；注入本提示后模型会真正执行工具。
+CORRECTIVE_PROMPT = (
+    "（系统校正）你在没有调用工具的情况下声称预约/取消已成功，"
+    "系统并没有产生任何预约记录变更，这是错误的。请立即调用对应的工具"
+    "（预约挂号 / 取消预约挂号）真正完成该操作；"
+    "如果信息不全或无法完成，请如实告知用户尚未办理，不得再声称成功。"
+)
+
+
+def booking_executed_in_history(history: Sequence[Any]) -> bool:
+    """历史会话里是否真的执行过预约挂号（且之后未被取消）。
+
+    用途有二：
+    * 抑制误报——用户在**上一个请求**里成功挂号后问"挂号成功了吗？"，
+      模型回答"已经预约好了"是真话，不应追加免责提示，也不应纠正重试；
+    * 纠正重试的前提——历史里从未执行过预约工具，才能逼迫模型调工具
+      （否则可能造成重复预约，虽然工具层已有 find_duplicate 兜底）。
+
+    判定依据是历史 assistant 消息上的 ``tool_calls``（会话持久化会保留它们）：
+    最后一次相关工具调用是"预约挂号"则视为已预约；若其后又调用过
+    "取消预约挂号"则视为已取消。
+    """
+    booked = False
+    for message in history or []:
+        for call in getattr(message, "tool_calls", None) or []:
+            name = str(getattr(call, "name", "") or "")
+            if name == "预约挂号":
+                booked = True
+            elif name == "取消预约挂号":
+                booked = False
+    return booked
+
 
 @dataclass
 class QualityFinding:

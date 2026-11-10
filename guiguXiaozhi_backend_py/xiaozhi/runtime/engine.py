@@ -38,7 +38,9 @@ from xiaozhi.core.tool import ToolResult
 from xiaozhi.memory.context import ContextAssembler
 from xiaozhi.memory.store import ConversationStore
 from xiaozhi.models.quality import (
+    CORRECTIVE_PROMPT,
     FALSE_CONFIRMATION_NOTICE,
+    booking_executed_in_history,
     inspect_turn,
 )
 from xiaozhi.ops.metrics import MetricsCollector
@@ -174,6 +176,11 @@ class AgentEngine:
             successful_tool_calls = 0  # 请求级：用于抑制"工具已执行后的总结轮"误报
             tool_results: List[Message] = []
             tool_failures: Dict[str, int] = {}
+            # 历史里是否真的执行过预约（本次会话早前请求成功挂过号且未取消）。
+            # 是真话依据：模型说"已经预约好了"时不算幻觉，也不做纠正重试。
+            prior_booking = booking_executed_in_history(history)
+            corrective_used = 0     # 已做过的纠正重试次数（每请求至多 1 次）
+            corrective_pending = False  # 本轮检测到幻觉且待纠正
 
             while turn < self.max_turns:
                 # ---- 请求级时间预算 ----
@@ -239,7 +246,7 @@ class AgentEngine:
                         finding = inspect_turn(
                             candidate,
                             known_tool_names,
-                            tool_executed=successful_tool_calls > 0,
+                            tool_executed=successful_tool_calls > 0 or prior_booking,
                         )
                         # 关键：只有"一个字都没下发"时才允许重试，避免前端出现重复文本
                         retryable = (not emitted) and (
@@ -279,11 +286,23 @@ class AgentEngine:
                             if finding.false_confirmation:
                                 self.metrics.inc("hallucination_suspected")
                                 llm_span.set_attribute("hallucination_suspected", True)
-                                result.text += FALSE_CONFIRMATION_NOTICE
-                                yield TextResponseEvent(
-                                    trace_id=trace_id,
-                                    metadata={"delta": FALSE_CONFIRMATION_NOTICE},
-                                )
+                                if corrective_used == 0 and not prior_booking:
+                                    # 先不追加免责提示——注入纠正提示重试一轮，
+                                    # 逼迫模型真正调用工具（比事后提示更能纠错）
+                                    corrective_pending = True
+                                    llm_span.set_attribute(
+                                        "corrective_retry_scheduled", True
+                                    )
+                                    logger.warning(
+                                        "检测到未调工具的预约/取消承诺，准备纠正重试：trace=%s",
+                                        trace_id,
+                                    )
+                                else:
+                                    result.text += FALSE_CONFIRMATION_NOTICE
+                                    yield TextResponseEvent(
+                                        trace_id=trace_id,
+                                        metadata={"delta": FALSE_CONFIRMATION_NOTICE},
+                                    )
                         break
 
                     self.metrics.record_llm((time.monotonic() - llm_started) * 1000)
@@ -313,8 +332,19 @@ class AgentEngine:
                 if response is None:
                     response = _empty_turn()
 
-                # ---- 没有工具调用 → 结束 ----
+                # ---- 没有工具调用 → 结束（或纠正重试一轮） ----
                 if not response.tool_calls:
+                    if corrective_pending:
+                        corrective_pending = False
+                        corrective_used += 1
+                        self.metrics.inc("false_confirmation_retries")
+                        messages.append({"role": "user", "content": CORRECTIVE_PROMPT})
+                        turn += 1
+                        yield TurnEndEvent(
+                            trace_id=trace_id,
+                            metadata={"turn_number": turn, "corrective_retry": True},
+                        )
+                        continue
                     break
 
                 # ---- 执行工具 ----
