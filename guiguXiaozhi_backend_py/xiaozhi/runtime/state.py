@@ -74,6 +74,13 @@ class TurnState:
     prior_booking: bool = False
     # 本请求是否为操作类（决定叙述门控是否启用）
     operation_request: bool = False
+    # ---- Phase 4 写操作 Response Gate ----
+    # 本请求是否为写操作（预约/取消/退号/含身份证号）：完成态承诺只认
+    # 本请求真实执行的写操作（prior_booking 不再背书，见 response_gate.py）
+    write_operation: bool = False
+    # 结构化写结果账本（以业务服务的 ToolResult 为准，不让模型总结成败）：
+    # entry = {"tool", "success", "content", "authoritative_status"}
+    write_results: List[Dict[str, Any]] = field(default_factory=list)
 
     # ---- 查询能力 ----
 
@@ -114,6 +121,41 @@ class TurnState:
         """工具结果消息单点入账（I4）：本轮回填 + 落库累积各一份。"""
         self.tool_results.append(message)
         self.persisted_tool_results.append(message)
+
+    # ---- Phase 4 写操作结构化结果账本 ----
+
+    _WRITE_TOOLS = ("预约挂号", "取消预约挂号")
+
+    def record_write_result(self, tool_name: str, result: ToolResult) -> None:
+        """登记写工具的结构化执行结果（Response Gate 收尾判定用）。
+
+        只记写工具（查询结果不影响完成态判定）；
+        ``authoritative_status`` 来自工具 metadata（UNKNOWN 对账语义，
+        Phase 3b 真实 HIS 接入后由 his_client 填写）。
+        """
+        if tool_name not in self._WRITE_TOOLS:
+            return
+        meta = result.metadata or {}
+        self.write_results.append(
+            {
+                "tool": tool_name,
+                "success": result.success,
+                "content": result.content,
+                "authoritative_status": meta.get("authoritative_status"),
+            }
+        )
+
+    @property
+    def has_unknown_write(self) -> bool:
+        """是否有写工具报告 UNKNOWN（结果未核实）"""
+        return any(
+            r.get("authoritative_status") == "UNKNOWN" for r in self.write_results
+        )
+
+    @property
+    def write_executed_success(self) -> bool:
+        """本请求是否有写工具**成功**执行（以结构化结果账本为准）"""
+        return any(r.get("success") for r in self.write_results)
 
     def drain_tool_results(self) -> List[Message]:
         """取出本轮待回填的工具结果并清空（落库累积不动）。"""

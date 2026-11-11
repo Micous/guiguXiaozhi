@@ -163,6 +163,15 @@ class BookAppointmentTool(Tool):
             return ToolResult.fail(
                 f"预约未能写入：{result.message}", error_type="RepositoryUnavailable"
             )
+        if result.outcome == BookingOutcome.UNKNOWN:
+            # Phase 4：结果未核实（HIS 对账语义）→ 结构化标记 UNKNOWN，
+            # Response Gate 收尾时换固定文案"结果核实中，请勿重复提交"，
+            # 绝不允许模型宣称成功或失败。
+            return ToolResult.fail(
+                result.message or "结果核实中，请勿重复提交。",
+                error_type="UnknownState",
+                authoritative_status="UNKNOWN",
+            )
         return ToolResult.fail(
             f"预约写入失败：{result.message}", error_type="PersistenceError"
         )
@@ -273,6 +282,12 @@ class CancelAppointmentTool(Tool):
             return ToolResult.fail(
                 f"取消预约未能完成：{result.message}",
                 error_type="RepositoryUnavailable",
+            )
+        if result.outcome == BookingOutcome.UNKNOWN:
+            return ToolResult.fail(
+                result.message or "结果核实中，请勿重复提交。",
+                error_type="UnknownState",
+                authoritative_status="UNKNOWN",
             )
         if result.outcome == BookingOutcome.FAILED:
             # 业务层已经给了可读文案（未找到 / 已取消 / 失败）

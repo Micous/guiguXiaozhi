@@ -298,3 +298,45 @@
 3. **P0-06 未动**：预约成功文案仍回显完整身份证号，`appointment` 表明文落库。
 4. 迁移机制尚未接入启动流程（仍是"可选的"，仓储 `ensure_table` 兜底仍在）；上线前需把 `run_migrations` 挂到组合根并把散落的 `CREATE TABLE IF NOT EXISTS` 收编为迁移脚本。
 5. HIS 参考调研已完成（`参考项目/his`，见路线图 Phase 3b 附录）：对接走 REST 网关、号源=号表实例计数器、"先扣号源再落单"需要补偿（UNKNOWN 的语义落点）、有患者主档需先查档/建档。
+
+------------------------------------------------------------------------
+
+## 10. Phase 4 增量复核（2026-11-11，P0-05 写操作 Response Gate）
+
+> 测试基线：**457 passed / 6 skipped**（离线，新增 13 条 gate 验收）。
+> 本批对应路线图 Phase 4，P0-05 由 `PARTIALLY_FIXED` 变为 **`PARTIALLY_FIXED + RUNTIME_VERIFIED`**（8082 独立实例真机复验残留场景）。
+
+### 10.1 实现口径（与审计建议的差异）
+
+审计建议"自由文本进服务端缓冲区，执行期间只发中性进度事件"；实现收敛为**完成态确定性门控**，原因有二：
+1. 叙述段是 `NarratedToolCallInterceptor` 的检测输入（拆开检测就失效——第九轮事故教训），且 E1 特征测试钉住"无害前缀正常流式下发"的 UX；
+2. 完成态承诺的流内截断（第一道）+ 请求级确定性兜底（第二道）合计已覆盖审计 6 条验收。
+
+### 10.2 机制
+
+| 组件 | 位置 | 职责 |
+|---|---|---|
+| `is_write_operation` | `runtime/response_gate.py` | 判定写操作请求（预约/取消/退号/含身份证号/短确认承接）；**取消类祈使句先于 status_inquiry 判定**（"取消我的预约"不是查询）；查询类与结果询问不进写模式 |
+| 写模式 legit 判据 | `engine_phases._chat_turn` | `StreamFilter` / `inspect_turn` 的 `claim_is_legit` 只认**本请求**真实执行的写操作（`state.action_executed_success`），历史 `prior_booking` 不再背书 → 修掉 8.4 第 6 条残留（不带 token 重发同一句复述"预约成功"） |
+| 结构化写结果账本 | `state.record_write_result` | 写工具的 ToolResult 单独入账（success/content/authoritative_status），完成态以业务结果为准 |
+| 请求级兜底 | `engine_phases._finalize_response_gate` | 落库前执行：UNKNOWN → 固定文案；无写执行但有完成态承诺 → 按 claim 类型 + 工具真实失败原因整段替换；替换同步进 `final_reply_text`（拦截文本不进历史） |
+| UNKNOWN 契约 | `BookingOutcome.UNKNOWN` + 工具 `authoritative_status` metadata | Phase 3b HIS 对账语义的生产者待接入；Mock 链路暂无生产者 |
+
+### 10.3 审计 P0-05 六条验收对号（`tests/unit/test_response_gate.py`）
+
+| # | 用例 | 证据 |
+|---|---|---|
+| 1 | 首 delta 虚报成功无工具调用 | `test_acceptance_1_first_delta_claim_never_reaches_user`：截断 + 计数，用户收不到 |
+| 2 | 工具失败不得输出"预约成功" | `test_acceptance_2_tool_failure_never_announces_success`：兜底按 NoSlotAvailable 真实原因 |
+| 3 | UNKNOWN 只输出"结果核实中" | `test_acceptance_3_unknown_state_shows_fixed_notice_only`：固定文案 + `response_gate_blocks` 留痕 |
+| 4 | 真实执行成功才允许成功确认 | `test_acceptance_4_success_announced_only_after_real_execution` |
+| 5 | 重发同一句复述成功 → 确定性拦截 | `test_acceptance_5_replayed_request_claim_intercepted_deterministically`：prior_booking 不背书、不进纠正重试（model.calls==1）、兜底替换 |
+| 6 | 取消失败不得输出"已取消" | `test_acceptance_6_cancel_failure_never_announces_cancelled`：FALLBACK_CANCEL_NOT_DONE |
+
+另有：审批短路轮不受 gate 影响（`test_approval_short_circuit_bypasses_gate`）、拦截文本不进历史（`test_gate_replacement_never_enters_history`）、444 条既有测试零改动全过（gate 是纯增量防线）。
+
+### 10.4 残留
+
+1. 裸"成功了"（无预约/取消上下文）不在 claim 语义内——写模式下工具失败后模型说孤立的"成功了"不会被拦；扩正则误伤面大（知识问答"手术很成功"），归 Phase 7 医疗内容评测集定夺。
+2. UNKNOWN 无生产者（Mock 恒定 CONFIRMED）；Phase 3b `his_client` 接入后需真机复验固定文案路径。
+3. 未知 claim 换皮句式仍靠既有正则（gate 与截断同源），零日换皮还是要靠评测集补正则——gate 保证的是"检测到的绝不漏出去"，不是"什么都能检测到"。

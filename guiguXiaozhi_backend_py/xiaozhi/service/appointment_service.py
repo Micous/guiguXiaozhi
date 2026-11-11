@@ -72,6 +72,10 @@ class BookingOutcome(str):
     NO_SLOT = "no_slot"
     REPOSITORY_UNAVAILABLE = "repository_unavailable"
     FAILED = "failed"
+    # Phase 4：结果未核实（Phase 3b 真实 HIS 的"扣号源成功但落单结果未知"
+    # 对账语义）。Mock 链路暂无生产者；工具层据此返回
+    # authoritative_status=UNKNOWN，Response Gate 换固定中性文案。
+    UNKNOWN = "unknown"
 
 
 @dataclass

@@ -125,6 +125,8 @@ class AgentEngine(EnginePhases):
 
             # 3. 请求级跨轮状态（工具跟踪/纠正重试/文本账本的单一事实来源）
             state = self._new_turn_state(history, prep["operation_request"])
+            # Phase 4：写操作模式（Response Gate 的完成态确定性门控）
+            state.write_operation = bool(prep.get("write_operation"))
 
             # 4. 主循环（最终轮数写入 loop_outcome["turns"]）
             loop_outcome: Dict[str, Any] = {}
@@ -141,6 +143,11 @@ class AgentEngine(EnginePhases):
                 result=result,
                 outcome=loop_outcome,
             ):
+                yield _ev
+
+            # 4.5 写操作 Response Gate 收尾（确定性兜底，在落库前执行——
+            #     被拦下的承诺文本绝不能进历史）
+            async for _ev in self._finalize_response_gate(state, result, trace_id):
                 yield _ev
 
             # 5. 落库 + 画像抽取

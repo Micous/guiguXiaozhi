@@ -39,6 +39,7 @@ from xiaozhi.runtime.engine_helpers import (
 from xiaozhi.reliability.tracing import trace_span
 from xiaozhi.runtime.intent import should_inject_knowledge
 from xiaozhi.runtime.interceptors import TurnFacts, quality_gate
+from xiaozhi.runtime.response_gate import curate_final_reply, is_write_operation, stream_claim_is_legit
 from xiaozhi.runtime.state import TurnState
 from xiaozhi.runtime.stream_filter import StreamFilter
 from xiaozhi.security.secure_executor import ToolCall as SecureToolCall
@@ -179,6 +180,10 @@ class EnginePhases:
         outcome["tools"] = tools
         outcome["known_tool_names"] = known_tool_names
         outcome["operation_request"] = operation_request
+        # ---- Phase 4 写操作判定（Response Gate）----
+        # 与 operation_request 的区别：只要"写"意图（预约/取消/退号/含身份证号），
+        # 查询类（查号源/查专家）不进写模式 —— 读取类请求继续流式输出。
+        outcome["write_operation"] = is_write_operation(user_input, last_assistant_text)
 
     async def _chat_turn(
         self,
@@ -223,8 +228,19 @@ class EnginePhases:
                 # 注意不能只看 successful_tool_calls：查询号源也算工具调用，
                 # 但"查询成功"不等于"预约成功"。
                 # （E3：回看窗口/claim 拦截/textual 切割收敛进 StreamFilter）
+                #
+                # Phase 4 写操作模式：legit 判据**只认本请求**真实执行的写操作。
+                # 历史里的 prior_booking（"会话早前真的挂过号"）在写模式下不再
+                # 为完成态承诺背书 —— 真机残留（8.4 第 6 条）：用户不带 token
+                # 重发同一句"帮我预约…"，历史里有成功记录 → 旧判据判真 →
+                # 模型复述"预约成功"原样下发，而本次请求什么都没做。
+                # 查询类请求不受影响（根本不进写模式）。
+                if state.write_operation:
+                    legit = stream_claim_is_legit(state)
+                else:
+                    legit = state.claim_is_legit(state.prior_booking)
                 stream_filter = StreamFilter(
-                    claim_is_legit=state.claim_is_legit(state.prior_booking),
+                    claim_is_legit=legit,
                     query_executed_success=state.query_executed_success,
                     metrics=self.metrics,
                     trace_id=trace_id,
@@ -274,7 +290,7 @@ class EnginePhases:
                 finding = inspect_turn(
                     _TurnView(detected_text, candidate.tool_calls),
                     known_tool_names,
-                    tool_executed=state.tool_executed_for_inspect(state.prior_booking),
+                    tool_executed=legit,
                 )
                 # 结构化事件：谎话被就地截断也是"走了兜底路径"，
                 # events 通道要能看到（裸文本模式不消费此事件，前端零改动）
@@ -467,6 +483,10 @@ class EnginePhases:
                     state.record_tool_success(call.name)
                 else:
                     state.record_tool_failure(call.name, tool_result)
+                # ---- Phase 4：写工具的结构化结果单独入账 ----
+                # 完成态表述以业务服务的 ToolResult 为准（不让模型总结成败）；
+                # UNKNOWN（authoritative_status）在请求收尾时换固定文案。
+                state.record_write_result(call.name, tool_result)
 
                 self.metrics.record_tool(call.name, tool_result.success)
                 self.metrics.observe(
@@ -842,6 +862,39 @@ class EnginePhases:
             )
 
         outcome["turns"] = turn
+
+    async def _finalize_response_gate(
+        self,
+        state: TurnState,
+        result: "AgentEngineResultHolder",
+        trace_id: str,
+    ) -> AsyncIterator[Event]:
+        """写操作请求收尾的确定性门控（Phase 4 / P0-05）。
+
+        纠正重试是"逼模型再说一次"（可能再漏），本阶段不看模型说什么，
+        只看**业务事实**（state.write_results）：本请求没有真实执行写操作，
+        最终回复里就绝不允许站着一句完成态承诺 —— 漏判的换皮句式在这里
+        被整段替换，而不是只追加免责声明（审计 P0-05 验收 5）。
+        审批短路轮不走这里（clean 文案本就是结构化结果）。
+        """
+        if not state.write_operation or state.approval_required:
+            return
+        curated, reason = curate_final_reply(state, result.text)
+        if reason is None:
+            return
+        logger.warning(
+            "Response Gate 替换最终回复：trace=%s reason=%s", trace_id, reason
+        )
+        self.metrics.inc("response_gate_blocks")
+        result.text = curated
+        # 落库的最终回复同步替换 —— 被拦下的承诺文本绝不能进历史
+        # （教训：叙述/谎话进历史就是教模型照抄）
+        state.set_final_reply(curated)
+        yield TextResponseEvent(trace_id=trace_id, metadata={"delta": curated})
+        yield DegradedEvent(
+            trace_id=trace_id,
+            metadata={"component": "response_gate", "reason": reason},
+        )
 
     async def _persist_and_extract(
         self,
