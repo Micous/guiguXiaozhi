@@ -204,3 +204,64 @@
 6. **P0-02 审批闭环、P0-03 真实 HIS、P0-06 明文身份证回显仍未动**——Phase 2 / 3b 是内网演示与真实上线的下一道门。
 
 **结论**：Phase 1 的 7 条验收用例均有代码与真机证据，身份不再由请求体决定；但**不满足面向真实患者上线**，也不等于 M2（写操作安全）已达成。`DELETE /profile/{user_key}` 的无鉴权面已按约定一并收口。
+
+
+------------------------------------------------------------------------
+
+## 8. Phase 2 增量复核（2026-11-11，基线 `bfcd269` / 406 passed / 6 skipped）
+
+> 本节是增量复核，不改写第 1~6 节的 `9822856` 冻结快照，也不改写第 7 节。
+> 代码批次：`e590ed0`(P2-A 工具契约) / `e698a22`(P2-B 状态机+MySQL) /
+> `5b157f6`(P2-C 执行前门控) / `86295ea`(P2-D 审批 API + 确认 UI) /
+> `bfcd269`(P2-E1 重放预检修复)。
+> 真机验证用独立实例 8082/5174（`APPROVAL_ENABLED=true`、`APPROVAL_TTL_SECONDS=900`、
+> `AUTH_ENABLED=true`），**未改动用户正在跑的 8081/5173**；验完已停。
+
+### 8.1 P0-02 状态变化
+
+| 项 | 冻结快照（`9822856`） | Phase 2 后（`bfcd269`） |
+|---|---|---|
+| 主状态 | `PARTIALLY_FIXED`（只有门禁） | `RUNTIME_VERIFIED`（闭环已跑通），仍 `PARTIALLY_FIXED`（灰度默认关） |
+| 写工具判定 | 靠 YAML `ask` + `no_ui=allow` 放行 | `ToolDefinition.effect/approval_required/idempotency_required` 显式契约，注册期 `validate_contracts()` fail-fast |
+| 审批状态 | 进程内 `_approvals` 集合 | MySQL `approval_requests` 状态机 PENDING→APPROVED→CONSUMED，另有 EXPIRED/REVOKED |
+| 授权绑定 | 无 | subject / session / task / tool / **规范化参数哈希**，短时一次性 token（只存哈希） |
+| 执行前校验 | 无 | `SecureToolExecutor` L0 门控在四层安全流最前，重算哈希后原子消费 |
+| 确认 UI | 无 | 裸文本流 sentinel → `ChatWindow.vue` 确认弹窗（工具名/影响/脱敏参数/有效期） |
+| 生产门禁 | 5 项 | 6 项（新增 `approval_enabled=true`） |
+| 敏感数据 | 完整身份证回显 | 审批表与确认弹窗只存脱敏副本（业务表仍明文，见 8.3） |
+
+### 8.2 审计 P0-02 的 7 条验收用例（逐条证据）
+
+| # | 用例 | 证据 | 结论 |
+|---|---|---|---|
+| 1 | 无 UI 情况下 ASK 写工具必须拒绝 | 真机：第一次发起预约 → 200 但只有「需要您核对信息并明确确认…」，审批表 PENDING，`appointment` 表无新增；`test_write_without_token_creates_pending_and_never_executes`、`test_approval_disabled_keeps_legacy_behavior` | ✅ |
+| 2 | 确认参数 A 后改成 B：审批失效 | `test_tampered_args_invalidate_approval`（日期 11-20→11-21 被 `invalid_or_replayed` 拒绝）、`test_parameter_tampering_invalidates_approval` | ✅ |
+| 3 | token 重复使用第二次拒绝 | `test_token_replay_is_rejected`、`test_consume_success_and_replay_rejected`；**真机发现并修复**：旧代码下模型因历史里有成功记录会复述「预约成功」，新增 HTTP 层 `inspect_token` 预检 → 409「本次确认已失效」，`test_chat_rejects_replayed_approval_token` | ✅ |
+| 4 | 超时 / 撤销 / 跨用户：拒绝 | `test_expired_approval_rejected_and_marked_expired`、`test_revoke_invalidates_token`、`test_cross_user_approve_detail_and_consume_rejected`；真机跨用户 approve 403 `forbidden`、重复 approve 409 `not_pending`；`test_chat_rejects_cross_user_approval_token` | ✅ |
+| 5 | 进程重启 / 切实例后状态一致 | `test_state_survives_service_restart`；**真机**：PENDING 记录经 8082 完整重启后列表仍在，重启后 approve 200 → 带 token 请求工具真正执行 → 状态 CONSUMED | ✅ |
+| 6 | 未注册工具 / 未知风险 / 缺 required scope：拒绝 | `test_unknown_risk_level_is_rejected_at_definition_time`、`test_write_tool_without_idempotency_is_rejected`、`test_unregistered_tool_is_denied_by_default_policy`、`test_missing_scope_is_rejected_before_execution`、`test_real_tools_all_declare_valid_contracts` | ✅ |
+| 7 | `OVERRIDE` 不得由模型或请求参数触发 | `test_override_policy_still_requires_approval`、`test_model_supplied_claims_cannot_bypass_gate`（`approved=true` /「用户已经同意」/`permission_level=OVERRIDE` / 伪造 token 四种参数化） | ✅ |
+
+补充证据：`test_engine_stops_after_approval_required_without_second_model_call` 钉死引擎短路——审批拦下后模型只被调用一次，不会把「需确认」结果喂回去生成「已预约成功」；落库仍是三段式（assistant(tool_calls) → tool → assistant 最终回复）。`test_concurrent_consume_only_one_winner` 验证 20 并发只有一个赢家。
+
+### 8.3 真机链路摘要（8082/5174）
+
+1. 登录 `approval-demo` → 签发 session → 发起完整预约请求 → 响应含 `[[XIAOZHI_APPROVAL]]` sentinel，`args.id_card = 610121********2831`、状态 PENDING；`appointment` 表无新记录。
+2. 其他主体 approve → 403；本人 approve → 200（43 字符一次性 token）；重复 approve → 409 `not_pending`。
+3. 带 token 重发同一句 → **「预约成功…医生：徐国兴」**，`appointment` 表新增且仅新增 1 条（2026-11-20 呼吸内科 上午），审批状态 CONSUMED。
+4. 重放同一 token（旧代码）→ 用户看到「预约成功」但数据库无新增（模型复述历史）；修复后 → 409 + 明确文案，请求根本不进模型。
+5. 新会话产生 PENDING → 重启 8082（36s，RAG 33 块降级=False）→ PENDING 仍在 → approve → 带 token 执行（业务层因周末不出诊拒绝，但审批已 CONSUMED，证明门控与工具链路跨重启可用）。
+6. Vite 转换产物含 `approvalDialogVisible` / `extractApprovalSentinel` / `confirmApproval`，`import.meta.env` 注入 `VITE_AUTH_ENABLED:"true"` 与 `VITE_API_TARGET=http://127.0.0.1:8082`；前端日志 `broker.sock` 计数 0。
+
+### 8.4 仍然存在的口径差异（不要误读为「已可上线」）
+
+1. **审批与认证都是灰度默认关**（`approval_enabled=false` / `auth_enabled=false`）：8081/5173 当前运行态只开了认证（本机 `.env`），**审批未开**；代码默认值未改以保住 406 个离线单测与一期零变更设计。
+2. `permission_no_ui` 在 development 仍是 `allow`；审批开启后 L0 会先拦住写工具，但配置层面只靠 production 门禁强制 `deny`。
+3. **认证关闭时审批主体退化为 `anonymous`**：任何访客都能确认他人的写操作；组合根会打 WARN，production 门禁因强制 `auth_enabled=true` 不会出现此组合。
+4. **bootstrap 登录仍是过渡**（共享凭证换 JWT），正式上线须换 OIDC/网关并删 `/v1/auth/token`。
+5. **P0-06 未动**：预约成功文案仍回显完整身份证号，业务表仍明文；本次只是让审批表/确认弹窗不新增泄露面。
+6. **残留模型缺陷（本次真机暴露，未修）**：不带 `approvalToken` 重复发同一句预约时，模型会因历史里 `booking_executed=true` 让 `claim_is_legit` 判为真话，从而零工具调用复述「预约成功」。数据库确认没有副作用，但 UI 误导仍在；根因在 `prior_booking` 与完成态判定，归入 Phase 4 Response Gate。
+7. 未做：审批状态机无 `REJECTED` 显式态（拒绝走 REVOKED）、无审批审计导出、token 无 jti 黑名单、无 CORS/安全响应头、无渗透测试。
+8. **P0-03 真实 HIS 仍未实现**，`IMPLEMENTED_REAL_SLOT_ADAPTERS` 仍为空 → `APP_ENV=production` 恒定拒绝启动（刻意）。
+
+**结论**：Phase 2 的 7 条验收用例均有单测 + 真机证据，**形态 A（内网演示/教学）的 M2 标准达成**；但形态 B/C 不成立——认证源是过渡、审批默认关、号源是 Mock、敏感数据仍明文回显、Phase 3/4 未开工。下一批建议 Phase 3a（预约状态机 / 事务 / 唯一约束，无外部依赖），同时并行催 HIS 文档与沙箱。
