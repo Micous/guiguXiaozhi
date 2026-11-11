@@ -6,6 +6,7 @@
 > **依据**：《Python_Harness_生产化深度审计与分阶段整改设计方案.md》V1.0（审计基线 `f7f0ff4`）、《生产就绪评估.md》（基线 `97d8d9e`）、《上线迭代路线图.md》（基线 `2e60c11`）
 > **本文定位**：**Phase 0 交付物**。冻结「审计说了什么」与「当前代码实际是什么」的差异，让后续每个 Phase 从可核对的事实出发，不再照着过期文档整改。
 > **配套代码**：本批门禁改动见 commit `9822856`。
+> **Phase 1 增量复核（`f1f1cbe` / 357 单测）见本文第 7 节**：P0-01 已从 `SOURCE_CONFIRMED` 变为 `PARTIALLY_FIXED` + `RUNTIME_VERIFIED`，审计的 7 条验收用例逐条有代码/真机证据。第 1~6 节仍是 `9822856` 的冻结快照，按历史保留、不改写。
 
 ------------------------------------------------------------------------
 
@@ -158,3 +159,48 @@
 > 再次强调：本批是**门禁**，不是修复。`permission_no_ui=allow` 在 development 仍是默认值；把 `APP_ENV` 设成 production 只会得到一次清晰的拒绝，不会让系统变安全。
 
 *冻结时间：2026-11-11｜基线提交：`9822856`*
+
+
+------------------------------------------------------------------------
+
+## 7. Phase 1 增量复核（2026-11-11，基线 `f1f1cbe` / 357 passed / 6 skipped）
+
+> 本节是增量复核，不改写第 1~6 节的 `9822856` 冻结快照。
+> 代码批次：`0631f3d`(P1-A) / `c2cd129`(P1-B) / `d216f5f`(P1-C) /
+> `5098470`(P1-C2) / `2656078`(P1-D) / `f1f1cbe`(P1-D2)。
+
+### 7.1 P0-01 状态变化
+
+| 项 | 冻结快照（`9822856`） | Phase 1 后（`f1f1cbe`） |
+|---|---|---|
+| 主状态 | `SOURCE_CONFIRMED` | `PARTIALLY_FIXED` + `RUNTIME_VERIFIED` |
+| 身份来源 | 请求体自报 `memoryId`/`userId` | Bearer JWT 的 `sub`；请求体 `userId` 一律忽略 |
+| 会话主键 | 客户端自报、可枚举 | 服务端 CSPRNG 签发 `s-` 前缀，MySQL `agent_sessions` 归属表 |
+| 跨用户访问 | 无校验 | 路由层归属校验，「不存在 / 越权」统一 403 防枚举 |
+| 运维端点 | 全裸奔 | `ops:read`；认证开启时不注册 `/docs` `/redoc` `/openapi.json` |
+| 画像删除 | 知道 `user_key` 即可删 | 需 `profile:forget` scope |
+| 会话撤销 | 无 | `DELETE /v1/sessions/{id}`（本人可撤、越权 403、撤销后旧 id 403） |
+| 生产门禁 | 4 项 | 5 项（新增：必须 `auth_enabled=true` + JWT 强密钥 + bootstrap 凭证） |
+
+### 7.2 审计 P0-01 的 7 条验收用例（逐条证据）
+
+| # | 用例 | 证据 | 结论 |
+|---|---|---|---|
+| 1 | 未携带凭证访问聊天：401 | 8082 真机 + `test_chat_requires_token` | ✅ |
+| 2 | A 用 B 的 `memoryId`：403 且不读历史 | 真机返回「会话不存在或不属于当前用户。」；`test_chat_cross_user_session_forbidden`（校验在 engine 之前） | ✅ |
+| 3 | 伪造 `userId=B` 但 JWT `sub=A`：只以 A 为准 | 真机请求体故意传 `userId=hacker` 仍正常；`test_chat_owner_ok_and_identity_from_token` | ✅ |
+| 4 | A 查询 B 的 trace/audit：403 | 普通用户访问运维端点统一 403（`test_ops_endpoints_reject_normal_user` 参数化） | ✅（以统一 403 实现） |
+| 5 | 普通用户 `/metrics` `/audit` `/tools` 403；运维成功 | 真机 alice 403 / ops-admin 200；BOLA 参数化用例 | ✅ |
+| 6 | 过期 / 签名错 / issuer / **audience** 不符：拒绝 | 单测全覆盖；`f1f1cbe` 补 `aud` 校验，真机旧 token（缺 aud）被拒 401 | ✅ |
+| 7 | session 撤销后旧 id 不能继续读写 | 真机撤销 200 → chat 403；`test_revoke_session_makes_old_id_unusable` | ✅ |
+
+### 7.3 仍然存在的口径差异与剩余工作（不要误读为「已可上线」）
+
+1. **认证源是过渡态**：`/v1/auth/token` 用 `auth_bootstrap_secret` 换 JWT，属内网演示；正式上线须换 OIDC / API 网关，并删除该端点与前端 `LoginGate.vue`。
+2. **认证默认关闭**（`auth_enabled=false`）：8081/5173 现状仍是开放态。`APP_ENV=production` 门禁强制开启认证，但 production 因 Mock 号源恒定不可启动——门禁不是修复。
+3. **scope 未细分**：审计建议 `ops:read`/`audit:read`/`trace:read`/`tools:read` 分别授权，当前统一 `ops:read`；运维角色能读全部 trace（按策略授权，非按会话隔离）。
+4. **撤销用物理删除**，未实现审计建议的 `status/version/expires_at` 状态机；前端「开启新会话」的 revoke 是 best-effort（失败不阻断）。
+5. **未做**：CORS 与安全响应头、token 存 localStorage 的 XSS 风险（正式应 httpOnly cookie）、jti 黑名单 / token 主动失效、会话 TTL 清理、CSRF、渗透测试。归入 Phase 6/7 或下一批。
+6. **P0-02 审批闭环、P0-03 真实 HIS、P0-06 明文身份证回显仍未动**——Phase 2 / 3b 是内网演示与真实上线的下一道门。
+
+**结论**：Phase 1 的 7 条验收用例均有代码与真机证据，身份不再由请求体决定；但**不满足面向真实患者上线**，也不等于 M2（写操作安全）已达成。`DELETE /profile/{user_key}` 的无鉴权面已按约定一并收口。
