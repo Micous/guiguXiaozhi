@@ -23,6 +23,7 @@ from xiaozhi.core.event import EventType
 from xiaozhi.reliability.tracing import new_trace_id, set_trace_id
 from xiaozhi.security.approval_service import (
     ApprovalContext,
+    ApprovalError,
     reset_approval_context,
     set_approval_context,
 )
@@ -271,6 +272,92 @@ async def revoke_session(session_id: str, request: Request):
     except SessionForbiddenError:
         return JSONResponse({"detail": "无权操作该会话"}, status_code=403)
     return {"revoked": removed, "session_id": session_id}
+
+
+def _approval_service(request: Request):
+    """审批组件未启用时返回 None（端点统一 404，不暴露存在性）。"""
+    container = _container(request)
+    if not container.settings.approval_enabled or container.approval_service is None:
+        return None
+    return container.approval_service
+
+
+def _approval_error(exc: ApprovalError) -> JSONResponse:
+    """状态机拒绝 → 结构化原因码；跨用户与不存在统一 403 防枚举。"""
+    code = exc.reason_code
+    status = 403 if code in ("forbidden", "not_found") else 409
+    return JSONResponse(
+        {"detail": str(exc), "reason_code": code}, status_code=status
+    )
+
+
+def _approval_principal(request: Request):
+    """审批端点必须有真实主体；认证开启时还要求 chat:write scope。"""
+    principal = _require_principal(request)
+    if _container(request).settings.auth_enabled and not principal.has_scope(
+        CHAT_WRITE_SCOPE
+    ):
+        raise HTTPException(status_code=403, detail="需要 chat:write 权限")
+    return principal
+
+
+@router.get("/v1/approvals")
+@router.get("/api/v1/approvals")
+async def list_approvals(request: Request):
+    """当前主体的待确认/已确认请求（刷新页面后恢复确认弹窗用）。"""
+    service = _approval_service(request)
+    if service is None:
+        return JSONResponse({"detail": "审批未启用"}, status_code=404)
+    principal = _approval_principal(request)
+    return {"items": service.list_for_subject(principal)}
+
+
+@router.get("/v1/approvals/{approval_id}")
+@router.get("/api/v1/approvals/{approval_id}")
+async def get_approval(approval_id: str, request: Request):
+    service = _approval_service(request)
+    if service is None:
+        return JSONResponse({"detail": "审批未启用"}, status_code=404)
+    principal = _approval_principal(request)
+    try:
+        return service.detail(approval_id, principal)
+    except ApprovalError as exc:
+        return _approval_error(exc)
+
+
+@router.post("/v1/approvals/{approval_id}/approve")
+@router.post("/api/v1/approvals/{approval_id}/approve")
+async def approve_approval(approval_id: str, request: Request):
+    """用户**明确点击确认**：签发短时一次性 token（明文只在此返回一次）。"""
+    service = _approval_service(request)
+    if service is None:
+        return JSONResponse({"detail": "审批未启用"}, status_code=404)
+    container = _container(request)
+    principal = _approval_principal(request)
+    try:
+        token = service.approve(approval_id, principal)
+    except ApprovalError as exc:
+        return _approval_error(exc)
+    return {
+        "approval_token": token,
+        "approval_id": approval_id,
+        "expires_in": container.settings.approval_ttl_seconds,
+    }
+
+
+@router.post("/v1/approvals/{approval_id}/revoke")
+@router.post("/api/v1/approvals/{approval_id}/revoke")
+async def revoke_approval(approval_id: str, request: Request):
+    """用户拒绝/取消：撤销后即便持有明文 token 也无法消费。"""
+    service = _approval_service(request)
+    if service is None:
+        return JSONResponse({"detail": "审批未启用"}, status_code=404)
+    principal = _approval_principal(request)
+    try:
+        service.revoke(approval_id, principal)
+    except ApprovalError as exc:
+        return _approval_error(exc)
+    return {"revoked": True, "approval_id": approval_id}
 
 
 @router.get("/health")

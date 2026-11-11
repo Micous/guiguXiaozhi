@@ -124,6 +124,45 @@
       </footer>
     </main>
 
+    <el-dialog
+        v-model="approvalDialogVisible"
+        title="请确认本次操作"
+        width="480px"
+        :close-on-click-modal="false"
+        :show-close="false"
+        align-center
+    >
+      <div class="approval-body" v-if="approvalPending">
+        <div class="approval-warning">
+          <i class="fa-solid fa-shield-halved"></i>
+          这是会产生业务副作用的写操作，需由您本人核对并明确确认后才会执行。
+        </div>
+        <div class="approval-row">
+          <span class="approval-label">操作</span>
+          <strong>{{ approvalPending.detail.tool_name }}</strong>
+        </div>
+        <div class="approval-row">
+          <span class="approval-label">影响</span>
+          <span>{{ impactText(approvalPending.detail.tool_name) }}</span>
+        </div>
+        <div class="approval-args">
+          <div class="approval-label">关键参数（敏感信息已脱敏）</div>
+          <div v-for="(value, key) in approvalPending.detail.args" :key="key" class="approval-arg-line">
+            <span>{{ key }}</span><span>{{ value }}</span>
+          </div>
+        </div>
+        <div class="approval-row">
+          <span class="approval-label">有效期至</span>
+          <span>{{ approvalPending.detail.expires_at }}</span>
+        </div>
+        <p class="approval-error" v-if="approvalError">{{ approvalError }}</p>
+      </div>
+      <template #footer>
+        <el-button :disabled="approvalBusy" @click="denyApproval">拒绝 / 取消</el-button>
+        <el-button type="primary" :loading="approvalBusy" @click="confirmApproval">确认执行</el-button>
+      </template>
+    </el-dialog>
+
     <aside class="sidebar right-sidebar">
       <div class="side-card">
         <h3 class="card-title"><i class="fa-solid fa-star"></i> 就医必读</h3>
@@ -150,15 +189,33 @@
 </template>
 
 <script setup>
-import { onMounted, ref, watch, nextTick } from 'vue'
+import { onMounted, ref, computed, watch, nextTick } from 'vue'
 import axios from 'axios'
-import { AUTH_ENABLED, authHeaders, chatUrl, initMemoryId, newSession, revokeSession, setToken } from '@/api/xiaozhi'
+import {
+  AUTH_ENABLED, authHeaders, chatUrl, initMemoryId, newSession, revokeSession, setToken,
+  extractApprovalSentinel, listApprovals, approveApproval, revokeApproval
+} from '@/api/xiaozhi'
 
 const messaggListRef = ref()
 const isSending = ref(false)
 const uuid = ref()
 const inputMessage = ref('')
 const messages = ref([])
+// Phase 2 审批：待用户确认的请求、按钮忙态与错误提示（token 只在内存里传，绝不落盘）
+const approvalPending = ref(null)
+const approvalBusy = ref(false)
+const approvalError = ref('')
+const lastUserMessage = ref('')
+const approvalDialogVisible = computed({
+  get: () => !!approvalPending.value,
+  set: (visible) => { if (!visible) approvalPending.value = null }
+})
+
+const impactText = (toolName) => {
+  if (toolName === '预约挂号') return '将创建一条真实挂号记录，占用一个号源。'
+  if (toolName === '取消预约挂号') return '将取消已有挂号记录并释放号源。'
+  return '将写入/修改业务数据，请核对以下参数。'
+}
 
 onMounted(async () => {
   try {
@@ -177,7 +234,25 @@ onMounted(async () => {
   }
   watch(messages, () => scrollToBottom(), { deep: true })
   hello()
+  restorePendingApproval()
 })
+
+/** 刷新页面后恢复尚未确认的写操作（审批未启用时后端 404，静默忽略） */
+const restorePendingApproval = async () => {
+  try {
+    const items = await listApprovals()
+    const pending = items.find((item) => item.status === 'PENDING')
+    if (pending) {
+      approvalPending.value = {
+        decision: 'REQUIRE_APPROVAL',
+        detail: pending,
+        message: '有待确认的操作，请核对后决定是否执行。'
+      }
+    }
+  } catch (e) {
+    // 审批端点未启用 / 网络异常：不影响正常聊天
+  }
+}
 
 const scrollToBottom = async () => {
   await nextTick()
@@ -200,18 +275,25 @@ const sendMessage = () => {
   }
 }
 
-const sendRequest = (message) => {
+const sendRequest = (message, approvalToken = '', skipUserBubble = false) => {
   isSending.value = true
-  const userMsg = { isUser: true, content: message, isTyping: false, isThinking: false }
-  if(messages.value.length > 0) messages.value.push(userMsg)
+  if (!skipUserBubble) {
+    lastUserMessage.value = message
+    const userMsg = { isUser: true, content: message, isTyping: false, isThinking: false }
+    if(messages.value.length > 0) messages.value.push(userMsg)
+  }
 
   const botMsg = { isUser: false, content: '', isTyping: true, isThinking: false }
   messages.value.push(botMsg)
   const lastMsg = messages.value[messages.value.length - 1]
   scrollToBottom()
 
+  const payload = { memoryId: uuid.value, message }
+  // 一次性审批 token 只在这一次重发里出现，用完即弃，不写 localStorage
+  if (approvalToken) payload.approvalToken = approvalToken
+
   axios.post(chatUrl,
-      { memoryId: uuid.value, message },
+      payload,
       {
         responseType: 'text',
         headers: authHeaders(),
@@ -245,8 +327,48 @@ const initUUID = async () => {
 }
 
 const convertStreamOutput = (output) => {
-  if (!output) return ''
-  return output.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\n/g, '<br>')
+  const { visibleText, payload } = extractApprovalSentinel(output)
+  if (payload && payload.decision === 'REQUIRE_APPROVAL' && payload.detail) {
+    const current = approvalPending.value
+    const nextId = payload.detail.approval_id
+    if (!current || !current.detail || current.detail.approval_id !== nextId) {
+      approvalPending.value = payload
+      approvalError.value = ''
+    }
+  }
+  if (!visibleText) return ''
+  return visibleText.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\n/g, '<br>')
+}
+
+/** 用户明确点「确认执行」：换一次性 token，重发同一句请求让工具真正执行 */
+const confirmApproval = async () => {
+  const payload = approvalPending.value
+  const approvalId = payload && payload.detail && payload.detail.approval_id
+  if (!approvalId) { approvalPending.value = null; return }
+  approvalBusy.value = true
+  approvalError.value = ''
+  try {
+    const result = await approveApproval(approvalId)
+    approvalPending.value = null
+    const text = lastUserMessage.value
+    if (text && result.approval_token) sendRequest(text, result.approval_token, true)
+  } catch (e) {
+    const status = e && e.response && e.response.status
+    approvalError.value = status === 409
+      ? '该确认已过期或已被处理，请重新发起操作。'
+      : '确认失败，请稍后重试或重新发起操作。'
+  } finally {
+    approvalBusy.value = false
+  }
+}
+
+const denyApproval = async () => {
+  const payload = approvalPending.value
+  const approvalId = payload && payload.detail && payload.detail.approval_id
+  approvalPending.value = null
+  if (approvalId) {
+    try { await revokeApproval(approvalId) } catch (e) { /* best-effort */ }
+  }
 }
 
 const newChat = async () => {
@@ -888,6 +1010,40 @@ const newChat = async () => {
   0%, 100% { opacity: 0.3; transform: translateY(0); }
   50% { opacity: 1; transform: translateY(-4px); }
 }
+
+/* Phase 2 审批确认弹窗 */
+.approval-body { font-size: 14px; color: var(--text-dark); }
+.approval-warning {
+  background: #fff7e6;
+  border: 1px solid #ffd591;
+  color: #ad4e00;
+  border-radius: 10px;
+  padding: 10px 12px;
+  line-height: 1.6;
+  margin-bottom: 16px;
+}
+.approval-warning i { margin-right: 6px; }
+.approval-row {
+  display: flex;
+  gap: 12px;
+  padding: 7px 0;
+  border-bottom: 1px solid #f1f5f9;
+}
+.approval-label { color: var(--text-muted); min-width: 92px; flex-shrink: 0; }
+.approval-args { padding: 12px 0; }
+.approval-args .approval-label { margin-bottom: 8px; }
+.approval-arg-line {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  background: #f8fafc;
+  border-radius: 8px;
+  padding: 7px 10px;
+  margin-bottom: 6px;
+  word-break: break-all;
+}
+.approval-arg-line span:first-child { color: var(--text-muted); flex-shrink: 0; }
+.approval-error { color: #cf1322; margin: 12px 0 0; }
 
 /* 自定义滚动条美化（可选） */
 .message-list::-webkit-scrollbar {

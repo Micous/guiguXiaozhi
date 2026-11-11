@@ -21,6 +21,7 @@ export const AUTH_ENABLED = import.meta.env.VITE_AUTH_ENABLED === 'true'
 export const chatUrl = '/api/xiaozhi/chat'
 const SESSION_URL = '/api/v1/sessions'
 const TOKEN_URL = '/api/v1/auth/token'
+const APPROVAL_URL = '/api/v1/approvals'
 const TOKEN_KEY = 'xiaozhi_token'
 const SESSION_KEY = 'xiaozhi_session_id'
 const LEGACY_UUID_KEY = 'user_uuid'
@@ -84,4 +85,63 @@ export async function revokeSession() {
 export function newSession() {
   localStorage.removeItem(LEGACY_UUID_KEY)
   localStorage.removeItem(SESSION_KEY)
+}
+
+/**
+ * Phase 2 审批闭环（审计 P0-02）。
+ *
+ * 后端在裸文本流里夹带 [[XIAOZHI_APPROVAL]]{...}[[/XIAOZHI_APPROVAL]] 标记，
+ * 前端剥离后弹确认框；用户点「确认执行」才签发一次性 token，再带着它重发
+ * 同一句请求。token 只经内存传递，绝不写 localStorage，也不出现在对话文本里。
+ */
+export const APPROVAL_SENTINEL_PREFIX = '[[XIAOZHI_APPROVAL]]'
+export const APPROVAL_SENTINEL_SUFFIX = '[[/XIAOZHI_APPROVAL]]'
+
+/** 从累积的流文本里摘出审批标记，返回 { visibleText, payload } */
+export function extractApprovalSentinel(output) {
+  const text = output || ''
+  const start = text.indexOf(APPROVAL_SENTINEL_PREFIX)
+  if (start < 0) return { visibleText: text, payload: null }
+  const bodyStart = start + APPROVAL_SENTINEL_PREFIX.length
+  const end = text.indexOf(APPROVAL_SENTINEL_SUFFIX, bodyStart)
+  if (end < 0) {
+    // 标记跨 chunk 尚未收全：从标记起点起先不显示，避免露出半截 JSON
+    return { visibleText: text.slice(0, start), payload: null }
+  }
+  let payload = null
+  try {
+    payload = JSON.parse(text.slice(bodyStart, end))
+  } catch (e) {
+    payload = null
+  }
+  return {
+    visibleText: text.slice(0, start) + text.slice(end + APPROVAL_SENTINEL_SUFFIX.length),
+    payload
+  }
+}
+
+const approvalConfig = () => ({ headers: authHeaders() })
+
+/** 刷新页面后恢复未处理的确认请求 */
+export async function listApprovals() {
+  const resp = await axios.get(APPROVAL_URL, approvalConfig())
+  return (resp.data && resp.data.items) || []
+}
+
+export async function approveApproval(approvalId) {
+  const resp = await axios.post(
+    `${APPROVAL_URL}/${encodeURIComponent(approvalId)}/approve`,
+    {},
+    approvalConfig()
+  )
+  return resp.data
+}
+
+export async function revokeApproval(approvalId) {
+  const resp = await axios.post(
+    `${APPROVAL_URL}/${encodeURIComponent(approvalId)}/revoke`,
+    {},
+    approvalConfig()
+  )
+  return resp.data
 }

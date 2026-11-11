@@ -351,6 +351,11 @@ async def get_application(settings: Optional[Settings] = None) -> Application:
         approval_service = ApprovalService(
             approval_repo, ttl_seconds=settings.approval_ttl_seconds
         )
+        if not settings.auth_enabled:
+            logger.warning(
+                "审批已开启但认证关闭：所有主体退化为 anonymous，"
+                "任何访客都能确认他人的写操作；仅限本机单机调试"
+            )
         logger.info(
             "审批闭环已启用：approval_requests 就绪，TTL=%ss，写工具需一次性确认",
             settings.approval_ttl_seconds,
