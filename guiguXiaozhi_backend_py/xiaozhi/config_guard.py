@@ -89,6 +89,22 @@ def validate_production_settings(settings: Settings) -> None:
             "模拟号源不具业务效力，禁止以 production 启动"
         )
 
+    # 5) 认证门禁（审计 P0-01）：生产必须开认证，且密钥材料齐备
+    if not settings.auth_enabled:
+        problems.append(
+            "auth_enabled=false → 生产必须开启认证（JWT/OIDC）："
+            "当前 memoryId/userId 由请求体自报，可越权读写他人会话"
+        )
+    else:
+        if len(settings.auth_secret_key.strip()) < 32:
+            problems.append(
+                "auth_secret_key 为空或短于 32 字符 → HS256 密钥必须由环境注入且足够长"
+            )
+        if not settings.auth_bootstrap_secret.strip():
+            problems.append(
+                "auth_bootstrap_secret 为空 → 本地签发端点的换取凭证必须配置"
+            )
+
     if problems:
         raise ProductionConfigError(
             f"APP_ENV=production 启动被拒绝，共 {len(problems)} 项不合规：\n  - "

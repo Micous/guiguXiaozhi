@@ -108,6 +108,18 @@ class Settings(BaseSettings):
     # Fernet 密钥；开启画像时必填，缺失则画像模块整体禁用（敏感字段必须密文落库）
     profile_secret_key: str = ""
 
+    # ---------- 认证（Phase 1，灰度默认关）----------
+    # auth_enabled=false：完全沿用一期行为（memoryId/userId 由请求体自报，前端零改动）；
+    # auth_enabled=true ：/xiaozhi/chat 必须带 Bearer token，memoryId 必须是服务端
+    #   签发的 session_id 且归属该主体；运维端点需 ops:read scope。
+    # 正式环境换 OIDC/网关时只换签发方，TokenService.verify 契约不变。
+    auth_enabled: bool = False
+    auth_secret_key: str = ""  # JWT HS256 签名密钥（开启时必填，生产要求 ≥32 字符）
+    auth_bootstrap_secret: str = ""  # 本地过渡：/api/v1/auth/token 的换取凭证
+    auth_token_ttl_seconds: int = 3600
+    auth_issuer: str = "xiaozhi-local"
+    auth_ops_subjects: List[str] = Field(default_factory=list)  # 可访问运维端点的主体
+
     # ---------- 可观测 ----------
     log_level: str = "INFO"
     json_logs: bool = True

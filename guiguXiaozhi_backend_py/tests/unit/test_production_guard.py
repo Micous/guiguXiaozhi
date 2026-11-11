@@ -38,6 +38,9 @@ def his_ready(monkeypatch):
         "permission_no_ui": "deny",
         "mysql_password": "S3cure-Pass!",
         "slot_service_impl": "his",
+        "auth_enabled": True,
+        "auth_secret_key": "a-32-character-minimum-secret-key-1234567890",
+        "auth_bootstrap_secret": "bootstrap-secret",
     }
 
 
@@ -83,12 +86,12 @@ def test_production_env_aliases_detected(env):
 
 
 def test_production_reports_all_problems_at_once():
-    """默认配置下 3 项不合规（画像默认关，故不含密钥项），一次报全。"""
+    """默认配置下 4 项不合规（画像默认关，故不含密钥项），一次报全。"""
     with pytest.raises(ProductionConfigError) as exc:
         validate_production_settings(prod())
     msg = str(exc.value)
-    assert "共 3 项不合规" in msg
-    for token in ("permission_no_ui", "mysql_password", "slot_service_impl"):
+    assert "共 4 项不合规" in msg
+    for token in ("permission_no_ui", "mysql_password", "slot_service_impl", "auth_enabled"):
         assert token in msg
     assert "APP_ENV=development" in msg  # 错误信息要给出可执行的修复方向
 
@@ -209,3 +212,33 @@ def test_build_slot_service_rejects_unregistered_adapter():
     with pytest.raises(ProductionConfigError) as exc:
         _build_slot_service(dev(slot_service_impl="his"), object())
     assert "尚未实现" in str(exc.value)
+
+
+# ---------------------------------------------------------------- 认证门禁（P1-A）
+
+
+def test_development_auth_defaults_off():
+    """红线：认证默认关，否则 291 个既有行为与前端协议都会变。"""
+    s = Settings(_env_file=None)
+    assert s.auth_enabled is False
+    assert s.auth_secret_key == ""
+    assert s.auth_bootstrap_secret == ""
+    assert s.auth_ops_subjects == []
+
+
+def test_production_rejects_auth_disabled(his_ready):
+    with pytest.raises(ProductionConfigError) as exc:
+        validate_production_settings(prod(**{**his_ready, "auth_enabled": False}))
+    assert "auth_enabled" in str(exc.value)
+
+
+def test_production_rejects_short_auth_key(his_ready):
+    with pytest.raises(ProductionConfigError) as exc:
+        validate_production_settings(prod(**{**his_ready, "auth_secret_key": "short"}))
+    assert "auth_secret_key" in str(exc.value)
+
+
+def test_production_rejects_missing_bootstrap_secret(his_ready):
+    with pytest.raises(ProductionConfigError) as exc:
+        validate_production_settings(prod(**{**his_ready, "auth_bootstrap_secret": ""}))
+    assert "auth_bootstrap_secret" in str(exc.value)

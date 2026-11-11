@@ -8,6 +8,7 @@ pymilvus==2.5.3
 pymongo==4.10.1
 mysql-connector-python==9.1.0
 PyYAML==6.0.2
+PyJWT==2.10.1
 
 # 开发依赖
 pytest==8.3.4
