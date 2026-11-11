@@ -152,7 +152,7 @@
 <script setup>
 import { onMounted, ref, watch, nextTick } from 'vue'
 import axios from 'axios'
-import { authHeaders, chatUrl, initMemoryId, newSession } from '@/api/xiaozhi'
+import { AUTH_ENABLED, authHeaders, chatUrl, initMemoryId, newSession, setToken } from '@/api/xiaozhi'
 
 const messaggListRef = ref()
 const isSending = ref(false)
@@ -164,9 +164,12 @@ onMounted(async () => {
   try {
     await initUUID()
   } catch (e) {
+    // 会话签发失败/token 失效：清掉本地 token，刷新后 App.vue 会回到登录页。
+    // 不主动 reload，避免网关自动注入 token 的场景形成「登录-失败」循环。
+    if (AUTH_ENABLED) setToken('')
     messages.value.push({
       isUser: false,
-      content: '登录状态异常，请重新登录或联系管理员。',
+      content: '登录状态异常，请刷新页面重新登录。',
       isTyping: false,
       isThinking: false
     })
@@ -225,8 +228,9 @@ const sendRequest = (message) => {
       })
       .catch((error) => {
         const status = error && error.response && error.response.status
+        if (status === 401 && AUTH_ENABLED) setToken('')
         lastMsg.content = status === 401
-          ? '登录已失效，请重新登录后再试。'
+          ? '登录已失效，请刷新页面重新登录。'
           : status === 403
             ? '无权访问该会话，请点击「开启新会话」重试。'
             : '网络异常，请尝试刷新页面。'
