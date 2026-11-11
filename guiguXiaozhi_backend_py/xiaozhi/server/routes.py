@@ -15,12 +15,22 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
 
 from xiaozhi.core.event import EventType
 from xiaozhi.reliability.tracing import new_trace_id, set_trace_id
+from xiaozhi.security.auth import AuthError, BootstrapRejected, bearer_token
 from xiaozhi.security.guardrails import check_input
+from xiaozhi.security.principal import (
+    ANONYMOUS,
+    CHAT_WRITE_SCOPE,
+    OPS_READ_SCOPE,
+    PROFILE_FORGET_SCOPE,
+    SESSION_CREATE_SCOPE,
+    Principal,
+)
+from xiaozhi.security.session_access import SessionAccessError
 from xiaozhi.server.trace_view import render_trace_page
 
 logger = logging.getLogger(__name__)
@@ -35,14 +45,60 @@ def _client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
+def _require_principal(request: Request) -> Principal:
+    """认证关闭 → ANONYMOUS（兼容路径）；开启 → 校验 Bearer token。
+
+    不改变任何端点签名（既有调用方零感知），认证开启时缺/坏 token 直接 401。
+    """
+    container = _container(request)
+    if not container.settings.auth_enabled:
+        return ANONYMOUS
+    if container.token_service is None:
+        raise HTTPException(status_code=503, detail="认证组件未就绪")
+    try:
+        return container.token_service.verify(
+            bearer_token(request.headers.get("authorization"))
+        )
+    except AuthError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+
+
+def _require_ops(request: Request) -> None:
+    """运维端点：认证开启时需要 ops:read scope。"""
+    container = _container(request)
+    if not container.settings.auth_enabled:
+        return
+    principal = _require_principal(request)
+    if not principal.has_scope(OPS_READ_SCOPE):
+        raise HTTPException(status_code=403, detail="需要 ops:read 权限")
+
+
 @router.post("/xiaozhi/chat")
 async def chat(request: Request):
     """对话接口 —— 返回裸文本流（与 Java 版一致，前端零改动）"""
     container = _container(request)
+    principal = _require_principal(request)
     payload: Dict[str, Any] = await request.json()
     memory_id = str(payload.get("memoryId") or payload.get("memory_id") or "default")
     message = payload.get("message") or ""
     user_id = str(payload.get("userId") or payload.get("user_id") or "anonymous")
+
+    if container.settings.auth_enabled:
+        # 身份不再取自请求体：一律以 token 主体为准（P0-01）。
+        user_id = principal.subject_id
+        if not principal.has_scope(CHAT_WRITE_SCOPE):
+            return PlainTextResponse(
+                "无权发起对话。", status_code=403, media_type="text/plain; charset=utf-8"
+            )
+        try:
+            container.session_access.assert_owner(memory_id, principal)
+        except SessionAccessError:
+            # 「不存在」与「不属于你」统一 403，不泄露 session_id 是否真实存在。
+            return PlainTextResponse(
+                "会话不存在或不属于当前用户。",
+                status_code=403,
+                media_type="text/plain; charset=utf-8",
+            )
 
     if not message.strip():
         return PlainTextResponse("请输入您的问题。", media_type="text/plain; charset=utf-8")
@@ -119,6 +175,49 @@ async def chat(request: Request):
     )
 
 
+@router.post("/v1/auth/token")
+@router.post("/api/v1/auth/token")  # 直连后端（不经 Vite 代理）的别名
+async def issue_token(request: Request):
+    """本地过渡：用 bootstrap 凭证换 JWT（正式环境换 OIDC/网关，只换签发方）。
+
+    scopes 由服务端按 subject_id 计算，客户端传什么都不会提权。
+    """
+    container = _container(request)
+    if not container.settings.auth_enabled:
+        return JSONResponse({"detail": "认证未启用"}, status_code=404)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    subject_id = str(body.get("subject_id") or "")
+    try:
+        container.token_service.verify_bootstrap(str(body.get("secret") or ""))
+        token = container.token_service.issue(subject_id)
+    except BootstrapRejected:
+        return JSONResponse({"detail": "凭证不正确"}, status_code=401)
+    except ValueError as exc:
+        return JSONResponse({"detail": str(exc)}, status_code=400)
+    return {
+        "access_token": token,
+        "token_type": "Bearer",
+        "expires_in": container.settings.auth_token_ttl_seconds,
+        "subject_id": subject_id.strip(),
+    }
+
+
+@router.post("/v1/sessions")
+@router.post("/api/v1/sessions")  # 直连后端的别名
+async def create_session(request: Request):
+    """服务端签发不可枚举的 session_id，作为 /xiaozhi/chat 的 memoryId。"""
+    container = _container(request)
+    if not container.settings.auth_enabled:
+        return JSONResponse({"detail": "认证未启用"}, status_code=404)
+    principal = _require_principal(request)
+    if not principal.has_scope(SESSION_CREATE_SCOPE):
+        return JSONResponse({"detail": "需要 session:create 权限"}, status_code=403)
+    return {"session_id": container.session_access.create(principal)}
+
+
 @router.get("/health")
 async def health(request: Request):
     """存活探针"""
@@ -141,6 +240,7 @@ async def ready(request: Request):
 @router.get("/metrics")
 async def metrics(request: Request):
     """运行指标（精简视图 + 完整快照）"""
+    _require_ops(request)
     container = _container(request)
     return {
         "summary": container.metrics.summary(),
@@ -158,6 +258,10 @@ async def metrics(request: Request):
 async def forget_profile(user_key: str, request: Request):
     """"忘记我"——删除该用户全部画像事实（MySQL + 向量）。合规要求端点。"""
     container = _container(request)
+    if container.settings.auth_enabled:
+        principal = _require_principal(request)
+        if not principal.has_scope(PROFILE_FORGET_SCOPE):
+            return JSONResponse({"detail": "需要 profile:forget 权限"}, status_code=403)
     if container.profile_service is None:
         return JSONResponse({"detail": "画像功能未启用"}, status_code=404)
     removed = await container.profile_service.forget(user_key)
@@ -167,6 +271,7 @@ async def forget_profile(user_key: str, request: Request):
 @router.get("/audit")
 async def audit(request: Request, limit: int = 50):
     """最近的审计记录（已脱敏）"""
+    _require_ops(request)
     container = _container(request)
     return {"entries": container.audit.read_recent(limit=limit)}
 
@@ -174,6 +279,7 @@ async def audit(request: Request, limit: int = 50):
 @router.get("/traces")
 async def list_traces(request: Request, limit: int = 50):
     """最近的追踪列表"""
+    _require_ops(request)
     container = _container(request)
     return {"traces": container.trace_store.list_traces(limit=limit)}
 
@@ -181,6 +287,7 @@ async def list_traces(request: Request, limit: int = 50):
 @router.get("/trace/{trace_id}")
 async def get_trace(trace_id: str, request: Request):
     """某次对话的完整追踪树"""
+    _require_ops(request)
     container = _container(request)
     tree = container.trace_store.get_trace_tree(trace_id)
     if tree is None:
@@ -191,12 +298,14 @@ async def get_trace(trace_id: str, request: Request):
 @router.get("/trace")
 async def trace_page(request: Request):
     """追踪可视化页面（纯 HTML + 原生 JS，无前端框架）"""
+    _require_ops(request)
     return HTMLResponse(render_trace_page())
 
 
 @router.get("/tools")
 async def list_tools(request: Request):
     """当前注册的工具（便于排查模型为什么调了某个工具）"""
+    _require_ops(request)
     container = _container(request)
     return {
         "tools": [

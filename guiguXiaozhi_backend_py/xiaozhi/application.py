@@ -37,11 +37,14 @@ from xiaozhi.repositories.appointment_repo import (
     InMemoryAppointmentRepository,
     MySQLAppointmentRepository,
 )
+from xiaozhi.repositories.session_repo import MySQLSessionRepository
 from xiaozhi.retrieval.rag import RagService
 from xiaozhi.retrieval.vector_store import MilvusVectorStore
 from xiaozhi.runtime.engine import AgentEngine
+from xiaozhi.security.auth import TokenService
 from xiaozhi.security.permissions import PermissionDecisionEngine
 from xiaozhi.security.secure_executor import SecureToolExecutor
+from xiaozhi.security.session_access import SessionAccess
 from xiaozhi.service.impl.VectorStoreDoctorService import VectorStoreDoctorService
 from xiaozhi.service.doctor_service import DoctorService
 from xiaozhi.service.slot_service import MockSlotService, SlotService
@@ -82,6 +85,9 @@ class Application:
     shutdown: GracefulShutdown
     # P2 患者画像（灰度：profile_enabled=false 时为 None）
     profile_service: Optional[ProfileService] = None
+    # P1 认证与会话归属（灰度：auth_enabled=false 时为 None）
+    token_service: Optional[TokenService] = None
+    session_access: Optional[SessionAccess] = None
 
     async def aclose(self) -> None:
         """优雅停机：释放连接"""
@@ -157,6 +163,30 @@ async def get_application(settings: Optional[Settings] = None) -> Application:
     # 否则「拒绝启动」会退化成「连了一圈依赖才失败」，且 /health 可能已经 ok。
     validate_production_settings(settings)
     configure_logging(settings.log_level, json_output=settings.json_logs)
+
+    # ---- 认证与会话归属（P1，灰度默认关）----
+    # 开启但配置/存储不就绪时**直接抛错**，不静默降级：画像模块曾因初始化失败
+    # 被「禁用+告警」吞掉而假健康（见《踩坑与优化记录》13.1）。
+    token_service: Optional[TokenService] = None
+    session_access: Optional[SessionAccess] = None
+    if settings.auth_enabled:
+        token_service = TokenService(
+            secret_key=settings.auth_secret_key,
+            ttl_seconds=settings.auth_token_ttl_seconds,
+            issuer=settings.auth_issuer,
+            bootstrap_secret=settings.auth_bootstrap_secret,
+            ops_subjects=settings.auth_ops_subjects,
+        )
+        session_repo = MySQLSessionRepository(
+            settings.mysql_host,
+            settings.mysql_port,
+            settings.mysql_user,
+            settings.mysql_password,
+            settings.mysql_database,
+        )
+        session_repo.ensure_table()
+        session_access = SessionAccess(session_repo)
+        logger.info("认证已启用（issuer=%s，会话归属表已就绪）", settings.auth_issuer)
 
     # ---- 追踪 ----
     trace_store = TraceStore(
@@ -392,4 +422,6 @@ async def get_application(settings: Optional[Settings] = None) -> Application:
         rate_limiter=rate_limiter,
         shutdown=shutdown,
         profile_service=profile_service,
+        token_service=token_service,
+        session_access=session_access,
     )
