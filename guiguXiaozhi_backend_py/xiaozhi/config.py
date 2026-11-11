@@ -88,6 +88,10 @@ class Settings(BaseSettings):
     #   allow —— 放行（用户确认已由系统提示词的对话流程承担，权限层只做越权防护）
     #   deny  —— 拒绝（更严格，适合生产环境按需开启）
     permission_no_ui: str = "allow"
+    # Phase 2 审批闭环（灰度默认关）：开启后写工具必须先经用户明确确认，
+    # 凭一次性 token 才能执行；关闭时 SecureToolExecutor 行为与一期完全一致。
+    approval_enabled: bool = False
+    approval_ttl_seconds: float = 120.0
 
     # ---------- 可靠性 ----------
     retry_backoff_base: float = 0.1

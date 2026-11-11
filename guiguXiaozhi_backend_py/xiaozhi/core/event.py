@@ -21,6 +21,7 @@ class EventType(str, Enum):
     RETRIEVAL = "retrieval"
     TOOL_EXECUTE = "tool_execute"
     TOOL_RESULT = "tool_result"
+    APPROVAL_REQUIRED = "approval_required"
     TEXT_RESPONSE = "text_response"
     TURN_END = "turn_end"
     AGENT_END = "agent_end"
@@ -80,6 +81,17 @@ class ToolExecuteEvent(Event):
 @dataclass
 class ToolResultEvent(Event):
     event_type: EventType = EventType.TOOL_RESULT
+
+
+@dataclass
+class ApprovalRequiredEvent(Event):
+    """Phase 2：写工具被审批门控拦下，metadata 携带待确认请求的展示信息。
+
+    裸文本流模式下由路由层转成结构化 sentinel 下发给前端确认 UI；
+    events 模式下按普通 SSE 帧透传，不改变既有协议。
+    """
+
+    event_type: EventType = EventType.APPROVAL_REQUIRED
 
 
 @dataclass

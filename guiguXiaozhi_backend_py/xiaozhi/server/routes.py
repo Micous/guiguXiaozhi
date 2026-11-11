@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any, Dict
 
@@ -20,6 +21,11 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Str
 
 from xiaozhi.core.event import EventType
 from xiaozhi.reliability.tracing import new_trace_id, set_trace_id
+from xiaozhi.security.approval_service import (
+    ApprovalContext,
+    reset_approval_context,
+    set_approval_context,
+)
 from xiaozhi.security.auth import AuthError, BootstrapRejected, bearer_token
 from xiaozhi.security.guardrails import check_input
 from xiaozhi.security.principal import (
@@ -35,6 +41,11 @@ from xiaozhi.server.trace_view import render_trace_page
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+# Phase 2：裸文本流里夹带的结构化审批标记。审批关闭时永不出现，
+# 旧前端/Java 版协议零感知；新前端在流结束后从累积文本里剥离并弹确认框。
+APPROVAL_SENTINEL_PREFIX = "[[XIAOZHI_APPROVAL]]"
+APPROVAL_SENTINEL_SUFFIX = "[[/XIAOZHI_APPROVAL]]"
 
 
 def _container(request: Request):
@@ -82,6 +93,10 @@ async def chat(request: Request):
     memory_id = str(payload.get("memoryId") or payload.get("memory_id") or "default")
     message = payload.get("message") or ""
     user_id = str(payload.get("userId") or payload.get("user_id") or "anonymous")
+    # 一次性审批 token 只从请求体读入，经 contextvar 下发；模型输出永远碰不到它
+    approval_token = str(
+        payload.get("approvalToken") or payload.get("approval_token") or ""
+    )
 
     if container.settings.auth_enabled:
         # 身份不再取自请求体：一律以 token 主体为准（P0-01）。
@@ -137,28 +152,49 @@ async def chat(request: Request):
     events_mode = (request.query_params.get("format") or "text").lower() == "events"
 
     async def generate():
-        async with container.shutdown.inflight_request():
-            try:
-                async for event in container.engine.run(
-                    memory_id, message, user_id=user_id
-                ):
+        # 请求级审批上下文：engine.run() 签名不变，靠 contextvar 把
+        # principal / session / 一次性 token 送到 SecureToolExecutor。
+        set_approval_context(
+            ApprovalContext(
+                principal=principal,
+                approval_token=approval_token,
+                session_id=memory_id,
+                auth_enabled=container.settings.auth_enabled,
+            )
+        )
+        try:
+            async with container.shutdown.inflight_request():
+                try:
+                    async for event in container.engine.run(
+                        memory_id, message, user_id=user_id
+                    ):
+                        if events_mode:
+                            yield event.to_sse()
+                            continue
+                        if event.event_type == EventType.TEXT_RESPONSE:
+                            delta = event.metadata.get("delta") or event.metadata.get("text") or ""
+                            if delta:
+                                yield delta
+                        elif event.event_type == EventType.APPROVAL_REQUIRED:
+                            # 裸文本流里的结构化标记：前端在流结束后剥离并弹确认框
+                            yield (
+                                "\n\n"
+                                + APPROVAL_SENTINEL_PREFIX
+                                + json.dumps(event.metadata, ensure_ascii=False, default=str)
+                                + APPROVAL_SENTINEL_SUFFIX
+                            )
+                        elif event.event_type == EventType.ERROR:
+                            yield f"\n\n（出错了：{event.metadata.get('error')}）"
+                except Exception as exc:  # 兜底：任何异常都要给用户一个可读的回复
+                    logger.exception("对话异常")
                     if events_mode:
-                        yield event.to_sse()
-                        continue
-                    if event.event_type == EventType.TEXT_RESPONSE:
-                        delta = event.metadata.get("delta") or event.metadata.get("text") or ""
-                        if delta:
-                            yield delta
-                    elif event.event_type == EventType.ERROR:
-                        yield f"\n\n（出错了：{event.metadata.get('error')}）"
-            except Exception as exc:  # 兜底：任何异常都要给用户一个可读的回复
-                logger.exception("对话异常")
-                if events_mode:
-                    from xiaozhi.core.event import ErrorEvent
+                        from xiaozhi.core.event import ErrorEvent
 
-                    yield ErrorEvent(trace_id=trace_id, metadata={"error": f"{type(exc).__name__}"}).to_sse()
-                else:
-                    yield f"\n\n（服务暂时异常：{type(exc).__name__}）"
+                        yield ErrorEvent(trace_id=trace_id, metadata={"error": f"{type(exc).__name__}"}).to_sse()
+                    else:
+                        yield f"\n\n（服务暂时异常：{type(exc).__name__}）"
+        finally:
+            reset_approval_context()
 
     return StreamingResponse(
         generate(),

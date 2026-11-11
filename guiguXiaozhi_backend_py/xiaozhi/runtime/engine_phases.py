@@ -17,6 +17,7 @@ if TYPE_CHECKING:  # 仅供类型标注，避免与 engine.py 循环导入
 
 from xiaozhi.core.event import (
     AgentEndEvent,
+    ApprovalRequiredEvent,
     DegradedEvent,
     Event,
     RetrievalEvent,
@@ -425,6 +426,26 @@ class EnginePhases:
                     "execution_time_ms", round(tool_result.execution_time * 1000, 2)
                 )
 
+            # ---- Phase 2：审批门控拦下写工具，立刻短路本轮 ----
+            # 不能把「需要确认」的工具结果继续喂给模型：7b 模型会编造
+            # 「已为您确认并预约成功」。这里直接给用户可读提示 + 结构化审批事件。
+            approval_payload = (tool_result.metadata or {}).get("approval") or {}
+            if approval_payload:
+                clean = approval_payload.get("message") or "该操作需要您确认后才会执行。"
+                state.mark_approval_required(approval_payload)
+                state.set_final_reply(clean)
+                result.text = clean
+                state.add_tool_result(
+                    Message.tool_result(clean, call.id, call.name, is_error=False)
+                )
+                result.tool_calls.append(call)
+                yield TextResponseEvent(trace_id=trace_id, metadata={"delta": clean})
+                yield ApprovalRequiredEvent(
+                    trace_id=trace_id,
+                    metadata=dict(approval_payload),
+                )
+                break
+
             yield ToolResultEvent(
                 trace_id=trace_id,
                 metadata={
@@ -646,6 +667,15 @@ class EnginePhases:
                 result=result,
             ):
                 yield _ev
+
+            # 审批短路：本请求到此为止，不再进入下一轮模型调用
+            if state.approval_required:
+                turn += 1
+                yield TurnEndEvent(
+                    trace_id=trace_id,
+                    metadata={"turn_number": turn, "approval_required": True},
+                )
+                break
 
             turn += 1
             yield TurnEndEvent(

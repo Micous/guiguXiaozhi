@@ -37,10 +37,12 @@ from xiaozhi.repositories.appointment_repo import (
     InMemoryAppointmentRepository,
     MySQLAppointmentRepository,
 )
+from xiaozhi.repositories.approval_repo import MySQLApprovalRepository
 from xiaozhi.repositories.session_repo import MySQLSessionRepository
 from xiaozhi.retrieval.rag import RagService
 from xiaozhi.retrieval.vector_store import MilvusVectorStore
 from xiaozhi.runtime.engine import AgentEngine
+from xiaozhi.security.approval_service import ApprovalService
 from xiaozhi.security.auth import TokenService
 from xiaozhi.security.permissions import PermissionDecisionEngine
 from xiaozhi.security.secure_executor import SecureToolExecutor
@@ -88,6 +90,8 @@ class Application:
     # P1 认证与会话归属（灰度：auth_enabled=false 时为 None）
     token_service: Optional[TokenService] = None
     session_access: Optional[SessionAccess] = None
+    # P2 审批闭环（灰度：approval_enabled=false 时为 None）
+    approval_service: Optional[ApprovalService] = None
 
     async def aclose(self) -> None:
         """优雅停机：释放连接"""
@@ -325,10 +329,38 @@ async def get_application(settings: Optional[Settings] = None) -> Application:
     # 新增只读工具不再需要手动改 permissions.yaml
     for definition in tool_registry.list_definitions():
         permission_engine.register_tool_default(definition.name, definition.risk_level)
+
+    # ---- 审批闭环（Phase 2，灰度默认关）----
+    # 开启时先做**注册期契约体检**，再确保 MySQL 表就绪；任何失败直接抛错，
+    # 绝不「禁用 + 告警」静默降级成无审批放行（画像 alias 坑的教训）。
+    approval_service: Optional[ApprovalService] = None
+    if settings.approval_enabled:
+        problems = tool_registry.validate_contracts()
+        if problems:
+            raise ProductionConfigError(
+                "审批已开启但工具契约不合规，拒绝启动：\n  - " + "\n  - ".join(problems)
+            )
+        approval_repo = MySQLApprovalRepository(
+            settings.mysql_host,
+            settings.mysql_port,
+            settings.mysql_user,
+            settings.mysql_password,
+            settings.mysql_database,
+        )
+        approval_repo.ensure_table()
+        approval_service = ApprovalService(
+            approval_repo, ttl_seconds=settings.approval_ttl_seconds
+        )
+        logger.info(
+            "审批闭环已启用：approval_requests 就绪，TTL=%ss，写工具需一次性确认",
+            settings.approval_ttl_seconds,
+        )
+
     secure_executor = SecureToolExecutor(
         permission_engine,
         no_ui_policy=settings.permission_no_ui,
         audit_logger=audit,
+        approval_service=approval_service,
     )
 
     # ---- 患者画像（P2，灰度开关默认关）----
@@ -425,4 +457,5 @@ async def get_application(settings: Optional[Settings] = None) -> Application:
         profile_service=profile_service,
         token_service=token_service,
         session_access=session_access,
+        approval_service=approval_service,
     )

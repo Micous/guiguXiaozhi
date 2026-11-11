@@ -14,7 +14,13 @@ from typing import Any, Awaitable, Callable, Dict, Optional
 
 from xiaozhi.core.tool import Tool, ToolResult
 from xiaozhi.ops.audit import AuditLogger
+from xiaozhi.security.approval_service import (
+    ApprovalRejected,
+    ApprovalService,
+    get_approval_context,
+)
 from xiaozhi.security.injection import detect_injection
+from xiaozhi.security.principal import CHAT_WRITE_SCOPE
 from xiaozhi.security.permissions import (
     Decision,
     PermissionDecisionEngine,
@@ -47,6 +53,7 @@ class SecureToolExecutor:
         no_ui_policy: str = "allow",
         approval_callback: Optional[Callable[[str, ToolCall], Awaitable[bool]]] = None,
         audit_logger: Optional[AuditLogger] = None,
+        approval_service: Optional[ApprovalService] = None,
     ) -> None:
         # no_ui_policy 是安全兜底开关，拼错字符串等于静默改策略 —— 启动即报错
         if no_ui_policy not in ("allow", "deny"):
@@ -57,14 +64,34 @@ class SecureToolExecutor:
         self.no_ui_policy = no_ui_policy
         self.approval_callback = approval_callback
         self.audit_logger = audit_logger
+        # Phase 2 灰度：未装配审批服务时，下面整段门控完全不进入执行路径
+        self.approval_service = approval_service
 
     def _audit(self, event_type: str, **fields: Any) -> None:
         if self.audit_logger is not None:
             self.audit_logger.record(event_type, **fields)
 
     async def execute(self, tool_call: ToolCall, tool: Tool) -> ToolResult:
-        """执行一次工具调用（四层安全流）"""
+        """执行一次工具调用（四层安全流 + Phase 2 审批门控）"""
         scope = approval_scope_for_args(tool_call.args)
+        definition = tool.definition()
+
+        # ---- L0 审批门控（灰度：approval_service=None 时整段不进入执行路径）----
+        # 写工具必须先有「用户明确确认」签发的、绑定本次参数的一次性 token。
+        # 模型自述「已同意」、请求体里塞 approved=true、YAML 里的 OVERRIDE
+        # 都不能绕过这里 —— 决策只认 ApprovalService 的持久化状态。
+        approval_granted = False
+        if self.approval_service is not None and definition.is_write:
+            # 审批绑定的是「实际执行的参数」，所以归一化必须前置：
+            # 否则模型传 camelCase 别名时会出现「确认 A、执行 B」。
+            canonical_args = normalize_arguments_by_schema(
+                dict(tool_call.args or {}), definition
+            )
+            gate = self._approval_gate(tool_call, canonical_args)
+            if gate is not None:
+                return gate
+            tool_call.args = canonical_args
+            approval_granted = True
 
         # ---- L1 权限决策 ----
         decision = self.permission_engine.decide(
@@ -84,7 +111,10 @@ class SecureToolExecutor:
                 error_type="PermissionDenied",
             )
         if decision == Decision.ASK_USER:
-            if self.approval_callback is None:
+            if approval_granted:
+                # 已通过持久化审批闭环核验，不再走「无 UI 放行」这条兜底路径
+                logger.info("审批闭环已核验，跳过 ASK：tool=%s", tool_call.tool_name)
+            elif self.approval_callback is None:
                 # 无交互通道：按配置的兜底策略处理
                 if self.no_ui_policy == "allow":
                     logger.info(
@@ -110,7 +140,6 @@ class SecureToolExecutor:
         # 先按 schema 归一化（参数名/camel/中文描述别名/位置兜底），再校验
         # required/type/enum，最后做通用体检。工具内部的旧版归一化保持
         # 幂等兼容 —— 双层归一化结果一致。
-        definition = tool.definition()
         tool_call.args = normalize_arguments_by_schema(tool_call.args, definition)
         invalid = validate_arguments(tool_call.args, definition)
         if invalid:
@@ -156,6 +185,89 @@ class SecureToolExecutor:
             result_preview=result.content[:200],
         )
         return result
+
+    def _approval_gate(
+        self, tool_call: ToolCall, canonical_args: Dict[str, Any]
+    ) -> Optional[ToolResult]:
+        """L0：写工具执行前的授权闭环核验（返回 None 才允许继续）。
+
+        决策只认 ``ApprovalService`` 的持久化状态 + contextvar 里的请求级上下文：
+          * 模型自述「用户已经同意」、请求体塞 ``approved=true``、
+            YAML 里的 OVERRIDE 策略、进程内的 ``_approvals`` 缓存，
+            一律不能替代这里（审计 P0-02 验收 1/7）。
+          * 无 token → 生成 PENDING 请求并拒绝执行，由前端确认 UI 展示；
+          * 有 token → 重新计算参数哈希后原子消费，任何不符（篡改/重放/
+            过期/撤销/跨用户）都抛 ``ApprovalRejected``。
+        """
+        ctx = get_approval_context()
+        principal = ctx.principal
+        session_id = ctx.session_id or tool_call.user_id or "default"
+
+        # 验收 6：缺 required scope 直接拒绝，且发生在任何执行尝试之前
+        if ctx.auth_enabled and not principal.has_scope(CHAT_WRITE_SCOPE):
+            return self._approval_denied(
+                "missing_scope", "当前账号缺少 chat:write 权限，写操作未执行。"
+            )
+
+        if ctx.approval_token:
+            try:
+                self.approval_service.consume(
+                    ctx.approval_token,
+                    principal,
+                    session_id=session_id,
+                    tool_name=tool_call.tool_name,
+                    canonical_args=canonical_args,
+                )
+            except ApprovalRejected as exc:
+                logger.warning(
+                    "审批消费失败：tool=%s reason=%s trace=%s",
+                    tool_call.tool_name,
+                    exc.reason_code,
+                    tool_call.trace_id,
+                )
+                return self._approval_denied(
+                    exc.reason_code,
+                    f"审批校验未通过（{exc.reason_code}），操作未执行。",
+                )
+            logger.info("审批一次性消费成功：tool=%s", tool_call.tool_name)
+            return None
+
+        record = self.approval_service.create(
+            principal,
+            session_id,
+            tool_call.tool_name,
+            canonical_args,
+            required_scopes=[CHAT_WRITE_SCOPE],
+        )
+        detail = self.approval_service.detail(record.approval_id, principal)
+        self._audit(
+            "approval_required",
+            tool_name=tool_call.tool_name,
+            user_id=tool_call.user_id,
+            trace_id=tool_call.trace_id,
+            approval_id=record.approval_id,
+        )
+        return ToolResult.fail(
+            f"工具【{tool_call.tool_name}】需要您核对信息并明确确认，尚未执行。",
+            error_type="ApprovalRequired",
+            approval={
+                "decision": "REQUIRE_APPROVAL",
+                "reason_code": "pending_confirmation",
+                "detail": detail,
+                "message": (
+                    f"该操作（{tool_call.tool_name}）需要您核对信息并明确确认后才会执行，"
+                    "请在确认窗口核对参数；未确认前不会挂号或取消。"
+                ),
+            },
+        )
+
+    @staticmethod
+    def _approval_denied(reason_code: str, message: str) -> ToolResult:
+        return ToolResult.fail(
+            message,
+            error_type="ApprovalRejected",
+            approval={"decision": "DENY", "reason_code": reason_code, "message": message},
+        )
 
     @staticmethod
     def _validate_generic(tool_call: ToolCall) -> Optional[str]:

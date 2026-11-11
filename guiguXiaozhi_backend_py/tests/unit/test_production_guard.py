@@ -41,6 +41,7 @@ def his_ready(monkeypatch):
         "auth_enabled": True,
         "auth_secret_key": "a-32-character-minimum-secret-key-1234567890",
         "auth_bootstrap_secret": "bootstrap-secret",
+        "approval_enabled": True,
     }
 
 
@@ -86,12 +87,18 @@ def test_production_env_aliases_detected(env):
 
 
 def test_production_reports_all_problems_at_once():
-    """默认配置下 4 项不合规（画像默认关，故不含密钥项），一次报全。"""
+    """默认配置下 5 项不合规（画像默认关，故不含密钥项），一次报全。"""
     with pytest.raises(ProductionConfigError) as exc:
         validate_production_settings(prod())
     msg = str(exc.value)
-    assert "共 4 项不合规" in msg
-    for token in ("permission_no_ui", "mysql_password", "slot_service_impl", "auth_enabled"):
+    assert "共 5 项不合规" in msg
+    for token in (
+        "permission_no_ui",
+        "mysql_password",
+        "slot_service_impl",
+        "auth_enabled",
+        "approval_enabled",
+    ):
         assert token in msg
     assert "APP_ENV=development" in msg  # 错误信息要给出可执行的修复方向
 
@@ -242,3 +249,20 @@ def test_production_rejects_missing_bootstrap_secret(his_ready):
     with pytest.raises(ProductionConfigError) as exc:
         validate_production_settings(prod(**{**his_ready, "auth_bootstrap_secret": ""}))
     assert "auth_bootstrap_secret" in str(exc.value)
+
+
+# ---------------------------------------------------------------- 审批门禁（P2-C）
+
+
+def test_development_approval_defaults_off():
+    """红线：审批默认关，SecureToolExecutor 行为与一期逐字一致。"""
+    s = Settings(_env_file=None)
+    assert s.approval_enabled is False
+    assert s.approval_ttl_seconds == 120.0
+
+
+def test_production_rejects_approval_disabled(his_ready):
+    with pytest.raises(ProductionConfigError) as exc:
+        validate_production_settings(prod(**{**his_ready, "approval_enabled": False}))
+    assert "approval_enabled" in str(exc.value)
+    assert "一次性 token" in str(exc.value)

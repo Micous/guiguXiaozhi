@@ -105,6 +105,15 @@ def validate_production_settings(settings: Settings) -> None:
                 "auth_bootstrap_secret 为空 → 本地签发端点的换取凭证必须配置"
             )
 
+    # 6) 审批闭环（审计 P0-02）：permission_no_ui=deny 只做到「失败关闭」，
+    #    还需真正开启带持久化状态机的确认通道，否则写工具在生产永远不可用
+    #    （或被人悄悄改回 allow 变成无确认挂号）。
+    if not settings.approval_enabled:
+        problems.append(
+            "approval_enabled=false → 生产必须开启审批闭环（PENDING→APPROVED→CONSUMED）："
+            "缺少用户明确确认与一次性 token 绑定，不得执行预约/取消"
+        )
+
     if problems:
         raise ProductionConfigError(
             f"APP_ENV=production 启动被拒绝，共 {len(problems)} 项不合规：\n  - "

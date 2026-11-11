@@ -59,6 +59,12 @@ class TurnState:
     narrative_text: str = ""
     final_reply_text: str = ""
 
+    # ---- Phase 2 审批短路 ----
+    # 写工具被审批门控拦下时置位：主循环立刻收尾，绝不再把「审批未通过」
+    # 的工具结果喂给模型（否则 qwen2.5:7b 会编造「已确认/已预约」）。
+    approval_required: bool = False
+    approval_detail: Dict[str, Any] = field(default_factory=dict)
+
     # ---- 请求级上下文（拦截器只读）----
     # 历史里是否真的执行过预约（真话依据：说"已经预约好了"不算幻觉）
     prior_booking: bool = False
@@ -166,6 +172,11 @@ class TurnState:
     def set_narration(self, text: str) -> None:
         """带 tool_calls 轮的文本（叙述段）。"""
         self.narrative_text = text or ""
+
+    def mark_approval_required(self, detail: Dict[str, Any]) -> None:
+        """登记「等用户确认」：主循环据此短路，落库仍走三段式结构。"""
+        self.approval_required = True
+        self.approval_detail = dict(detail or {})
 
     def set_final_reply(self, text: str) -> None:
         """无 tool_calls 轮的文本（真正给用户的最终回复）。
