@@ -256,6 +256,30 @@ class ApprovalService:
         record.token_hash = ""  # 撤销后即便持有明文 token 也无法消费
         self.repository.save(record)
 
+    def inspect_token(
+        self, token: str, principal: Principal, *, session_id: str
+    ) -> ApprovalRecord:
+        """HTTP 层预检：判断 token 是否仍可用，**绝不消费**。
+
+        消费仍由 ``SecureToolExecutor`` 在真正执行前原子完成（绑定规范化参数）。
+        预检的作用是：重放/过期/越权的 token 在进入模型前就被 409 拦下 ——
+        否则模型会因历史里已有成功记录而复述「已预约成功」，用户误以为
+        第二次也真的执行了（2026-11-11 真机验证发现的误导）。
+        """
+        if not token:
+            raise ApprovalRejected("missing_token", "缺少审批 token")
+        record = self.repository.get_by_token_hash(_token_hash(token))
+        if record is None:
+            raise ApprovalRejected("invalid_or_replayed", "审批不存在或已被撤销")
+        if record.subject_id != principal.subject_id or record.session_id != session_id:
+            raise ApprovalRejected("forbidden", "审批不属于当前用户或会话")
+        record = self._expire_if_needed(record)
+        if record.status != ApprovalStatus.APPROVED:
+            raise ApprovalRejected(
+                "invalid_or_replayed", f"审批不可再用（{record.status.value}）"
+            )
+        return record
+
     def consume(
         self,
         token: str,

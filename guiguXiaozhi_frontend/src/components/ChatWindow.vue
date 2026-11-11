@@ -315,7 +315,9 @@ const sendRequest = (message, approvalToken = '', skipUserBubble = false) => {
           ? '登录已失效，请刷新页面重新登录。'
           : status === 403
             ? '无权访问该会话，请点击「开启新会话」重试。'
-            : '网络异常，请尝试刷新页面。'
+            : status === 409
+              ? '本次确认已失效（重复使用或已过期），操作未执行，请重新发起。'
+              : '网络异常，请尝试刷新页面。'
         lastMsg.isTyping = false
         isSending.value = false
       })

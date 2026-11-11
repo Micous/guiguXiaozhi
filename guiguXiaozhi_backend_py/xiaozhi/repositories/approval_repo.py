@@ -83,6 +83,10 @@ class ApprovalRepository(ABC):
         """按业务幂等键找仍可用的请求（PENDING/APPROVED 且未过期），避免重复弹框"""
 
     @abstractmethod
+    def get_by_token_hash(self, token_hash: str) -> Optional[ApprovalRecord]:
+        """只按 token 哈希读取（**不消费**），供 HTTP 层预检重放/过期/越权"""
+
+    @abstractmethod
     def save(self, record: ApprovalRecord) -> None:
         """更新状态/签发信息"""
 
@@ -150,6 +154,15 @@ class InMemoryApprovalRepository(ApprovalRepository):
                 if record.idempotency_key != idempotency_key or record.is_terminal:
                     continue
                 return record
+            return None
+
+    def get_by_token_hash(self, token_hash: str) -> Optional[ApprovalRecord]:
+        if not token_hash:
+            return None
+        with self._lock:
+            for record in self._rows.values():
+                if record.token_hash == token_hash:
+                    return record
             return None
 
     def save(self, record: ApprovalRecord) -> None:
@@ -321,6 +334,11 @@ class MySQLApprovalRepository(ApprovalRepository):
 
     def get(self, approval_id: str) -> Optional[ApprovalRecord]:
         return self._fetch_one("approval_id=%s", (approval_id,))
+
+    def get_by_token_hash(self, token_hash: str) -> Optional[ApprovalRecord]:
+        if not token_hash:
+            return None
+        return self._fetch_one("token_hash=%s", (token_hash,))
 
     def find_active_by_key(self, idempotency_key: str) -> Optional[ApprovalRecord]:
         conn = self._connect()

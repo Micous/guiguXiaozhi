@@ -119,6 +119,25 @@ async def chat(request: Request):
     if not message.strip():
         return PlainTextResponse("请输入您的问题。", media_type="text/plain; charset=utf-8")
 
+    # Phase 2：携带一次性审批 token 的请求先做**非消费式**预检。
+    # 失效 token 若放行进模型，历史里的成功记录会让模型复述「已预约成功」，
+    # 误导用户以为重放也执行了；真正消费仍由执行器在写工具执行前原子完成。
+    if (
+        container.settings.approval_enabled
+        and approval_token
+        and container.approval_service is not None
+    ):
+        try:
+            container.approval_service.inspect_token(
+                approval_token, principal, session_id=memory_id
+            )
+        except ApprovalError as exc:
+            return PlainTextResponse(
+                f"本次确认已失效（{exc.reason_code}），操作未执行，请重新发起。",
+                status_code=409,
+                media_type="text/plain; charset=utf-8",
+            )
+
     # 输入护栏：超长截断；注入仅留痕（是否拒绝由工具层 L3 按上下文决定）
     guard = check_input(message)
     message = guard.text

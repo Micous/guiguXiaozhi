@@ -215,35 +215,38 @@ def test_events_mode_emits_approval_required_frame(api):
 
 def test_chat_passes_approval_token_through_contextvar(api):
     """审批 token 只从请求体读入，经 contextvar 送到执行层，模型输出碰不到。"""
-    client, container, tokens, _ = api
+    client, container, tokens, service = api
     sid = _new_session(client, tokens.issue("alice"))
+    token = service.approve(_pending(service, session_id=sid), ALICE)
     resp = client.post(
         "/xiaozhi/chat",
         json={
             "memoryId": sid,
             "message": "帮我预约挂号",
-            "approvalToken": "one-shot-token",
+            "approvalToken": token,
         },
         headers=_headers(tokens.issue("alice")),
     )
     assert resp.status_code == 200
-    subject, token, session, auth_enabled = container.engine.contexts[-1]
+    subject, seen_token, session, auth_enabled = container.engine.contexts[-1]
     assert subject == "alice"
-    assert token == "one-shot-token"
+    assert seen_token == token
     assert session == sid
     assert auth_enabled is True
 
 
 def test_chat_context_is_reset_between_requests(api):
-    client, container, tokens, _ = api
+    client, container, tokens, service = api
     sid = _new_session(client, tokens.issue("alice"))
     h = _headers(tokens.issue("alice"))
+    token = service.approve(_pending(service, session_id=sid), ALICE)
     client.post(
         "/xiaozhi/chat",
-        json={"memoryId": sid, "message": "a", "approvalToken": "tok"},
+        json={"memoryId": sid, "message": "a", "approvalToken": token},
         headers=h,
     )
     client.post("/xiaozhi/chat", json={"memoryId": sid, "message": "b"}, headers=h)
+    assert container.engine.contexts[-2][1] == token
     assert container.engine.contexts[-1][1] == ""
 
 
@@ -302,6 +305,79 @@ def test_revoke_prevents_later_approval(api):
     alice = _headers(tokens.issue("alice"))
     assert client.post(f"/v1/approvals/{approval_id}/revoke", headers=alice).status_code == 200
     assert client.post(f"/v1/approvals/{approval_id}/approve", headers=alice).status_code == 409
+
+
+# ---------------------------------------------------------------- HTTP 层 token 预检
+
+
+def test_chat_rejects_unknown_approval_token_before_model_runs(api):
+    client, container, tokens, _ = api
+    sid = _new_session(client, tokens.issue("alice"))
+    jwt = tokens.issue("alice")
+    resp = client.post(
+        "/xiaozhi/chat",
+        json={"memoryId": sid, "message": "帮我预约挂号", "approvalToken": jwt},
+        headers=_headers(jwt),
+    )
+    # 这里故意把 JWT 当审批 token 用；预检应在进模型前 409
+    assert resp.status_code == 409
+    assert "invalid_or_replayed" in resp.text
+    assert container.engine.contexts == []
+
+
+def test_chat_rejects_replayed_approval_token(api):
+    """真机验证发现：重放 token 若不拦，模型会照抄历史里的「预约成功」。"""
+    client, container, tokens, service = api
+    sid = _new_session(client, tokens.issue("alice"))
+    token = service.approve(_pending(service, session_id=sid), ALICE)
+    h = _headers(tokens.issue("alice"))  # 固定 headers，避免混淆 JWT 与审批 token
+
+    first = client.post(
+        "/xiaozhi/chat",
+        json={"memoryId": sid, "message": "帮我预约挂号", "approvalToken": token},
+        headers=h,
+    )
+    assert first.status_code == 200
+    # 模拟执行器已经把这条审批消费掉
+    service.consume(
+        token, ALICE, session_id=sid, tool_name="预约挂号", canonical_args=dict(ARGS)
+    )
+    second = client.post(
+        "/xiaozhi/chat",
+        json={"memoryId": sid, "message": "帮我预约挂号", "approvalToken": token},
+        headers=h,
+    )
+    assert second.status_code == 409
+    assert "失效" in second.text
+    assert len(container.engine.contexts) == 1  # 第二次根本没进模型
+
+
+def test_chat_rejects_cross_user_approval_token(api):
+    client, _, tokens, service = api
+    sid = _new_session(client, tokens.issue("alice"))
+    token = service.approve(_pending(service, session_id=sid), ALICE)
+    bob_token = tokens.issue("bob")
+    bob_session = client.post("/v1/sessions", headers=_headers(bob_token)).json()["session_id"]
+    resp = client.post(
+        "/xiaozhi/chat",
+        json={"memoryId": bob_session, "message": "帮我预约挂号", "approvalToken": token},
+        headers=_headers(bob_token),
+    )
+    assert resp.status_code == 409
+    assert "forbidden" in resp.text
+
+
+def test_chat_without_token_is_unaffected(api):
+    """普通对话（无 approvalToken）不经过预检，行为零变更。"""
+    client, container, tokens, _ = api
+    sid = _new_session(client, tokens.issue("alice"))
+    resp = client.post(
+        "/xiaozhi/chat",
+        json={"memoryId": sid, "message": "你好"},
+        headers=_headers(tokens.issue("alice")),
+    )
+    assert resp.status_code == 200
+    assert "请确认本次操作" in resp.text
 
 
 def test_api_alias_and_args_are_masked(api):
