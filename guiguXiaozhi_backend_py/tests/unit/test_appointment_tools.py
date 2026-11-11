@@ -68,15 +68,47 @@ class FakeSlotService:
 
 
 class FakeRepository:
-    def __init__(self):
+    """Phase 3a：补齐仓储新契约（原子 create_if_absent + 状态迁移 cancel）。
+
+    ``existing`` 可预置一条已存在的预约，用来验证"重复预约"分支。
+    """
+
+    def __init__(self, existing=None):
         self.saved = []
+        self.existing = existing
+        self.cancelled = []
 
     def find_duplicate(self, appointment):
-        return None
+        return self.existing
 
     def save(self, appointment):
         self.saved.append(appointment)
         return appointment
+
+    def create_if_absent(self, appointment):
+        """原子"查重 + 写入"（与真实仓储契约一致）"""
+        if self.existing is not None:
+            return self.existing, False
+        self.saved.append(appointment)
+        return appointment, True
+
+    def cancel(self, appointment_id):
+        from xiaozhi.repositories.appointment_repo import AppointmentStatus
+
+        for row in self.saved:
+            if row.id == appointment_id:
+                row.status = AppointmentStatus.CANCELLED
+                row.version += 1
+                self.cancelled.append(row)
+                return row
+        if self.existing is not None and self.existing.id == appointment_id:
+            self.existing.status = AppointmentStatus.CANCELLED
+            self.existing.version += 1
+            self.cancelled.append(self.existing)
+            return self.existing
+        from xiaozhi.repositories.errors import NotFound
+
+        raise NotFound(f"预约记录不存在（id={appointment_id}）")
 
     def delete(self, appointment_id):
         return True
@@ -85,8 +117,8 @@ class FakeRepository:
         return list(self.saved)
 
 
-def make_tool(available=True, doctors=("王笠",)):
-    repo = FakeRepository()
+def make_tool(available=True, doctors=("王笠",), existing=None):
+    repo = FakeRepository(existing=existing)
     slot = FakeSlotService(available=available, doctors=doctors)
     tool = BookAppointmentTool(repo, slot, FakeDoctorService())
     return tool, repo, slot

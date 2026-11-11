@@ -733,3 +733,72 @@ async def test_corrective_retry_does_not_merge_rounds_into_history():
     closing = [m for m in saved if m.role == Role.ASSISTANT and not m.tool_calls]
     assert closing, "最终回复没有落库"
     assert closing[-1].content == final, "落库的最终回复应只含最后一轮文本"
+
+
+# ---- Phase 3a 真机回归（2026-11-11）：审批兜底不得误伤"执行后转述轮" ----
+
+async def test_approval_forced_retry_skipped_when_tools_already_executed():
+    """带审批 token + 工具已执行 → 模型转述轮不再被强制重试。
+
+    2026-11-11 8082 真机实测：执行轮正常时序是"消费 token → 调工具
+    （返回 ALREADY_EXISTS）→ 模型转述结果"。旧判据只看「本轮没有
+    tool_calls」，把转述轮误判成"token 白拿"→ 强制重试一轮 →
+    同一句在界面上重复输出两遍。
+    """
+    from xiaozhi.security.approval_service import (
+        ApprovalContext,
+        reset_approval_context,
+        set_approval_context,
+    )
+
+    set_approval_context(ApprovalContext(approval_token="t0k", principal=None))
+    try:
+        final = "您在呼吸内科 2026-11-12 上午已有预约，请勿重复预约。"
+        model = FakeChatModel(
+            [
+                {
+                    "chunks": [],
+                    "turn": ChatTurn(
+                        text="",
+                        tool_calls=[ToolCall(id="e1", name="预约挂号", arguments={})],
+                    ),
+                },
+                {"chunks": [final], "turn": ChatTurn(text=final)},
+            ]
+        )
+        engine, metrics = make_engine(model)
+        text, _events = await collect(engine, "帮我预约呼吸内科")
+
+        assert model.calls == 2, (
+            f"执行轮+转述轮共 2 次模型调用，实际 {model.calls} —— "
+            "转述轮被误判触发了强制重试"
+        )
+        assert text.count("已有预约") == 1, "转述文本被重复下发"
+        assert metrics.snapshot()["counters"]["llm_calls_total"] == 2
+    finally:
+        reset_approval_context()
+
+
+async def test_approval_forced_retry_still_fires_on_zero_tool_calls():
+    """带 token 但全程零工具调用 → 强制重试兜底仍然生效（第十轮事故行为保持）。"""
+    from xiaozhi.security.approval_service import (
+        ApprovalContext,
+        reset_approval_context,
+        set_approval_context,
+    )
+
+    set_approval_context(ApprovalContext(approval_token="t0k", principal=None))
+    try:
+        model = FakeChatModel(
+            [
+                {"chunks": ["请在确认窗口核对"], "turn": ChatTurn(text="请在确认窗口核对")},
+                {"chunks": ["好的，马上办理"], "turn": ChatTurn(text="好的，马上办理")},
+            ]
+        )
+        engine, _metrics = make_engine(model)
+        text, _events = await collect(engine, "帮我预约")
+
+        assert model.calls == 2, "带 token 却零工具调用，必须触发一次强制重试"
+        assert "马上办理" in text
+    finally:
+        reset_approval_context()

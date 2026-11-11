@@ -10,14 +10,18 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, List, Optional
 
 from xiaozhi.core.tool import Tool, ToolDefinition, ToolParameter, RiskLevel
 from xiaozhi.repositories.appointment_repo import Appointment, AppointmentRepository
 from xiaozhi.security.validators import validate_appointment
+from xiaozhi.service.appointment_service import AppointmentService, BookingOutcome
 from xiaozhi.service.doctor_service import DoctorService
 from xiaozhi.service.slot_service import SlotService
 from xiaozhi.tools.argument_normalizer import normalize_arguments
+
+logger = logging.getLogger(__name__)
 
 
 def build_department_hint(doctor_service: DoctorService) -> str:
@@ -80,12 +84,15 @@ class BookAppointmentTool(Tool):
     def __init__(
         self,
         repository: AppointmentRepository,
-        slot_service: SlotServiceProtocol,
+        slot_service: SlotService,
         doctor_service: DoctorService,
     ) -> None:
         self.repository = repository
         self.slot_service = slot_service
         self.doctor_service = doctor_service
+        # Phase 3a：业务规则（状态机、原子查重写入、异常分类）收敛到服务层；
+        # 工具层只负责"参数校验 → 调服务 → 转述结果"。
+        self._service = AppointmentService(repository, slot_service)
         # 本院真实科室清单 —— 注入工具描述，避免模型自己编科室名。
         # 2026-11-10 真实联调：用户问"内科"，本院没有泛化的"内科"，
         # 模型被拒后**编了一个"呼吸科"**（真名是"呼吸内科"），
@@ -125,38 +132,40 @@ class BookAppointmentTool(Tool):
         if swap_error is not None:
             return ToolResult.fail(swap_error, error_type="ValidationError")
 
-        availability = self.slot_service.check(
-            data["department"], data["date"], data["time"], data.get("doctor_name")
-        )
-        if not availability.available:
-            return ToolResult.fail(
-                f"{availability.message} 因此无法为您办理预约。", error_type="NoSlotAvailable"
-            )
-
-        doctor = data.get("doctor_name") or (
-            availability.doctors[0] if availability.doctors else None
-        )
-        appointment = Appointment(
+        # ---- 委托业务服务（Phase 3a）：号源检查 + 原子查重写入都在服务里 ----
+        result = self._service.book(
             username=data["username"],
             id_card=data["id_card"],
             department=data["department"],
             date=data["date"],
             time=data["time"],
-            doctor_name=doctor,
+            doctor_name=data.get("doctor_name"),
         )
 
-        duplicate = self.repository.find_duplicate(appointment)
-        if duplicate is not None:
+        if result.outcome == BookingOutcome.CREATED:
+            return ToolResult.ok(
+                f"预约成功。预约详情：{self._describe(result.appointment)}"
+            )
+        if result.outcome == BookingOutcome.ALREADY_EXISTS:
+            existing = result.appointment
+            doctor_text = f"（医生：{existing.doctor_name or '未指定'}）" if existing else ""
             return ToolResult.fail(
-                f"您在{appointment.department} {appointment.date} {appointment.time}"
-                f"已有预约（医生：{duplicate.doctor_name or '未指定'}），请勿重复预约。",
+                f"您在{data['department']} {data['date']} {data['time']}"
+                f"已有预约{doctor_text}，请勿重复预约。",
                 error_type="DuplicateAppointment",
             )
-
-        saved = self.repository.save(appointment)
-        if saved is None:
-            return ToolResult.fail("预约写入失败，请稍后重试。", error_type="PersistenceError")
-        return ToolResult.ok(f"预约成功。预约详情：{self._describe(saved)}")
+        if result.outcome == BookingOutcome.NO_SLOT:
+            return ToolResult.fail(
+                f"{result.message} 因此无法为您办理预约。", error_type="NoSlotAvailable"
+            )
+        if result.outcome == BookingOutcome.REPOSITORY_UNAVAILABLE:
+            # 基础设施不可用 → 如实说系统问题，不伪装成业务失败
+            return ToolResult.fail(
+                f"预约未能写入：{result.message}", error_type="RepositoryUnavailable"
+            )
+        return ToolResult.fail(
+            f"预约写入失败：{result.message}", error_type="PersistenceError"
+        )
 
     def _detect_name_swap(self, data: Dict[str, Any]) -> Optional[str]:
         """检测"患者姓名"和"医生姓名"填反了。
@@ -225,6 +234,10 @@ class CancelAppointmentTool(Tool):
 
     def __init__(self, repository: AppointmentRepository) -> None:
         self.repository = repository
+        # Phase 3a：取消 = 状态迁移，业务规则在服务层。
+        # 取消不需要号源服务（slot_service 传 None）；
+        # 本工具只用 cancel，book 的号源检查走 BookAppointmentTool。
+        self._service = AppointmentService(repository, None)
 
     async def call(self, params: Dict[str, Any]) -> Any:
         from xiaozhi.core.tool import ToolResult
@@ -240,25 +253,33 @@ class CancelAppointmentTool(Tool):
             )
 
         data = validation.normalized
-        probe = Appointment(
+
+        # ---- 委托业务服务（Phase 3a）：取消 = 状态迁移，保留审计痕迹 ----
+        result = self._service.cancel(
             username=data["username"],
             id_card=data["id_card"],
             department=data["department"],
             date=data["date"],
             time=data["time"],
         )
-        existing = self.repository.find_duplicate(probe)
-        if existing is None or existing.id is None:
-            return ToolResult.fail(
-                "未找到可取消的预约记录，请核对姓名、身份证号、科室、日期和时段。",
-                error_type="NotFound",
+        if result.outcome == BookingOutcome.CREATED:
+            cancelled = result.appointment
+            return ToolResult.ok(
+                "取消预约成功："
+                f"姓名：{cancelled.username}，科室：{cancelled.department}，"
+                f"日期：{cancelled.date}，时段：{cancelled.time}"
             )
-        if not self.repository.delete(existing.id):
-            return ToolResult.fail("取消预约失败，请稍后重试。", error_type="PersistenceError")
-        return ToolResult.ok(
-            "取消预约成功，已删除："
-            f"姓名：{existing.username}，科室：{existing.department}，"
-            f"日期：{existing.date}，时段：{existing.time}"
+        if result.outcome == BookingOutcome.REPOSITORY_UNAVAILABLE:
+            return ToolResult.fail(
+                f"取消预约未能完成：{result.message}",
+                error_type="RepositoryUnavailable",
+            )
+        if result.outcome == BookingOutcome.FAILED:
+            # 业务层已经给了可读文案（未找到 / 已取消 / 失败）
+            error_type = "NotFound" if "未找到" in result.message else "PersistenceError"
+            return ToolResult.fail(result.message, error_type=error_type)
+        return ToolResult.fail(
+            f"取消预约失败：{result.message}", error_type="PersistenceError"
         )
 
 
@@ -291,7 +312,7 @@ class QuerySlotTool(Tool):
 
     def __init__(
         self,
-        slot_service: SlotServiceProtocol,
+        slot_service: SlotService,
         doctor_service: DoctorService,
     ) -> None:
         self.slot_service = slot_service

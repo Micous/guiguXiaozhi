@@ -268,3 +268,33 @@
 10. **审批弹窗时序与唯一键冲突已修（`1472290`）**：①模型在同一轮里既询问用户（"是否同意换成呼吸内科"）又调用写工具 → 确认窗"提前"弹出，弹窗里的科室还是模型替用户选的；已在提示词里明确"信息齐全就直接调工具，需要用户表态就先停下询问"。②同参数在上一条审批记录 CONSUMED 后再次发起会撞 `uk_idempotency` 唯一约束 → 500「服务暂时异常：IntegrityError」；已补 `find_by_key`（查任意状态）+ 终态记录改用带序号的幂等键 + 仓储层撞键按已存在处理。③用户报的"最后一个没有弹窗"实为正确行为：执行轮走 token 消费分支，本就不该再弹。④**执行轮模型不调工具 →「用户已确认但预约没发生」**（`17f924e`）：模型输出"请在确认窗口核对上述信息并确认预约"，既不是成功承诺也不是叙述承诺，三个检测全漏判 → 零工具调用收尾 → token 白拿、预约没发生。已加引擎层兜底：**带审批 token 的请求必须产生写操作**（`_has_pending_approval_token` + `_retry_with_approval_hint`），强制重试预算用独立字段 `state.approval_forced_retry_done`（不能复用 `corrective_used`，那条路径不经过 `consume_corrective` → 计数永远 0 → 无限重试、同一句刷 5 遍）。详见 `踩坑与优化记录.md` 第十六节 / 16.10。
 
 **结论**：Phase 2 的 7 条验收用例均有单测 + 真机证据，**形态 A（内网演示/教学）的 M2 标准达成**；但形态 B/C 不成立——认证源是过渡、审批默认关、号源是 Mock、敏感数据仍明文回显、Phase 3/4 未开工。下一批建议 Phase 3a（预约状态机 / 事务 / 唯一约束，无外部依赖），同时并行催 HIS 文档与沙箱。
+
+------------------------------------------------------------------------
+
+## 9. Phase 3a 增量复核（2026-11-11，P0-04 数据一致性）
+
+> 测试基线：**444 passed / 6 skipped**（离线）。本批对应路线图 Phase 3a（不等 HIS 也能做的部分），审计 P0-04 从 `SOURCE_CONFIRMED` 变为 **PARTIALLY_FIXED + RUNTIME_VERIFIED**（8082 独立实例真机走完整审批-执行-落库链路）。
+
+### 9.1 P0-04 状态变化
+
+| 审计原问题 | 本批处置 |
+|---|---|
+| 4 处 `except Exception` 静默返回 `None`/`False` | 仓储按 `repositories/errors.py` 分类抛异常（`RepositoryUnavailable`/`UniqueConflict`/`NotFound`/`InvalidState`/`PersistenceError`）；服务层分类翻译成业务结果，工具层如实转述"系统故障"与"重复预约"的差别 |
+| `find_duplicate` + `save` 两次连接、无事务 | `create_if_absent`：同一事务内 `SELECT ... FOR UPDATE` + INSERT，撞唯一约束回滚后读回既有记录，返回 `(记录, 是否新建)` |
+| 无唯一索引 → 并发可插重复 | `uk_appointment_active (username, id_card, department, date, time, active_marker)`；`active_marker` 是生成列（`CANCELLED`→NULL），取消后同一时段可重新预约 |
+| 无状态字段 / 取消=物理 DELETE | `status` 状态机（REQUESTED/HOLDING/CONFIRMED/UNKNOWN/CANCELLED）+ `version` 乐观锁；取消=状态迁移，保留审计痕迹 |
+| 建表散落业务代码 | `xiaozhi/migrations/`：版本表 `schema_migrations` + checksum 防篡改 + 幂等脚本（DDL 不可回滚 → 失败重跑收敛）；当前库已迁至版本 2 |
+
+### 9.2 验收证据
+
+- **单测 21 条**（`tests/unit/test_appointment_service.py`）：并发 10 线程同参数只进 1 条、异常分类映射、取消状态迁移/version+1/可重约、迁移幂等/防篡改/dry-run、SQL 拆分正确性。
+- **真机链路（8082）**：登录 → 会话 → 发起预约 → 审批 sentinel → approve → 带一次性 token 重发 → 执行器原子消费 → 工具经 `AppointmentService` 查号源+原子查重写入 → MySQL 落库 `status=CONFIRMED`、`version=1`；对既有记录（id=8）同参数再约 → 如实转述"已有预约（医生：徐国兴）"，**无重复写入**（12 条记录无新增）。
+- **真机暴露并修复**：带 token 的执行轮正常时序（消费→调工具→转述）被强制重试兜底误判"零工具调用" → 同一句输出两遍。修复：判据改为「本次请求从未调过工具」（`state.tool_call_count==0`）；补 2 条回归测试（转述轮不重试 / 全程零调用仍重试）。
+
+### 9.3 仍然存在的口径差异（不要误读为「已可上线」）
+
+1. **P0-04 的"数据一致性"只覆盖本地 MySQL**：真实 HIS 的预占/确认/对账（Phase 3b）未动，`UNKNOWN` 状态目前没有生产者（ Mock 链路恒定 CONFIRMED）。
+2. `IMPLEMENTED_REAL_SLOT_ADAPTERS` 仍为空 → production 门禁恒定拒绝启动（刻意）；P0-03 依旧 `EXTERNAL_DEPENDENCY`。
+3. **P0-06 未动**：预约成功文案仍回显完整身份证号，`appointment` 表明文落库。
+4. 迁移机制尚未接入启动流程（仍是"可选的"，仓储 `ensure_table` 兜底仍在）；上线前需把 `run_migrations` 挂到组合根并把散落的 `CREATE TABLE IF NOT EXISTS` 收编为迁移脚本。
+5. HIS 参考调研已完成（`参考项目/his`，见路线图 Phase 3b 附录）：对接走 REST 网关、号源=号表实例计数器、"先扣号源再落单"需要补偿（UNKNOWN 的语义落点）、有患者主档需先查档/建档。

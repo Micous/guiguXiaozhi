@@ -658,9 +658,27 @@ class EnginePhases:
         # 于是 ``corrective_used`` 一直是 0 → 每次都返回 True → 无限重试。
         # 真机实测：模型被追问后连续 5 轮重复同一句失败原因，
         # 用户看到同一段话被刷了 5 遍。
+        # 前置条件：本请求必须真的带了审批 token（routes 层经 contextvar 下发）。
+        # 没带 token 的零工具调用轮走纠正重试（_schedule_corrective_retry），
+        # 与本兜底互不相干。
+        if not self._has_pending_approval_token():
+            return False
         if state.approval_forced_retry_done:
             logger.warning(
                 "带审批 token 仍未调用工具，放弃强制重试（避免重复刷屏）：trace=%s",
+                trace_id,
+            )
+            return False
+        # 2026-11-11 Phase 3a 真机补充：判据必须是「**本次请求**从未调过工具」
+        # （tool_call_count==0），而不是「本轮没有 tool_calls」——
+        # 执行轮正常时序是"消费 token → 调工具（如返回 ALREADY_EXISTS）→
+        # 模型下一轮转述结果"，转述轮本来就不该再调工具。
+        # 漏了累计条件会把如实转述误判成"token 白拿"，强制重试一轮 →
+        # 同一句在界面上重复输出两遍（8082 真机实测）。
+        if state.tool_call_count > 0:
+            logger.debug(
+                "带审批 token 的请求已发生过工具调用（count=%d），无需强制重试：trace=%s",
+                state.tool_call_count,
                 trace_id,
             )
             return False
@@ -779,16 +797,15 @@ class EnginePhases:
                 #
                 # 这类句子靠正则很难穷举（模型有无数种说法），必须在引擎层兜底：
                 # **有 token 进来，就一定要有写操作发生**。
-                if self._has_pending_approval_token():
-                    if self._retry_with_approval_hint(
-                        messages, tools, state, response, trace_id
-                    ):
-                        turn += 1
-                        yield TurnEndEvent(
-                            trace_id=trace_id,
-                            metadata={"turn_number": turn, "corrective_retry": True},
-                        )
-                        continue
+                if self._retry_with_approval_hint(
+                    messages, tools, state, response, trace_id
+                ):
+                    turn += 1
+                    yield TurnEndEvent(
+                        trace_id=trace_id,
+                        metadata={"turn_number": turn, "corrective_retry": True},
+                    )
+                    continue
                 if self._schedule_corrective_retry(response, messages, state):
                     turn += 1
                     yield TurnEndEvent(
