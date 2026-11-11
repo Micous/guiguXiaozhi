@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from xiaozhi.config import Settings, get_settings
+from xiaozhi.config_guard import ProductionConfigError, validate_production_settings
 from xiaozhi.core.tool import Tool
 from xiaozhi.memory.context import ContextAssembler, rule_based_summary
 from xiaozhi.memory.store import (
@@ -132,9 +133,29 @@ def load_system_prompt(doctor_service=None) -> str:
     return text
 
 
+def _build_slot_service(settings: Settings, doctor_service: DoctorService) -> SlotService:
+    """按配置装配号源适配器（组合根唯一装配点）。
+
+    目前只有 MockSlotService。Phase 3b 实现 HisSlotService 后在此加分支，
+    并同步把适配器名登记进 config_guard.IMPLEMENTED_REAL_SLOT_ADAPTERS，
+    production 门禁才会放行。填了未实现的名字要在任何外部连接前就报错，
+    不能等到工具层才发现号源是假的。
+    """
+    impl = settings.slot_service_impl.strip().lower()
+    if impl == "mock":
+        return MockSlotService(doctor_service)
+    raise ProductionConfigError(
+        f"号源适配器 {settings.slot_service_impl!r} 尚未实现："
+        "请在 xiaozhi/service/ 下实现 HisSlotService 并在组合根注册后再启动。"
+    )
+
+
 async def get_application(settings: Optional[Settings] = None) -> Application:
     """装配整个应用"""
     settings = settings or get_settings()
+    # 生产门禁：必须在任何外部连接（Ollama / Milvus / RAG 灌库）之前执行，
+    # 否则「拒绝启动」会退化成「连了一圈依赖才失败」，且 /health 可能已经 ok。
+    validate_production_settings(settings)
     configure_logging(settings.log_level, json_output=settings.json_logs)
 
     # ---- 追踪 ----
@@ -200,7 +221,7 @@ async def get_application(settings: Optional[Settings] = None) -> Application:
         retrieve_all_chunks=vector_store.all_texts,
         roster_file=settings.rag_excluded_files[0] if settings.rag_excluded_files else "doctors.md",
     )
-    slot_service = MockSlotService(doctor_service)  # ← 唯一 Mock：外部 HIS 接口本地调不通
+    slot_service = _build_slot_service(settings, doctor_service)
 
     # ---- 仓储 ----
     repository = MySQLAppointmentRepository(

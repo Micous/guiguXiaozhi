@@ -1,0 +1,97 @@
+"""生产启动门禁 —— APP_ENV=production 时 fail-fast 校验。
+
+职责边界：
+  * config.py       只负责「读配置」；
+  * application.py  只负责「装配组件」；
+  * 本模块          只负责「哪些配置组合允许对外服务」这一策略判断。
+
+为什么需要它：原型默认值为了方便本地联调而刻意宽松——
+``permission_no_ui=allow``、``mysql_password=123456``、号源用 Mock、
+画像缺密钥时静默禁用。这些值在本地是「方便」，一旦有人把 APP_ENV 标成
+production 就变成**静默高危放行**：无确认的写操作、弱口令、模拟号源、
+降级路径全部照常启动，而 /health 依然返回 ok。
+
+所以 production 必须在连接任何外部服务之前聚合报出全部问题并拒绝启动。
+development 下本模块完全不生效，既有行为零变更。
+"""
+
+from __future__ import annotations
+
+from typing import FrozenSet, List
+
+from xiaozhi.config import Settings
+
+# 弱口令/默认口令黑名单（小写比较）。生产禁止沿用 config.py 的默认值。
+WEAK_MYSQL_PASSWORDS: FrozenSet[str] = frozenset(
+    {
+        "",
+        "123456",
+        "12345678",
+        "123456789",
+        "root",
+        "password",
+        "admin",
+        "mysql",
+        "test",
+    }
+)
+
+# 已落地的**真实**号源适配器（不含 mock）。
+# Phase 3b 实现 HisSlotService 后，需在 application._build_slot_service 注册，
+# 并把适配器名加进这里，production 门禁才会放行。
+# 目前为空 = 无论 slot_service_impl 填什么，production 都不得启动。
+# 这是刻意的：没有真实 HIS，就不该存在「已可上线」的生产模式。
+IMPLEMENTED_REAL_SLOT_ADAPTERS: FrozenSet[str] = frozenset()
+
+
+class ProductionConfigError(RuntimeError):
+    """生产配置不合规：拒绝启动（区别于运行期异常，便于运维一眼定位）。"""
+
+
+def validate_production_settings(settings: Settings) -> None:
+    """非生产直接返回；生产环境聚合全部问题后一次性抛出。
+
+    一次报全而不是遇到第一个就退出：运维照着清单一次修完，避免
+    「改一项、重启、再报下一项」的循环。
+    """
+    if not settings.is_production:
+        return
+
+    problems: List[str] = []
+
+    # 1) 无审批 UI 时放行 ASK 级写操作 == 无确认挂号（审计 P0-02 / 评估 P0-3）
+    if settings.permission_no_ui != "deny":
+        problems.append(
+            f"permission_no_ui={settings.permission_no_ui!r} → 必须为 'deny'："
+            "无审批 UI 时放行 ASK 级写操作等于无确认挂号/取消"
+        )
+
+    # 2) 默认/弱数据库口令（审计 P1-05）
+    if settings.mysql_password.strip().lower() in WEAK_MYSQL_PASSWORDS:
+        problems.append(
+            "mysql_password 仍是默认/弱口令 → 必须换成强密码并由环境注入，"
+            "禁止使用 config.py 的默认值"
+        )
+
+    # 3) 画像开启但缺加密密钥：开发环境会「禁用 + 告警」静默降级，生产不允许
+    if settings.profile_enabled and not settings.profile_secret_key.strip():
+        problems.append(
+            "profile_enabled=true 但 profile_secret_key 为空 → "
+            "画像中的身份证号必须 Fernet 密文落库，生产禁止静默禁用降级"
+        )
+
+    # 4) Mock 号源 / HIS 适配器未实现（审计 P0-03 / 评估 P0-2）
+    adapter = settings.slot_service_impl.strip().lower()
+    if adapter not in IMPLEMENTED_REAL_SLOT_ADAPTERS:
+        problems.append(
+            f"slot_service_impl={settings.slot_service_impl!r} → "
+            "当前仓库只有 MockSlotService，真实 HIS 适配器（Phase 3b）尚未实现；"
+            "模拟号源不具业务效力，禁止以 production 启动"
+        )
+
+    if problems:
+        raise ProductionConfigError(
+            f"APP_ENV=production 启动被拒绝，共 {len(problems)} 项不合规：\n  - "
+            + "\n  - ".join(problems)
+            + "\n修复后再启动；内网演示/本地开发请保持 APP_ENV=development（默认）。"
+        )

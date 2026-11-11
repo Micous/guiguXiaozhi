@@ -24,6 +24,16 @@ class Settings(BaseSettings):
         env_file=ROOT / ".env", env_file_encoding="utf-8", extra="ignore"
     )
 
+    # ---------- 运行环境 ----------
+    # development（默认）：本地开发 / 内网演示，沿用宽松默认值；
+    # production：启动时执行 config_guard 的 fail-fast 校验，不合规直接拒绝启动。
+    # 注意：production 是一个**门禁**而非"更快的配置"，当前仓库没有真实 HIS 适配器，
+    # 因此该模式下必然启动失败（这是刻意的，见 config_guard.py）。
+    app_env: str = "development"
+    # 号源适配器选择（组合根据此装配）：mock = 本地模拟排班；
+    # 真实 HIS 适配器在 Phase 3b 落地后于 application._build_slot_service 注册。
+    slot_service_impl: str = "mock"
+
     # ---------- 服务 ----------
     host: str = "127.0.0.1"
     port: int = 8081  # 与 Java 版（8080）并存，便于 A/B 对比
@@ -105,6 +115,11 @@ class Settings(BaseSettings):
     trace_max: int = 500
     trace_persist_dir: str = str(ROOT / "logs" / "traces")
     audit_log_path: str = str(ROOT / "logs" / "audit.jsonl")
+
+    @property
+    def is_production(self) -> bool:
+        """是否以生产形态启动（大小写与 prod 别名不敏感）"""
+        return self.app_env.strip().lower() in ("production", "prod")
 
     @property
     def mysql_url(self) -> str:
