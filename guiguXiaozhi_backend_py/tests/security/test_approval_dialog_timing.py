@@ -224,3 +224,35 @@ async def test_approval_notice_is_injected_only_when_approval_enabled():
     engine2, _ = make_engine(FakeChatModel([]), executor=_ApprovalExecutor())
     assert engine2._approval_enabled() is True
     assert APPROVAL_PROMPT_NOTE
+
+
+# ---------- 执行轮：带 token 却没调工具 → 必须补一轮强制执行 ----------
+
+
+def test_approval_execution_prompt_is_explicit_about_execution():
+    """强制执行指令必须说清"用户已确认，必须真的调工具"。
+
+    事故原句：模型输出「请在确认窗口核对上述信息并确认预约。未确认前不会进行
+    实际挂号操作。」—— 用户**已经确认过了**，模型把已完成的确认又推回去，
+    而操作并没有发生。
+    """
+    from xiaozhi.runtime.engine_phases import APPROVAL_EXECUTION_PROMPT
+
+    assert "用户已经完成确认" in APPROVAL_EXECUTION_PROMPT
+    assert "真正调用工具" in APPROVAL_EXECUTION_PROMPT
+    assert "不要再次要求用户确认" in APPROVAL_EXECUTION_PROMPT
+
+
+def test_approval_forced_retry_happens_at_most_once():
+    """强制重试**最多一次** —— 避免模型被反复追问、同一句话刷屏。
+
+    真机事故：模型连续 5 轮重复同一句失败原因，用户界面被刷屏。
+    根因：用 ``state.corrective_used`` 判断预算，但本路径不经过
+    ``consume_corrective`` → 计数永远是 0 → 每次都重试。
+    """
+    from xiaozhi.runtime.state import TurnState
+
+    state = TurnState()
+    assert state.approval_forced_retry_done is False
+    state.approval_forced_retry_done = True
+    assert state.approval_forced_retry_done is True

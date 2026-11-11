@@ -64,6 +64,10 @@ class TurnState:
     # 的工具结果喂给模型（否则 qwen2.5:7b 会编造「已确认/已预约」）。
     approval_required: bool = False
     approval_detail: Dict[str, Any] = field(default_factory=dict)
+    # 带审批 token 却没调工具时，是否已经追加强制执行指令（**最多一次**）。
+    # 2026-11-11 第十轮事故：没这个闸门时，模型会被反复追问，
+    # 同一句失败原因在用户界面上刷了 5 遍。
+    approval_forced_retry_done: bool = False
 
     # ---- 请求级上下文（拦截器只读）----
     # 历史里是否真的执行过预约（真话依据：说"已经预约好了"不算幻觉）

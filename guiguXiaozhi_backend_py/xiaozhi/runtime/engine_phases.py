@@ -42,8 +42,25 @@ from xiaozhi.runtime.interceptors import TurnFacts, quality_gate
 from xiaozhi.runtime.state import TurnState
 from xiaozhi.runtime.stream_filter import StreamFilter
 from xiaozhi.security.secure_executor import ToolCall as SecureToolCall
+from xiaozhi.security.approval_service import get_approval_context
 
 logger = logging.getLogger(__name__)
+
+# 带审批 token 却没有调用任何工具时，追加给模型的强制执行指令。
+#
+# 2026-11-11 第十轮事故：用户点了「确认执行」→ 前端换到一次性 token → 带 token
+# 重发同一句。模型这一轮输出「请在确认窗口核对上述信息并确认预约。未确认前不会
+# 进行实际挂号操作。」—— 既不是成功承诺（claim 不匹配），也不是叙述承诺
+# （narrated 不匹配），**三个检测全部漏判** → 零工具调用收尾 → token 白拿、
+# 预约**没有发生**，而用户看到的却是"请在确认窗口核对"（确认窗早就关了）。
+#
+# 关键：此时**用户已经确认过了**，模型再说"请确认"是把已完成的确认又推回去，
+# 而操作并不会发生 —— 用户既没约上，也没被如实告知。
+APPROVAL_EXECUTION_PROMPT = (
+    "（系统要求）用户已经完成确认，本次请求必须**真正调用工具**完成这次操作。"
+    "请不要再次要求用户确认，也不要复述预约信息或说明尚未挂号——"
+    "调用成功后请把工具返回的结果如实转述给用户。"
+)
 
 # 审批闭环开启时追加给模型的说明。
 #
@@ -602,6 +619,63 @@ class EnginePhases:
             metadata={"component": "model", "error": str(call_error)},
         )
 
+    def _has_pending_approval_token(self) -> bool:
+        """本请求是否带了有效的审批 token（用户已点过「确认执行」）。
+
+        请求级 contextvar 由 routes 层设置 —— 模型输出永远碰不到它。
+        """
+        try:
+            ctx = get_approval_context()
+        except Exception:  # pragma: no cover - contextvar 未设置时的兜底
+            return False
+        return bool(getattr(ctx, "approval_token", ""))
+
+    def _retry_with_approval_hint(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: List[Any],
+        state: TurnState,
+        response: Any,
+        trace_id: str,
+    ) -> bool:
+        """带审批 token 却没有工具调用 → 追加强制指令再试一轮。
+
+        2026-11-11 第十轮事故：用户点了「确认执行」，前端带一次性 token 重发，
+        模型却输出「请在确认窗口核对上述信息并确认预约。未确认前不会进行实际
+        挂号操作。」—— 既不是成功承诺也不是叙述承诺，三个检测全部漏判 →
+        零工具调用收尾 → **token 白拿、预约没有发生**，而用户看到的却是
+        "请在确认窗口核对"（确认窗早就关了，用户会以为系统没认出他已经确认）。
+
+        这里不能靠正则穷举模型的说法，改为在**引擎层**兜底：
+        带 token 的请求必须产生写操作，否则补一轮"必须真的调工具"的强指令。
+
+        返回 True 表示已追加指令、调用方应当再跑一轮。
+        """
+        # 独立计数：**最多补一轮**。
+        #
+        # 不能用 ``state.corrective_used`` 判断 —— 那是"纠正重试被消费的次数"，
+        # 而本方法走的是另一条路径（直接 append 指令），不会经过 consume_corrective，
+        # 于是 ``corrective_used`` 一直是 0 → 每次都返回 True → 无限重试。
+        # 真机实测：模型被追问后连续 5 轮重复同一句失败原因，
+        # 用户看到同一段话被刷了 5 遍。
+        if state.approval_forced_retry_done:
+            logger.warning(
+                "带审批 token 仍未调用工具，放弃强制重试（避免重复刷屏）：trace=%s",
+                trace_id,
+            )
+            return False
+        state.approval_forced_retry_done = True
+        messages.append(
+            {
+                "role": "user",
+                "content": APPROVAL_EXECUTION_PROMPT,
+            }
+        )
+        logger.warning(
+            "带审批 token 却未调用工具，追加强制执行指令重试：trace=%s", trace_id
+        )
+        return True
+
     def _schedule_corrective_retry(
         self,
         response,
@@ -694,6 +768,27 @@ class EnginePhases:
 
             # ---- 没有工具调用 → 结束（或纠正重试一轮） ----
             if not response.tool_calls:
+                # ---- 带有效审批 token 的请求：模型**必须**真的调工具 ----
+                # （2026-11-11 第十轮事故）用户点了「确认执行」→ 前端换到一次性
+                # token → 带 token 重发同一句。这一轮模型可能输出
+                # 「请在确认窗口核对上述信息并确认预约。未确认前不会进行实际挂号操作。」
+                # —— 既不是成功承诺（claim 不匹配），也不是叙述承诺（narrated 不匹配），
+                # **三个检测全部漏判** → 模型零工具调用收尾 → token 白拿、
+                # 预约**没有发生**，而用户看到的却是"请在确认窗口核对"
+                # （确认窗早就关了）。
+                #
+                # 这类句子靠正则很难穷举（模型有无数种说法），必须在引擎层兜底：
+                # **有 token 进来，就一定要有写操作发生**。
+                if self._has_pending_approval_token():
+                    if self._retry_with_approval_hint(
+                        messages, tools, state, response, trace_id
+                    ):
+                        turn += 1
+                        yield TurnEndEvent(
+                            trace_id=trace_id,
+                            metadata={"turn_number": turn, "corrective_retry": True},
+                        )
+                        continue
                 if self._schedule_corrective_retry(response, messages, state):
                     turn += 1
                     yield TurnEndEvent(
