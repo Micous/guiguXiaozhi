@@ -10,19 +10,26 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Any, AsyncIterator, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, AsyncIterator, Dict, List, Optional
+
+if TYPE_CHECKING:  # 仅供类型标注，避免与 engine.py 循环导入
+    from xiaozhi.runtime.engine import AgentEngineResultHolder
 
 from xiaozhi.core.event import (
+    AgentEndEvent,
     DegradedEvent,
     Event,
     RetrievalEvent,
     TextResponseEvent,
     ToolExecuteEvent,
     ToolResultEvent,
+    TurnEndEvent,
+    TurnStartEvent,
 )
 from xiaozhi.core.message import Message
 from xiaozhi.core.tool import ToolResult
-from xiaozhi.models.quality import inspect_turn
+from xiaozhi.models.quality import booking_executed_in_history, corrective_prompt, inspect_turn
+from xiaozhi.reliability.resilience import degraded_reply
 from xiaozhi.runtime.engine_helpers import (
     _TurnView,
     _empty_turn,
@@ -443,4 +450,272 @@ class EnginePhases:
         # ---- 工具结果回填，继续下一轮 ----
         for message in state.drain_tool_results():
             messages.append(self._tool_to_ollama(message))
+
+    # ---------- 编排子步骤（run 的单一职责拆分，逻辑自 run() 原样平移） ----------
+
+    async def _load_history(self, memory_id: str, trace_id: str) -> List[Message]:
+        """读会话历史（最近 20 条），留 memory.load 跨度。"""
+        with trace_span("memory.load", trace_id=trace_id) as memory_span:
+            history = await self.conversation_store.load(memory_id, limit=20)
+            memory_span.set_attribute("message_count", len(history))
+        return history
+
+    def _new_turn_state(self, history: List[Message], operation_request: bool) -> TurnState:
+        """请求级跨轮状态（E2 收敛）。
+
+        prior_booking：历史里是否真的执行过预约（本次会话早前请求成功挂过号且未取消）。
+        是真话依据：模型说"已经预约好了"时不算幻觉，也不做纠正重试。
+        """
+        return TurnState(
+            prior_booking=booking_executed_in_history(history),
+            operation_request=operation_request,
+        )
+
+    def _time_budget_exceeded(self, started: float) -> bool:
+        """请求级时间预算是否已用尽。"""
+        return (
+            self.request_timeout is not None
+            and time.monotonic() - started > self.request_timeout
+        )
+
+    def _circuit_is_open(self) -> bool:
+        """模型熔断器是否处于打开状态。"""
+        return self.circuit_breaker is not None and not self.circuit_breaker.allow()
+
+    async def _degrade_on_time_budget(
+        self, user_input: str, trace_id: str, result: "AgentEngineResultHolder"
+    ) -> AsyncIterator[Event]:
+        """时间预算用尽：返回已生成内容 + 提示语（不再调模型）。"""
+        result.degraded = True
+        yield DegradedEvent(
+            trace_id=trace_id,
+            metadata={"component": "request", "reason": "time_budget_exceeded"},
+        )
+        hint = "\n\n（响应已达时间上限，先返回已生成的内容。）"
+        result.text += hint
+        yield TextResponseEvent(trace_id=trace_id, metadata={"delta": hint})
+
+    async def _degrade_on_circuit_open(
+        self, user_input: str, trace_id: str, result: "AgentEngineResultHolder"
+    ) -> AsyncIterator[Event]:
+        """模型熔断打开：直接返回本地规则分导诊建议。"""
+        result.degraded = True
+        fallback = degraded_reply(user_input)
+        result.text += fallback
+        yield TextResponseEvent(trace_id=trace_id, metadata={"delta": fallback})
+        yield DegradedEvent(
+            trace_id=trace_id,
+            metadata={"component": "model", "reason": "circuit_open"},
+        )
+        logger.warning("模型熔断器打开，返回规则应答：trace=%s", trace_id)
+
+    async def _degrade_on_model_error(
+        self,
+        call_error: Exception,
+        emitted_this_turn: bool,
+        user_input: str,
+        trace_id: str,
+        result: "AgentEngineResultHolder",
+    ) -> AsyncIterator[Event]:
+        """模型调用失败：记录熔断并给可读降级文案（不暴露内部错误）。
+
+        已向用户吐出过文本时不再补降级文案，否则前端会出现重复文字。
+        """
+        if self.circuit_breaker is not None:
+            self.circuit_breaker.record_failure()
+        result.error = str(call_error)
+        result.degraded = True
+        logger.warning("模型调用失败：trace=%s error=%s", trace_id, call_error)
+        if not emitted_this_turn:
+            fallback = degraded_reply(user_input)
+            result.text += fallback
+            yield TextResponseEvent(trace_id=trace_id, metadata={"delta": fallback})
+        yield DegradedEvent(
+            trace_id=trace_id,
+            metadata={"component": "model", "error": str(call_error)},
+        )
+
+    def _schedule_corrective_retry(
+        self,
+        response,
+        messages: List[Dict[str, Any]],
+        state: TurnState,
+    ) -> bool:
+        """无工具调用收尾：记录最终回复，命中幻觉/误报则追加纠正提示。
+
+        返回 True 表示需要纠正重试一轮（调用方负责 turn+=1 并 continue）。
+        narrated 叙述承诺检测已收敛进拦截器链（_chat_turn）。
+        """
+        state.set_final_reply(response.text)
+        corrective_fired, corrective_kind = state.consume_corrective()
+        if not corrective_fired:
+            return False
+        if corrective_kind != "action":
+            self.metrics.inc("false_confirmation_retries")
+        messages.append(
+            {"role": "user", "content": corrective_prompt(corrective_kind)}
+        )
+        return True
+
+    async def _run_loop(
+        self,
+        *,
+        messages: List[Dict[str, Any]],
+        tools: List[Any],
+        known_tool_names: List[str],
+        state: TurnState,
+        user_input: str,
+        user_id: str,
+        trace_id: str,
+        request_span,
+        started: float,
+        result: "AgentEngineResultHolder",
+        outcome: Dict[str, Any],
+    ) -> AsyncIterator[Event]:
+        """主循环：预算/熔断守门 → 调模型 → 出错降级 / 无工具收尾 / 执行工具。
+
+        结束时把最终轮数写入 outcome["turns"]（run 收口与 AgentEnd 要用）。
+        """
+        turn = 0
+        while turn < self.max_turns:
+            # ---- 守门一：请求级时间预算 ----
+            if self._time_budget_exceeded(started):
+                async for _ev in self._degrade_on_time_budget(user_input, trace_id, result):
+                    yield _ev
+                break
+
+            # ---- 守门二：模型熔断器打开时直接本地降级 ----
+            if self._circuit_is_open():
+                async for _ev in self._degrade_on_circuit_open(user_input, trace_id, result):
+                    yield _ev
+                break
+
+            yield TurnStartEvent(trace_id=trace_id, metadata={"turn_number": turn})
+
+            # ---- 调模型（流式 + 质量拦截器链，见 _chat_turn）----
+            turn_outcome: Dict[str, Any] = {}
+            async for _ev in self._chat_turn(
+                messages=messages,
+                tools=tools,
+                known_tool_names=known_tool_names,
+                state=state,
+                user_input=user_input,
+                trace_id=trace_id,
+                turn_number=turn,
+                request_span=request_span,
+                result=result,
+                outcome=turn_outcome,
+            ):
+                yield _ev
+            response = turn_outcome.get("response")
+            call_error = turn_outcome.get("call_error")
+            emitted_this_turn = turn_outcome.get("emitted_this_turn", False)
+
+            # ---- 模型调用失败 → 降级并结束 ----
+            if call_error is not None:
+                async for _ev in self._degrade_on_model_error(
+                    call_error, emitted_this_turn, user_input, trace_id, result
+                ):
+                    yield _ev
+                break
+
+            if self.circuit_breaker is not None:
+                self.circuit_breaker.record_success()
+
+            if response is None:
+                response = _empty_turn()
+
+            # ---- 没有工具调用 → 结束（或纠正重试一轮） ----
+            if not response.tool_calls:
+                if self._schedule_corrective_retry(response, messages, state):
+                    turn += 1
+                    yield TurnEndEvent(
+                        trace_id=trace_id,
+                        metadata={"turn_number": turn, "corrective_retry": True},
+                    )
+                    continue
+                break
+
+            # ---- 执行工具 + 结果回填（见 _execute_tools）----
+            async for _ev in self._execute_tools(
+                response=response,
+                messages=messages,
+                state=state,
+                user_id=user_id,
+                trace_id=trace_id,
+                result=result,
+            ):
+                yield _ev
+
+            turn += 1
+            yield TurnEndEvent(
+                trace_id=trace_id,
+                metadata={"turn_number": turn, "has_tool_calls": True},
+            )
+
+        outcome["turns"] = turn
+
+    async def _persist_and_extract(
+        self,
+        *,
+        memory_id: str,
+        history: List[Message],
+        user_input: str,
+        state: TurnState,
+        result: "AgentEngineResultHolder",
+        trace_id: str,
+    ) -> AsyncIterator[Event]:
+        """落库（失败不阻断，组装逻辑见 runtime/persister.py）+ 画像抽取钩子。"""
+        with trace_span("memory.write", trace_id=trace_id) as write_span:
+            try:
+                new_messages = self.persister.build(
+                    history,
+                    user_input,
+                    state,
+                    result.tool_calls,
+                    fallback_text=result.text,
+                )
+                await self.conversation_store.save(memory_id, new_messages)
+                # ---- 画像抽取（P2-M6，fire-and-forget）----
+                # 落库成功后才触发；失败只记日志，绝不影响本轮响应。
+                if self.profile_service is not None:
+                    asyncio.get_running_loop().create_task(
+                        self.profile_service.maybe_extract(
+                            user_input, new_messages, trace_id=trace_id
+                        )
+                    )
+            except Exception as exc:
+                write_span.set_error(f"{type(exc).__name__}: {exc}")
+                result.degraded = True
+                yield DegradedEvent(
+                    trace_id=trace_id,
+                    metadata={"component": "memory", "error": str(exc)},
+                )
+
+    async def _finalize(
+        self,
+        *,
+        result: "AgentEngineResultHolder",
+        state: TurnState,
+        turns: int,
+        trace_id: str,
+        started: float,
+    ) -> AsyncIterator[Event]:
+        """指标收口 + AgentEnd 结束事件。"""
+        self.metrics.observe("request_duration_ms", (time.monotonic() - started) * 1000)
+        if result.error:
+            self.metrics.inc("errors_total")
+        if result.degraded:
+            self.metrics.inc("degraded_total")
+
+        yield AgentEndEvent(
+            trace_id=trace_id,
+            metadata={
+                "turns": turns,
+                "tool_calls": [c.name for c in result.tool_calls],
+                "text_length": len(result.text),
+                "degraded": result.degraded,
+                "corrective_retries": state.corrective_used,
+            },
+        )
 
