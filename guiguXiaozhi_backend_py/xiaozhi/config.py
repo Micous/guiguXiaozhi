@@ -76,6 +76,15 @@ class Settings(BaseSettings):
     milvus_index_type: str = "FLAT"
     knowledge_dir: str = str(ROOT / "xiaozhi" / "knowledge")
     manifest_path: str = ""  # 留空则按集合名自动生成（不同集合不共用清单）
+    # ---------- Phase 6：知识库单写者 ----------
+    # true：启动时在 Web 进程内灌库（一期行为，单实例开发/内网演示）；
+    # false：只做**只读挂载**（连现有集合 + 建稀疏索引），灌库交给
+    #   `scripts/ingest_knowledge.py` 单写者 Job —— 多实例并发写同一集合
+    #   会产生半成品索引与清单互相覆盖。production 门禁强制 false。
+    rag_ingest_on_startup: bool = True
+    # true：只读挂载必须拿到非空索引，否则拒绝启动（生产要求）；
+    # false：索引空/不可达时降级为"无知识检索"，/health 仍 ok（开发友好）。
+    rag_require_index: bool = False
 
     # ---------- 检索 ----------
     rag_max_results: int = 2
@@ -140,6 +149,12 @@ class Settings(BaseSettings):
     enable_rate_limit: bool = True
     rate_limit_max_requests: int = 30
     rate_limit_window_seconds: float = 60.0
+    # Phase 6：限流后端。memory = 进程内滑动窗口（一期行为，单实例）；
+    # redis = 共享计数（多实例额度一致）。redis 不可达时**拒绝启动**，
+    # 不静默退回进程内 —— 退回后每个实例各有一份额度，等于额度被实例数放大。
+    rate_limit_backend: str = "memory"
+    redis_url: str = "redis://localhost:6379/0"  # 只在 rate_limit_backend=redis 时使用
+    rate_limit_redis_prefix: str = "xiaozhi:rl"
 
     # ---------- 患者画像（P2 长期记忆，灰度默认关） ----------
     profile_enabled: bool = False
@@ -168,6 +183,17 @@ class Settings(BaseSettings):
     trace_max: int = 500
     trace_persist_dir: str = str(ROOT / "logs" / "traces")
     audit_log_path: str = str(ROOT / "logs" / "audit.jsonl")
+    # ---------- Phase 6：审计 fail-closed 与集中存储 ----------
+    # true：任一审计 sink 写失败即拒绝执行工具（「无法留痕的操作不执行」）；
+    # false：一期行为（写失败只告警，不影响主流程）。
+    # production 门禁强制 true（config_guard 第 9 项）。
+    audit_fail_closed: bool = False
+    # 审计落地目标：file（本地 JSONL，默认）/ mongo（集中存储）/ file,mongo（双写）。
+    # mongo 模式下启动先 ping，连不上直接拒绝启动 —— 审计降级成本地文件
+    # 等于集中库里查不到，运维会以为"没有操作发生过"。
+    audit_sink: str = "file"
+    audit_mongo_database: str = "chat_memory_db"
+    audit_mongo_collection: str = "audit_events"
 
     @property
     def is_production(self) -> bool:

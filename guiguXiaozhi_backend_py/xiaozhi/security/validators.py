@@ -158,11 +158,11 @@ def validate_appointment(
         (validate_time_slot(params.get("time", "")), "time"),
         (validate_doctor(params.get("doctor_name")), "doctor_name"),
     ]
-    for result, field in checks:
+    for result, key in checks:
         if not result.ok:
             errors.extend(result.errors)
         else:
-            normalized[field] = result.normalized.get(field)
+            normalized[key] = result.normalized.get(key)
 
     if errors:
         return ValidationResult(ok=False, errors=errors)

@@ -22,9 +22,10 @@ from xiaozhi.memory.store import (
     ResilientConversationStore,
 )
 from xiaozhi.models.ollama import OllamaChatModel, OllamaEmbeddingModel
-from xiaozhi.ops.audit import AuditLogger
+from xiaozhi.ops.audit import AuditLogger, MongoAuditSink
 from xiaozhi.ops.lifecycle import GracefulShutdown, HealthChecker, RateLimiter
 from xiaozhi.ops.metrics import MetricsCollector
+from xiaozhi.ops.redis_limiter import RateLimitBackendError, build_rate_limiter
 from xiaozhi.profile.service import ProfileService
 from xiaozhi.profile.store import FactCipher, MySQLProfileRepository, ProfileDisabledError
 from xiaozhi.profile.injector import ProfileInjector
@@ -299,10 +300,42 @@ async def get_application(settings: Optional[Settings] = None) -> Application:
 
     # ---- 运维组件 ----
     metrics = MetricsCollector()
-    audit = AuditLogger(settings.audit_log_path)
-    rate_limiter = RateLimiter(
-        settings.rate_limit_max_requests, settings.rate_limit_window_seconds
+    # 审计：fail-closed + 可选集中存储（Phase 6）。
+    # mongo sink 启动先 ping：连不上直接抛错，不静默降级成本地文件
+    # （降级后集中库里查不到记录，运维会以为"没有操作发生过"）。
+    audit_sinks = []
+    sink_choice = (settings.audit_sink or "file").strip().lower()
+    if sink_choice in ("mongo", "file,mongo", "file+mongo", "both"):
+        mongo_sink = MongoAuditSink(
+            settings.mongo_uri,
+            database=settings.audit_mongo_database,
+            collection=settings.audit_mongo_collection,
+        )
+        mongo_sink.ping()
+        audit_sinks.append(mongo_sink)
+        logger.info(
+            "审计集中存储已启用：Mongo %s.%s",
+            settings.audit_mongo_database,
+            settings.audit_mongo_collection,
+        )
+    elif sink_choice not in ("", "file"):
+        raise ProductionConfigError(
+            f"audit_sink={settings.audit_sink!r} 无效：只能是 file / mongo / file,mongo"
+        )
+    audit = AuditLogger(
+        None if sink_choice.startswith("mongo") else settings.audit_log_path,
+        fail_closed=settings.audit_fail_closed,
+        sinks=audit_sinks,
+        on_write_error=(lambda detail: logger.error("审计写入失败：%s", detail)),
     )
+    if settings.audit_fail_closed:
+        logger.info("审计 fail-closed 已启用：审计不可用时工具执行会被拒绝")
+    try:
+        rate_limiter = build_rate_limiter(settings)
+    except RateLimitBackendError as exc:
+        # 配了 Redis 却连不上 → 拒绝启动。静默退回进程内会让"多实例额度一致"
+        # 这个前提无人察觉地失效（等于额度被实例数放大）。
+        raise ProductionConfigError(f"限流后端不可用，拒绝启动：{exc}") from exc
     shutdown = GracefulShutdown(settings.drain_timeout)
 
     # ---- 模型 ----
@@ -339,15 +372,45 @@ async def get_application(settings: Optional[Settings] = None) -> Application:
         dense_min_score=settings.rag_dense_min_score,
         excluded_files=settings.rag_excluded_files,
     )
-    stats = await rag.bootstrap()
-    logger.info(
-        "RAG 就绪：%s 块 / %s 文件，更新 %s 个，降级=%s",
-        stats.chunks,
-        stats.files,
-        stats.updated_files,
-        stats.degraded,
-    )
-
+    # Phase 6：灌库（写向量集合）只允许**单写者**执行。
+    #   rag_ingest_on_startup=true（默认）：沿用一期行为，启动即增量灌库，
+    #     适合单实例开发/内网演示；
+    #   false：只读挂载（连现有集合 + 建稀疏索引），灌库交给
+    #     `scripts/ingest_knowledge.py`。多实例部署必须用这个模式 ——
+    #     N 个实例并发写同一集合会出现半成品索引与清单互相覆盖。
+    if settings.rag_ingest_on_startup:
+        stats = await rag.bootstrap()
+        logger.info(
+            "RAG 就绪（启动期灌库）：%s 块 / %s 文件，更新 %s 个，降级=%s",
+            stats.chunks,
+            stats.files,
+            stats.updated_files,
+            stats.degraded,
+        )
+    else:
+        stats = await rag.mount_readonly()
+        if stats.degraded:
+            logger.error("RAG 只读挂载失败（知识检索将不可用）：%s", stats.error)
+        else:
+            logger.info(
+                "RAG 只读挂载就绪：%s 块（未写库；灌库请运行 scripts/ingest_knowledge.py）",
+                stats.chunks,
+            )
+        pending = rag.pending_changes()
+        if pending:
+            # 不是致命错，但必须喊出来：改了知识库却忘了跑灌库 Job，
+            # 用户会拿到旧答案，而 /health 一直是 ok。
+            logger.warning(
+                "知识库有 %d 个文件的改动尚未灌库，检索结果可能过期：%s",
+                len(pending),
+                ", ".join(pending[:5]) + ("..." if len(pending) > 5 else ""),
+            )
+        if settings.rag_require_index and (stats.degraded or stats.chunks <= 0):
+            raise ProductionConfigError(
+                "rag_ingest_on_startup=false 且 rag_require_index=true，但索引不可用："
+                f"{stats.error or '集合内没有任何块'}。请先运行 "
+                "python scripts/ingest_knowledge.py --force 再启动。"
+            )
     # ---- 院内系统 ----
     doctor_service = VectorStoreDoctorService(
         retrieve_all_chunks=vector_store.all_texts,
@@ -456,6 +519,14 @@ async def get_application(settings: Optional[Settings] = None) -> Application:
     health.register("mysql", _probe_mysql)
     if settings.storage_fail_fast:
         health.register("mongo", _probe_mongo)
+    if settings.rate_limit_backend.strip().lower() == "redis":
+        # 限流后端是硬依赖（fail-closed 下故障就 503），必须进就绪探针，
+        # 否则 /ready 报就绪但聊天全被拒 = 假健康。
+        def _probe_redis() -> dict:
+            rate_limiter.probe()
+            return {"ok": True}
+
+        health.register("redis", _probe_redis)
 
     # ---- 权限 ----
     permission_engine = PermissionDecisionEngine.from_yaml(Path(settings.permissions_file))
@@ -500,6 +571,7 @@ async def get_application(settings: Optional[Settings] = None) -> Application:
         no_ui_policy=settings.permission_no_ui,
         audit_logger=audit,
         approval_service=approval_service,
+        metrics=metrics,
     )
 
     # ---- 患者画像（P2，灰度开关默认关）----

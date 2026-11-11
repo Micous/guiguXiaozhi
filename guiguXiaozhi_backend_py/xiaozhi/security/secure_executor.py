@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
 
 from xiaozhi.core.tool import Tool, ToolResult
-from xiaozhi.ops.audit import AuditLogger
+from xiaozhi.ops.audit import AuditLogger, AuditWriteError
 from xiaozhi.security.approval_service import (
     ApprovalRejected,
     ApprovalService,
@@ -54,6 +54,7 @@ class SecureToolExecutor:
         approval_callback: Optional[Callable[[str, ToolCall], Awaitable[bool]]] = None,
         audit_logger: Optional[AuditLogger] = None,
         approval_service: Optional[ApprovalService] = None,
+        metrics: Any = None,
     ) -> None:
         # no_ui_policy 是安全兜底开关，拼错字符串等于静默改策略 —— 启动即报错
         if no_ui_policy not in ("allow", "deny"):
@@ -64,12 +65,44 @@ class SecureToolExecutor:
         self.no_ui_policy = no_ui_policy
         self.approval_callback = approval_callback
         self.audit_logger = audit_logger
+        # Phase 6：审计写失败时计数（fail-closed 下这是"工具为何全部拒绝"的第一现场）
+        self.metrics = metrics
         # Phase 2 灰度：未装配审批服务时，下面整段门控完全不进入执行路径
         self.approval_service = approval_service
 
     def _audit(self, event_type: str, **fields: Any) -> None:
-        if self.audit_logger is not None:
+        """写审计；``AuditWriteError`` 由调用方决定是拒绝执行还是只告警。"""
+        if self.audit_logger is None:
+            return
+        try:
             self.audit_logger.record(event_type, **fields)
+        except AuditWriteError:
+            if self.metrics is not None:
+                self.metrics.inc("audit_write_failed_total")
+            raise
+
+    def _audit_before_execution(self, event_type: str, **fields: Any) -> Optional[ToolResult]:
+        """执行**前**的必备留痕。
+
+        fail-closed 下审计没落成就没有"这次操作发生过"的证据 —— 直接拒绝执行。
+        只读工具同样拒绝：审计缺口无法区分"读"与"写"，放开读等于留下无痕访问。
+        """
+        try:
+            self._audit(event_type, **fields)
+        except AuditWriteError as exc:
+            logger.error("审计不可用，拒绝执行工具：%s", exc)
+            return ToolResult.fail(
+                "审计服务不可用，出于安全考虑本次操作未执行，请稍后重试。",
+                error_type="AuditUnavailable",
+            )
+        return None
+
+    def _audit_after_execution(self, event_type: str, **fields: Any) -> None:
+        """执行**后**的审计。此时副作用已经发生，fail-closed 无从挽回，只能留痕。"""
+        try:
+            self._audit(event_type, **fields)
+        except AuditWriteError as exc:
+            logger.error("工具已执行但审计写入失败（须对账）：%s", exc)
 
     async def execute(self, tool_call: ToolCall, tool: Tool) -> ToolResult:
         """执行一次工具调用（四层安全流 + Phase 2 审批门控）"""
@@ -100,7 +133,7 @@ class SecureToolExecutor:
         decision = self.permission_engine.decide(
             tool_call.tool_name, tool_call.user_id, scope, tool_call.trace_id
         )
-        self._audit(
+        denied_by_audit = self._audit_before_execution(
             "permission_decision",
             decision=decision.value,
             tool_name=tool_call.tool_name,
@@ -108,6 +141,8 @@ class SecureToolExecutor:
             trace_id=tool_call.trace_id,
             args=tool_call.args,
         )
+        if denied_by_audit is not None:
+            return denied_by_audit
         if decision == Decision.DENY:
             return ToolResult.fail(
                 f"工具【{tool_call.tool_name}】已被安全策略禁止调用。",
@@ -177,7 +212,7 @@ class SecureToolExecutor:
             result = ToolResult.fail(
                 f"工具执行异常：{type(exc).__name__}: {exc}", error_type="ToolExecutionError"
             )
-        self._audit(
+        self._audit_after_execution(
             "tool_execution",
             tool_name=tool_call.tool_name,
             user_id=tool_call.user_id,
@@ -258,13 +293,17 @@ class SecureToolExecutor:
             required_scopes=[CHAT_WRITE_SCOPE],
         )
         detail = self.approval_service.detail(record.approval_id, principal)
-        self._audit(
+        denied_by_audit = self._audit_before_execution(
             "approval_required",
             tool_name=tool_call.tool_name,
             user_id=tool_call.user_id,
             trace_id=tool_call.trace_id,
             approval_id=record.approval_id,
         )
+        if denied_by_audit is not None:
+            # 审批请求已落库但本次不执行：用户确认后重放仍可走正常链路，
+            # 所以这里不必回滚审批记录（回滚反而会让前端拿到的 PENDING 失效）。
+            return denied_by_audit, None
         return (
             ToolResult.fail(
                 f"工具【{tool_call.tool_name}】需要您核对信息并明确确认，尚未执行。",

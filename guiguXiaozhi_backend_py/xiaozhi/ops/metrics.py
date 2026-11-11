@@ -13,7 +13,7 @@ import time
 from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Deque, Dict, Iterator, Optional
+from typing import Any, Deque, Dict, Iterator, List, Optional
 
 DEFAULT_COUNTERS = (
     "requests_total",
@@ -31,6 +31,11 @@ DEFAULT_COUNTERS = (
     "false_confirmation_truncated",
     "narrated_tool_call_retries",
     "textual_tool_call_truncated",
+    # Phase 6：审计写盘失败次数。fail-closed 时每次失败都会拒绝执行，
+    # 这个计数器是「为什么工具突然全部不可用」的第一现场。
+    "audit_write_failed_total",
+    # Phase 6：共享限流后端（Redis）故障次数。非零意味着聊天正在 503。
+    "rate_limit_backend_errors_total",
 )
 
 
@@ -141,6 +146,20 @@ class MetricsCollector:
             "histograms": {k: self._summarize(v).to_dict() for k, v in sorted(histograms.items())},
         }
 
+    def raw_samples(self, prefix: str = "") -> Dict[str, List[float]]:
+        """原始直方图样本（毫秒）。
+
+        只给 Prometheus 导出用：``snapshot()`` 里只有 count/avg/p50/p95，
+        而算 Prometheus 直方图的 ``_bucket`` 需要原始分布。返回副本，
+        调用方遍历时不会持有锁。
+        """
+        with self._lock:
+            return {
+                name: list(values)
+                for name, values in self._histograms.items()
+                if name.startswith(prefix)
+            }
+
     def summary(self) -> Dict[str, Any]:
         """给运维看的精简视图"""
         snap = self.snapshot()
@@ -173,6 +192,7 @@ class MetricsCollector:
             "textual_tool_call_truncated": counters.get(
                 "textual_tool_call_truncated", 0.0
             ),
+            "audit_write_failed_total": counters.get("audit_write_failed_total", 0.0),
             "latency": latency,
         }
 

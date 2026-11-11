@@ -128,8 +128,20 @@ class MilvusVectorStore(VectorStore):
         self.max_version = max_version
         self._lock = threading.Lock()
         self._client = None
+        # 版本化重建期间把读写固定到指定物理集合（None = 跟随别名）。
+        # 没有它就没法"先写新版本、再切别名"：upsert 走别名解析，
+        # 会写进**旧**集合，切换瞬间用户看到空索引。
+        self._pinned: Optional[str] = None
 
     # ---------- 内部工具 ----------
+
+    def pin_collection(self, name: Optional[str]) -> None:
+        """把读写固定到指定物理集合（版本化重建用），``None`` 恢复跟随别名。"""
+        self._pinned = name
+
+    @property
+    def pinned_collection(self) -> Optional[str]:
+        return self._pinned
 
     @property
     def client(self):
@@ -144,37 +156,52 @@ class MilvusVectorStore(VectorStore):
         return f"{self.alias}_v{version}"
 
     def _resolve_collection(self) -> Optional[str]:
-        """解析别名指向的物理集合（别名 → 同名物理集合 → 最高版本号集合）"""
+        """解析别名指向的物理集合（pin → 别名解析 → 同名集合 → 最高版本）
+
+        顺序有讲究：**必须先用 ``describe_alias`` 精确解析**。早期实现靠
+        "``has_collection(alias)`` → ``list_aliases(collection_name=alias)`` →
+        最高版本"兜底，而 ``list_aliases(collection_name=X)`` 的参数是**集合名**
+        而不是别名名，用别名去查永远返回空 → 一路掉到"最高版本"。
+        于是「回滚到 v1」之后解析仍返回 v2，回滚静默失效（Phase 6 踩到）。
+
+        另：家族里一个集合都没有时直接返回 None（首次灌库/新环境），
+        避免为了探一个不存在的别名让 pymilvus 打一串 ERROR 日志。
+        """
+        if self._pinned:
+            return self._pinned
         try:
-            if self.client.has_collection(self.alias):
-                return self.alias
+            names = set(self.client.list_collections())
+        except Exception:
+            return None
+        family = {
+            name
+            for name in names
+            if name == self.alias or name.startswith(f"{self.alias}_v")
+        }
+        if not family:
+            return None
+        # 1) describe_alias：精确拿到别名当前指向哪个物理集合
+        try:
+            info = self.client.describe_alias(self.alias) or {}
+            target = info.get("collection_name") or info.get("collection")
+            if target and target != self.alias and target in names:
+                return target
         except Exception:
             pass
-        try:
-            info = self.client.list_aliases(collection_name=self.alias) or {}
-            aliases = info.get("aliases") or []
-            for alias_target in aliases:
-                # 悬空别名（指向已删除的集合）要跳过
-                try:
-                    if self.client.has_collection(alias_target):
-                        return alias_target
-                except Exception:
-                    continue
-        except Exception:
-            pass
-        # 兜底：取版本号最高的物理集合
-        try:
-            versions = []
-            for name in self.client.list_collections():
-                if name.startswith(f"{self.alias}_v"):
-                    try:
-                        versions.append((int(name.rsplit("_v", 1)[1]), name))
-                    except ValueError:
-                        continue
-            if versions:
-                return max(versions)[1]
-        except Exception:
-            pass
+        # 2) 同名物理集合（不解别名也能读到）
+        if self.alias in names:
+            return self.alias
+        # 3) 兜底：取版本号最高的物理集合（describe_alias 不可用时只剩这条路）
+        versions = []
+        for name in family:
+            if not name.startswith(f"{self.alias}_v"):
+                continue
+            try:
+                versions.append((int(name.rsplit("_v", 1)[1]), name))
+            except ValueError:
+                continue
+        if versions:
+            return max(versions)[1]
         return None
 
     def switch_alias(self, target_collection: str) -> None:
@@ -200,13 +227,21 @@ class MilvusVectorStore(VectorStore):
         """
         dropped: List[str] = []
         try:
-            names = [
-                n
-                for n in self.client.list_collections()
-                if n.startswith(f"{self.alias}_v")
-            ]
+            # 必须按**版本号**排序再截断：``list_collections()`` 的返回顺序
+            # 不保证递增（实测出现过 v1,v3,v2），直接切片会把最新版本删掉、
+            # 留下更旧的 —— 而"保留最近 keep 个"正是切片的全部意义。
+            versions: List[tuple] = []
+            for name in self.client.list_collections():
+                if not name.startswith(f"{self.alias}_v"):
+                    continue
+                try:
+                    versions.append((int(name.rsplit("_v", 1)[1]), name))
+                except ValueError:
+                    continue
+            versions.sort()
             current = self._resolve_collection()
-            for name in names[:-keep] if keep > 0 else names:
+            candidates = versions[:-keep] if keep > 0 else versions
+            for _version, name in candidates:
                 if name == current:
                     continue  # 别名当前指向的集合不能删
                 try:
@@ -291,6 +326,48 @@ class MilvusVectorStore(VectorStore):
                 except ValueError:
                     continue
         return (max(versions) + 1) if versions else 1
+
+    # ---------- 版本管理（灌库脚本用）----------
+
+    def list_versions(self) -> List[int]:
+        """已存在的版本号（升序）"""
+        versions: List[int] = []
+        for name in self.client.list_collections():
+            if name.startswith(f"{self.alias}_v"):
+                try:
+                    versions.append(int(name.rsplit("_v", 1)[1]))
+                except ValueError:
+                    continue
+        return sorted(versions)
+
+    def current_version(self) -> Optional[int]:
+        """别名当前指向的版本号（无法解析返回 None）"""
+        current = self._resolve_collection()
+        if not current or not current.startswith(f"{self.alias}_v"):
+            return None
+        try:
+            return int(current.rsplit("_v", 1)[1])
+        except ValueError:
+            return None
+
+    def create_new_version(self, dimension: int) -> str:
+        """建一个全新的版本化集合并返回其名字（**不切别名**）。
+
+        调用方负责把写入 pin 到它、灌完校验、再 ``switch_alias``。
+        """
+        version = self._next_version()
+        name = self._create_versioned(version, dimension)
+        self.client.load_collection(name)
+        return name
+
+    def switch_to_version(self, version: int) -> str:
+        """把别名切到指定版本（回滚用）"""
+        name = self._versioned_name(version)
+        if not self.client.has_collection(name):
+            raise ValueError(f"集合不存在：{name}")
+        self.client.load_collection(name)
+        self.switch_alias(name)
+        return name
 
     def upsert(self, chunks: Sequence[Chunk]) -> int:
         """幂等写入 —— 主键为 chunk.id（内容哈希），重复写入即覆盖"""

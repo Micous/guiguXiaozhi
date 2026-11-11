@@ -44,6 +44,11 @@ def his_ready(monkeypatch):
         "approval_enabled": True,
         # Phase 5（P1-01）：生产必须开启会话存储快速失败
         "storage_fail_fast": True,
+        # Phase 6：审计必须 fail-closed 且集中存储；灌库必须移出 Web 进程
+        "audit_fail_closed": True,
+        "audit_sink": "file,mongo",
+        "rag_ingest_on_startup": False,
+        "rag_require_index": True,
     }
 
 
@@ -89,11 +94,11 @@ def test_production_env_aliases_detected(env):
 
 
 def test_production_reports_all_problems_at_once():
-    """默认配置下 6 项不合规（画像默认关，故不含密钥项），一次报全。"""
+    """默认配置下 10 项不合规（画像默认关，故不含密钥项），一次报全。"""
     with pytest.raises(ProductionConfigError) as exc:
         validate_production_settings(prod())
     msg = str(exc.value)
-    assert "共 6 项不合规" in msg
+    assert "共 10 项不合规" in msg
     for token in (
         "permission_no_ui",
         "mysql_password",
@@ -101,6 +106,10 @@ def test_production_reports_all_problems_at_once():
         "auth_enabled",
         "approval_enabled",
         "storage_fail_fast",
+        "audit_fail_closed",
+        "audit_sink",
+        "rag_ingest_on_startup",
+        "rag_require_index",
     ):
         assert token in msg
     assert "APP_ENV=development" in msg  # 错误信息要给出可执行的修复方向

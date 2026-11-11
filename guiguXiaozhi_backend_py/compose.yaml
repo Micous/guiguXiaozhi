@@ -1,12 +1,26 @@
-# Python 版后端容器。
+# Python 版后端容器 —— **本地联调 / 内网演示** profile。
+#
 # MySQL / MongoDB / Milvus / Ollama 仍由宿主机的 ./start-local.sh 启动，
 # 容器通过 host.docker.internal 回连，避免与现有容器编排冲突。
 #
 #   cd guiguXiaozhi_backend_py && docker compose up --build -d
-#   curl http://localhost:8081/health
+#   curl http://localhost:8081/health          # liveness
+#   curl http://localhost:8081/ready           # readiness（依赖外部服务）
 #
-# Linux 上 host.docker.internal 由下面的 extra_hosts 映射；
-# macOS / Windows 的 Docker Desktop 原生支持。
+# ⚠️ 本文件刻意保留 development 口径（默认口令来自环境变量，缺省 123456），
+#    **只用于本地与内网演示**。面向真实患者时必须：
+#      APP_ENV=production + 强口令/密钥全程由密钥管理注入 + 接真实 HIS，
+#    否则启动门禁（config_guard）会直接拒绝启动 —— 这是设计，不是 bug。
+#
+# 资源与安全限制（Phase 6）：
+#   * read_only：根文件系统只读，应用无法落任何未声明的文件；
+#     需要写的只有 /app/logs（审计 JSONL + trace）与 /tmp，各自单独挂载；
+#   * no-new-privileges：禁止通过 setuid 提权；
+#   * deploy.resources.limits：单容器上限，防止一次 RAG 灌库把宿主机打满。
+#
+# readiness 不要写成 docker HEALTHCHECK：它依赖 Ollama/Milvus/MySQL/Mongo，
+# 依赖抖动会导致容器被反复重启（把"依赖暂时不可用"放大成"服务不可用"）。
+# 编排层（k8s readinessProbe / 网关）应探 /ready，容器自愈只看 /health。
 
 services:
   xiaozhi-py:
@@ -16,15 +30,37 @@ services:
     ports:
       - "8081:8081"
     environment:
+      APP_ENV: ${APP_ENV:-development}
       HOST: 0.0.0.0
       PORT: 8081
       OLLAMA_BASE_URL: http://host.docker.internal:11434
       MILVUS_URI: http://host.docker.internal:19530
       MYSQL_HOST: host.docker.internal
       MYSQL_PORT: 3306
+      MYSQL_USER: ${MYSQL_USER:-root}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-123456}
       MONGO_URI: mongodb://host.docker.internal:27017
       LOG_LEVEL: INFO
       JSON_LOGS: "true"
+      # 多实例部署：灌库交给 scripts/ingest_knowledge.py，Web 只读挂载
+      RAG_INGEST_ON_STARTUP: ${RAG_INGEST_ON_STARTUP:-true}
+      RATE_LIMIT_BACKEND: ${RATE_LIMIT_BACKEND:-memory}
+    volumes:
+      # 审计与 trace 必须落在容器外：容器重启不该丢审计
+      - xiaozhi-logs:/app/logs
+    tmpfs:
+      - /tmp
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1024M
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
+
+volumes:
+  xiaozhi-logs:

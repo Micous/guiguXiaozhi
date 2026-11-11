@@ -76,7 +76,10 @@ class HealthChecker:
 
 
 class RateLimiter:
-    """滑动窗口限流（线程安全）"""
+    """滑动窗口限流（线程安全，**进程内**）
+
+    多实例部署时每个实例各有一份额度，需要 ``ops.redis_limiter.RedisRateLimiter``。
+    """
 
     def __init__(
         self,
@@ -102,6 +105,10 @@ class RateLimiter:
         bucket.append(now)
         return True
 
+    async def allow_async(self, key: str) -> bool:
+        """异步入口：与 ``RedisRateLimiter`` 保持同一契约，路由无需区分后端。"""
+        return self.allow(key)
+
     def remaining(self, key: str) -> int:
         now = self._clock()
         bucket = self._hits[str(key)]
@@ -119,6 +126,7 @@ class RateLimiter:
 
     def snapshot(self) -> Dict[str, Any]:
         return {
+            "backend": "memory",
             "max_requests": self.max_requests,
             "window_seconds": self.window,
             "active_keys": len(self._hits),

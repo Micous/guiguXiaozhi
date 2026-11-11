@@ -1,0 +1,86 @@
+name: CI
+
+# 上线门禁的第一道闸：不依赖任何外部服务（Ollama / Milvus / MySQL / Mongo 都不起），
+# 纯离线单测 + 静态检查 + 前端构建。真实依赖的联调用 tests/integration（默认 skip）。
+#
+# 三条纪律：
+#   1. 离线可跑：CI 里不出现任何需要真实数据库/模型的步骤，否则红灯不代表代码坏了；
+#   2. lint 只拦确定性错误（未定义名 / 语法错误 / 重复定义 / 变量遮蔽），
+#      未使用 import 这类债务只打印不阻断 —— 让 CI 常红比不跑更糟；
+#   3. 依赖扫描现阶段不阻断（见 deps job 的注释），观察一段时间后再收紧。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend-test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: guiguXiaozhi_backend_py
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: guiguXiaozhi_backend_py/requirements.txt
+
+      - name: 安装依赖
+        run: pip install -r requirements.txt
+
+      - name: 语法检查
+        run: python -m compileall -q xiaozhi scripts
+
+      - name: 静态检查（ruff，只拦确定性错误）
+        # 规则集刻意收窄：E9 语法错误 / F63 无效转义 / F7 未定义名 /
+        # F82 其它确定性缺陷 / F811 重复定义。
+        # 未使用 import（F401）等债务**不阻断** —— 让 CI 常红等于没人看 CI。
+        run: |
+          pip install ruff==0.17.4
+          ruff check xiaozhi scripts tests --select E9,F63,F7,F82,F811 --output-format concise
+
+      - name: 离线单测（不依赖外部服务）
+        run: python -m pytest tests/ -q
+
+  deps-scan:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: guiguXiaozhi_backend_py
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      # 现阶段**不阻断**：首次接入，先观察告警质量再收紧为阻断。
+      # 已知债：mysql-connector-python / pymilvus 的间接依赖可能报 CVE，
+      # 需要升级或明确豁免后再改 continue-on-error: false。
+      - name: pip-audit
+        run: |
+          pip install pip-audit
+          pip-audit -r requirements.txt
+
+  frontend-build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: guiguXiaozhi_frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: guiguXiaozhi_frontend/package-lock.json
+      - run: npm ci
+      - run: npm run build

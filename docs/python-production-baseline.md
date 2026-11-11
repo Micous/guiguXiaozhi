@@ -542,3 +542,94 @@ P0-06 整改时本列与 `appointment.id_card` 一并切到 `patient_ref`。
 3. **患者主档未接**（本地只存 `patient_ref`，不建 HIS 侧患者档案）；
 4. **对账 Job 未接生产调度**（cron / CronJob）；
 5. **P0-06 未完成**：`patient_ref` 已落库，但存量数据与本地查重键仍依赖明文 id_card。
+
+---
+
+## 14. Phase 6 增量复核（2026-11-11，观测集中化与部署加固）
+
+> 结论先行：**M4「生产可运维」的代码侧条件达成**，但这个 M4 不等于可上线 ——
+> 真实 HIS（Phase 3b 沙箱）、TLS/密钥托管、合规签署仍在外部门槛上。
+> 2 项新门禁（审计 fail-closed / 灌库移出 Web）让 production **更难启动**，
+> 而不是更容易 —— 这是有意为之。
+
+### 14.1 P1-01 存储降级 / P1-05 配置安全的补强
+
+| 项 | 之前 | 现在 |
+|---|---|---|
+| 会话存储失败策略 | strict Mongo + 503（Phase 5） | 不变，`/ready` 有 mongo 探针 |
+| 配置安全 | 启动门禁 8 项 | **10 项**（新增审计与灌库）；非 root 镜像；CI 流水线 |
+| 审计 | 本地 JSONL，写失败静默 `pass` | 多 sink（文件/Mongo）+ **fail-closed** + 写失败计数 |
+| 指标 | `/metrics` JSON（人看） | 增加 `/metrics/prometheus`（机器抓，标签闭集） |
+| 限流 | 进程内滑动窗口 | 可选 Redis 共享计数（多实例额度一致） |
+| 知识库灌库 | Web 启动时灌（每实例一份写操作） | 单写者 Job + 只读挂载 + 版本化 alias 切换/回滚 |
+
+### 14.2 交付与关键取舍
+
+1. **`scripts/ingest_knowledge.py`（单写者 Job）**
+   - `fcntl.flock` 非阻塞独占锁：第二个进程立刻退出 3（不是"查一下有没有人在跑"，
+     那有竞态窗口）；
+   - `--force`：建新版本集合 → `pin_collection` 把写固定到新集合 → 灌库 →
+     `count(settle=True)` 校验行数 → **校验通过才切 alias** → 按版本号清理旧版本；
+   - 校验不通过返回 4，**别名不切换**，旧索引继续服务（这条是真机验证的主路径）；
+   - `--rollback`：切回指定/上一版本，并把进度清单移成 `.rollback` ——
+     否则下次增量灌库会误判"文件没变"而跳过重建，集合停在旧版但清单说新版。
+2. **`RagService.mount_readonly()`（只读挂载）**
+   - 不解析/不分块/不嵌入/不写集合/不改清单；稀疏索引从现有集合取回块重建；
+   - `pending_changes()` 比对磁盘与清单 → 启动日志喊"有 N 个文件未灌库"。
+     这一条解决"改了知识库忘了跑 Job，用户拿到旧答案而 /health 一直 ok"。
+3. **Prometheus 导出**：纯渲染，真源仍是 `MetricsCollector`；标签只允许
+   `tool` / `outcome`（闭集），用户/会话/trace 一律不进 label；ms→s；
+   直方图带固定桶（0.005~300s）+ `_sum`/`_count`。
+4. **审计 fail-closed 的语义边界**（重要，别误解）：
+   - 执行**前**的审计（`permission_decision` / `approval_required`）失败 →
+     **工具不执行**，返回 `AuditUnavailable`；
+   - 执行**后**的审计（`tool_execution`）失败 → 副作用已经发生，只能告警 +
+     `audit_write_failed_total` 计数，属于对账范畴；
+   - 所以 fail-closed 保的是"没有无痕写操作"，不是"写操作失败可回滚"。
+5. **Redis 限流用固定窗口**（`INCR`），不是滑动窗口：
+   - 理由：`INCR` 单条命令原子，多实例读到的计数严格一致，没有"先查后写"竞态；
+     滑动窗口要 ZSET + Lua 才原子；
+   - 代价：窗口边界可能出现 2× 额度，对"防刷"可接受（文档已写明）；
+   - **后端故障 503 而不是 429**：429 会让用户以为"是我太快了"，而真实原因是
+     保护组件不可用；
+   - TTL 自愈：`INCR` 成功但 `EXPIRE` 前崩溃会留下永不过期的 key → 该用户被
+     永久限流，所以每次顺带检查 TTL。
+
+### 14.3 真机暴露并修复的三处缺陷
+
+1. **回滚静默失效**（最严重）：`_resolve_collection` 里
+   `list_aliases(collection_name=self.alias)` 的参数是**集合名**而不是别名名，
+   用别名去查永远返回空 → 一路掉到"取最高版本"兜底。于是「回滚到 v1」之后
+   解析仍返回 v2/v3，界面显示回滚成功但读的还是新集合。修正：先用
+   `describe_alias(alias)` 精确解析，且家族为空时直接返回（顺带消掉首次灌库时
+   一串 pymilvus `RPC error` 噪音）。
+2. **`drop_old_versions` 按名字切片**：`list_collections()` 顺序不保证递增
+   （实测 `v1,v3,v2`），`names[:-keep]` 会删掉最新版本、留下更旧的 ——
+   "保留最近 2 个"变成"保留最旧 2 个"，等于把可回滚版本删了。修正：先按
+   版本号排序再截断（新增单测）。
+3. **首次灌库的日志噪音**：见 1 的附带修正，容器日志里 `RPC error` 由 N 条降为 0。
+
+### 14.4 验收证据
+
+| 验收点 | 证据 |
+|---|---|
+| 单测 | `tests/unit/test_phase6_ops_and_ingest.py` 33 条（Prometheus 6 / 审计 5 / Redis 7 / 只读挂载 3 / 版本化 3 / Job 6 / 锁 1）+ 全量 **555 passed / 6 skipped** |
+| 真机灌库 | `--force` 两次：v1 → v3 →（校验 33 块 / 可见 33 行）→ 切别名 → 清理旧版本；`--list` 显示别名指向 |
+| 真机回滚 | `--rollback` 后 `--list` 显示 `→ 版本 1`（v3 仍在但不生效）——**证明 describe_alias 修正生效** |
+| 单写者锁 | 第二个进程退出码 **3** 且打印 `[locked]` |
+| 只读挂载启动 | 8082 日志 `RAG 只读挂载就绪：33 块（未写库）` + `知识库有 4 个文件的改动尚未灌库`（回滚移走清单后的预期提示）；`/ready` ok |
+| 索引缺失拒绝启动 | `RAG_INGEST_ON_STARTUP=false RAG_REQUIRE_INDEX=true` + 空集合 → `ProductionConfigError`，`Application startup failed` |
+| 镜像 | `docker build` 成功；容器 `Up (healthy)`；`/health` ok；`/metrics/prometheus` 36 行时序；`id` = `uid=10001(app)`；`touch /app/x` → `Read-only file system`；`/app/logs` 卷可写；启动日志 `RPC error` 计数 0 |
+| CI | 本地复跑 ruff（E9,F63,F7,F82,F811）`All checks passed`；前端 `npm run build` 成功 |
+
+### 14.5 残留（下一批/外部门槛）
+
+1. **`pip-audit` 依赖扫描已接入但 `continue-on-error: true`**：本地装不上
+   （pip 安装被沙箱中断），未验证告警质量，先观察再收紧为阻断；
+2. **CI 尚不含前端单测**（只有 build）与 type-check（无 mypy 配置）；
+3. **Trace 未集中存储**：trace 是诊断用途、单请求生命周期短，保持进程内 +
+   本地文件；审计才是"必须集中且不可丢"的那份（已接 Mongo sink）；
+4. **TLS / 密钥托管（Vault/KMS）/ 非 root 之外的运行时加固（seccomp、网络策略）**
+   仍属部署环境，仓库无法自证；
+5. **`production` 仍恒定拒绝启动**（`IMPLEMENTED_REAL_SLOT_ADAPTERS` 为空）——
+   Phase 3b 沙箱验收前不得放开。

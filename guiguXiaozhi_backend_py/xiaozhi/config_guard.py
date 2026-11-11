@@ -134,6 +134,34 @@ def validate_production_settings(settings: Settings) -> None:
             "生产必须接真实 HIS"
         )
 
+    # 9) 审计（Phase 6）：生产不允许"审计写失败照样执行"，也不允许审计只落容器内
+    #    本地文件 —— 容器一重启日志就没了，多实例下各自为政，等于没有审计。
+    if not settings.audit_fail_closed:
+        problems.append(
+            "audit_fail_closed=false → 生产必须开启审计失败关闭："
+            "无法留痕的写操作不得执行（审计盘满/不可写时应拒绝，而不是照样挂号）"
+        )
+    sink = (settings.audit_sink or "").strip().lower()
+    if "mongo" not in sink:
+        problems.append(
+            f"audit_sink={settings.audit_sink!r} → 生产审计必须集中存储（含 mongo）："
+            "本地 JSONL 在容器里随重启丢失，多实例也无法统一检索"
+        )
+
+    # 10) 知识库灌库（Phase 6）：生产只允许"只读挂载 + 单写者 Job"。
+    #     每个实例启动都灌库会在多副本下并发写同一集合，产生半成品索引；
+    #     而且索引为空时必须拒绝启动，不能静默降级成"没有医学知识也能答"。
+    if settings.rag_ingest_on_startup:
+        problems.append(
+            "rag_ingest_on_startup=true → 生产必须关闭启动期灌库："
+            "灌库应由 scripts/ingest_knowledge.py 单写者 Job 执行（多实例并发写同一集合会产生半成品索引）"
+        )
+    if not settings.rag_require_index:
+        problems.append(
+            "rag_require_index=false → 生产必须有索引才能启动："
+            "索引为空/不可达时应拒绝启动，而不是降级成『没有知识检索的医疗问答』"
+        )
+
     if problems:
         raise ProductionConfigError(
             f"APP_ENV=production 启动被拒绝，共 {len(problems)} 项不合规：\n  - "

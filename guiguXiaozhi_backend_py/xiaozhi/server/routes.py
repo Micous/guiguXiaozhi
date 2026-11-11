@@ -20,6 +20,8 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
 
 from xiaozhi.core.event import EventType
+from xiaozhi.ops.prometheus import render_prometheus
+from xiaozhi.ops.redis_limiter import RateLimitBackendError
 from xiaozhi.repositories.errors import RepositoryUnavailable
 from xiaozhi.reliability.tracing import new_trace_id, set_trace_id
 from xiaozhi.security.approval_service import (
@@ -161,7 +163,19 @@ async def chat(request: Request):
     # 限流：同一会话 + 来源 IP
     if container.settings.enable_rate_limit:
         key = f"{memory_id}:{_client_ip(request)}"
-        if not container.rate_limiter.allow(key):
+        try:
+            allowed = await container.rate_limiter.allow_async(key)
+        except RateLimitBackendError:
+            # 共享限流后端故障 → 503（不是 429）。429 会让用户以为"是我太快了"，
+            # 而真实原因是服务端保护组件不可用；两者运维处置完全不同。
+            container.metrics.inc("rate_limit_backend_errors_total")
+            logger.error("限流后端故障，拒绝请求（fail-closed）")
+            return PlainTextResponse(
+                "服务繁忙，请稍后重试。",
+                status_code=503,
+                media_type="text/plain; charset=utf-8",
+            )
+        if not allowed:
             container.metrics.inc("rate_limited_total")
             return PlainTextResponse(
                 "请求过于频繁，请稍后再试。",
@@ -458,6 +472,24 @@ async def forget_profile(user_key: str, request: Request):
         return JSONResponse({"detail": "画像功能未启用"}, status_code=404)
     removed = await container.profile_service.forget(user_key)
     return {"user_key": user_key, "removed": removed}
+
+
+@router.get("/metrics/prometheus")
+async def metrics_prometheus(request: Request):
+    """Prometheus 抓取端点（text/plain; version=0.0.4）。
+
+    与 ``/metrics``（JSON，供人看）分开：抓取端点要稳定、可缓存、字段最少，
+    而 JSON 视图是给人排查用的，字段随时会加 —— 混在一起会让每加一个字段
+    都变成一次"监控契约变更"。
+    """
+    _require_ops(request)
+    container = _container(request)
+    body = render_prometheus(
+        container.metrics.snapshot(), container.metrics.raw_samples()
+    )
+    return PlainTextResponse(
+        body, media_type="text/plain; version=0.0.4; charset=utf-8"
+    )
 
 
 @router.get("/audit")

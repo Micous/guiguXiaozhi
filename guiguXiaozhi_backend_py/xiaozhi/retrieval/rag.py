@@ -19,7 +19,6 @@ from xiaozhi.reliability.tracing import trace_span
 
 logger = logging.getLogger(__name__)
 from xiaozhi.retrieval.bm25 import BM25Index
-from xiaozhi.retrieval.chunker import Chunk
 from xiaozhi.retrieval.chunker import Chunk, Chunker
 from xiaozhi.retrieval.hybrid import HybridHit, HybridRetriever
 from xiaozhi.retrieval.manifest import Manifest, build_manifest, load_manifest, save_manifest
@@ -179,6 +178,68 @@ class RagService:
 
         stats.duration_ms = (time.perf_counter() - start) * 1000
         return stats
+
+    async def mount_readonly(self) -> RagStats:
+        """只读挂载现有索引（**不写向量库、不改清单**）。
+
+        与 ``bootstrap`` 的区别：
+          * 不解析 / 不分块 / 不嵌入 / 不写集合 / 不改进度清单 —— 灌库是
+            ``scripts/ingest_knowledge.py``（单写者 Job）的职责；
+          * 稀疏索引从**现有集合**取回块重建（bootstrap 用本次写入的块集，
+            因为刚写的数据在 Milvus 里还不可查）。
+
+        失败语义：Milvus 不可达 / 集合不存在 / 集合为空 → ``degraded=True``，
+        检索返回空；是否拒绝启动由 ``rag_require_index`` 决定（组合根判断）。
+        这里**不抛异常**：只读挂载失败不该让 Web 进程连健康检查都起不来，
+        但也绝不假装就绪 —— degraded 会写日志并让 /ready 的 milvus 探针暴露。
+        """
+        stats = RagStats()
+        start = time.perf_counter()
+        with trace_span("retrieval.mount_readonly") as span:
+            try:
+                rows = self.vector_store.all_texts()
+                chunks = [
+                    Chunk(id=doc_id, text=text, metadata=metadata or {})
+                    for doc_id, text, metadata in rows
+                ]
+                stats.chunks = len(chunks)
+                stats.files = len(
+                    {c.metadata.get("file_name", "") for c in chunks if c.metadata.get("file_name")}
+                )
+                span.set_attribute("chunk_count", len(chunks))
+                self._rebuild_bm25(chunks)
+                if not chunks:
+                    stats.degraded = True
+                    stats.error = "向量集合为空或不可达（请先运行灌库 Job）"
+                    self._degraded = True
+                else:
+                    self._ready = True
+                    self._degraded = False
+            except Exception as exc:
+                stats.degraded = True
+                stats.error = f"{type(exc).__name__}: {exc}"
+                self._degraded = True
+                span.set_error(stats.error)
+
+        stats.duration_ms = (time.perf_counter() - start) * 1000
+        return stats
+
+    def pending_changes(self) -> List[str]:
+        """知识库文件相对上次灌库清单的改动（只读，不写清单）。
+
+        只读实例靠它发现「改了知识库却忘了跑灌库 Job」——不然用户会拿到旧答案，
+        而 /health 一直是 ok。没有清单时返回全部文件（等于"从未灌过库"）。
+        只比内容哈希，不做分块（启动期开销要小）。
+        """
+        try:
+            current = build_manifest(self.knowledge_dir, {})
+            old = load_manifest(self.manifest_path)
+            if old.is_empty():
+                return sorted(current.files)
+            diff = old.diff(current.files)
+            return sorted(set(diff["update"]) | set(diff["remove"]))
+        except Exception:
+            return []
 
     def _rebuild_bm25(self, chunks: Optional[List[Chunk]] = None) -> None:
         """重建稀疏索引
