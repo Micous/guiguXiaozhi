@@ -215,7 +215,8 @@
 > `5b157f6`(P2-C 执行前门控) / `86295ea`(P2-D 审批 API + 确认 UI) /
 > `bfcd269`(P2-E1 重放预检修复)。
 > 真机验证用独立实例 8082/5174（`APPROVAL_ENABLED=true`、`APPROVAL_TTL_SECONDS=900`、
-> `AUTH_ENABLED=true`），**未改动用户正在跑的 8081/5173**；验完已停。
+> `AUTH_ENABLED=true`），验证期间**未改动用户正在跑的 8081/5173**；验完已停。
+> 全部验收通过后，经用户确认把审批也开到主实例 8081/5173 并做了同样的全链路复验（见 8.4 第 1 条）。
 
 ### 8.1 P0-02 状态变化
 
@@ -255,7 +256,7 @@
 
 ### 8.4 仍然存在的口径差异（不要误读为「已可上线」）
 
-1. **审批与认证都是灰度默认关**（`approval_enabled=false` / `auth_enabled=false`）：8081/5173 当前运行态只开了认证（本机 `.env`），**审批未开**；代码默认值未改以保住 406 个离线单测与一期零变更设计。
+1. **审批与认证在代码里都是灰度默认关**（`approval_enabled=false` / `auth_enabled=false`）：默认值未改以保住 406 个离线单测与一期零变更设计。**本机运行态例外**：2026-11-11 Phase 2 验收后已在 `guiguXiaozhi_backend_py/.env` 追加 `APPROVAL_ENABLED=true` / `APPROVAL_TTL_SECONDS=900`，并把 8081/5173 用最新代码重启；现在 5173 上认证与审批**都开**，每次预约/取消都会弹确认框。换机器部署需带上这两个 `.env`，或正式改代码默认值（会动测试基线）。TTL 给到 900s 是因为本地 7b 单轮 25~70s、两轮确认链路容易超过默认 120s。
 2. `permission_no_ui` 在 development 仍是 `allow`；审批开启后 L0 会先拦住写工具，但配置层面只靠 production 门禁强制 `deny`。
 3. **认证关闭时审批主体退化为 `anonymous`**：任何访客都能确认他人的写操作；组合根会打 WARN，production 门禁因强制 `auth_enabled=true` 不会出现此组合。
 4. **bootstrap 登录仍是过渡**（共享凭证换 JWT），正式上线须换 OIDC/网关并删 `/v1/auth/token`。
