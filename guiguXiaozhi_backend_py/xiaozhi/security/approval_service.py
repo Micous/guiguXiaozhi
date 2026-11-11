@@ -203,6 +203,31 @@ class ApprovalService:
         if existing is not None:
             return self._expire_if_needed(existing)
 
+        # 同一组参数**已经办过**（上一条记录是 CONSUMED/EXPIRED/REVOKED）：
+        # 幂等键是"同一件事只处理一次"的语义，但 ``uk_idempotency`` 是
+        # **表级唯一约束**，终态记录仍在表里 → 直接 INSERT 会撞唯一键。
+        # 2026-11-11 真机事故：这个 IntegrityError 一路抛到 HTTP 层，
+        # 用户看到的是"（服务暂时异常：IntegrityError）"。
+        #
+        # 处理：给新一轮请求换一个**带序号的**幂等键 —— 业务上仍是
+        # "同参数复用同一条待确认记录"，而"已办过的那次"不该阻塞新的一次。
+        attempt = 0
+        while True:
+            candidate_key = (
+                key if attempt == 0 else self._idempotency_key(
+                    principal.subject_id, session_id, task_id, tool_name,
+                    f"{args_hash}#{attempt}",
+                )
+            )
+            stale = self.repository.find_by_key(candidate_key)
+            if stale is None:
+                key = candidate_key
+                break
+            attempt += 1
+            if attempt > 20:  # 兜底：极端情况下不要死循环
+                key = f"{key}#{self._now().timestamp()}"
+                break
+
         now = self._now()
         record = ApprovalRecord(
             approval_id=f"ap-{secrets.token_urlsafe(18)}",

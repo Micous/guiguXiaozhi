@@ -9,12 +9,17 @@ CONSUMED。InMemory 用锁、MySQL 用带条件的单条 UPDATE + rowcount，避
 from __future__ import annotations
 
 import json
+import logging
 import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional
+
+import mysql.connector
+
+logger = logging.getLogger(__name__)
 
 
 class ApprovalStatus(str, Enum):
@@ -81,6 +86,10 @@ class ApprovalRepository(ABC):
     @abstractmethod
     def find_active_by_key(self, idempotency_key: str) -> Optional[ApprovalRecord]:
         """按业务幂等键找仍可用的请求（PENDING/APPROVED 且未过期），避免重复弹框"""
+
+    @abstractmethod
+    def find_by_key(self, idempotency_key: str) -> Optional[ApprovalRecord]:
+        """按业务幂等键找**任意状态**的记录（含终态），用于判断"是否已办过" """
 
     @abstractmethod
     def get_by_token_hash(self, token_hash: str) -> Optional[ApprovalRecord]:
@@ -154,6 +163,13 @@ class InMemoryApprovalRepository(ApprovalRepository):
                 if record.idempotency_key != idempotency_key or record.is_terminal:
                     continue
                 return record
+            return None
+
+    def find_by_key(self, idempotency_key: str) -> Optional[ApprovalRecord]:
+        with self._lock:
+            for record in self._rows.values():
+                if record.idempotency_key == idempotency_key:
+                    return record
             return None
 
     def get_by_token_hash(self, token_hash: str) -> Optional[ApprovalRecord]:
@@ -305,30 +321,46 @@ class MySQLApprovalRepository(ApprovalRepository):
         conn = self._connect()
         try:
             cursor = conn.cursor()
-            cursor.execute(
-                f"INSERT INTO approval_requests ({_MYSQL_COLUMNS}) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-                (
-                    record.approval_id,
-                    record.subject_id,
-                    record.session_id,
-                    record.task_id,
-                    record.tool_name,
-                    record.canonical_args_hash,
-                    json.dumps(record.args_preview, ensure_ascii=False),
-                    record.resource_scope,
-                    record.status.value,
-                    record.expires_at,
-                    record.created_at,
+            try:
+                cursor.execute(
+                    f"INSERT INTO approval_requests ({_MYSQL_COLUMNS}) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    (
+                        record.approval_id,
+                        record.subject_id,
+                        record.session_id,
+                        record.task_id,
+                        record.tool_name,
+                        record.canonical_args_hash,
+                        json.dumps(record.args_preview, ensure_ascii=False),
+                        record.resource_scope,
+                        record.status.value,
+                        record.expires_at,
+                        record.created_at,
+                        record.idempotency_key,
+                        record.token_hash,
+                        record.approved_by,
+                        record.approved_at,
+                        record.consumed_at,
+                    ),
+                )
+                conn.commit()
+            except mysql.connector.IntegrityError:
+                # 幂等键撞唯一约束（uk_idempotency）：并发同参请求，
+                # 或同参数请求在上一条记录已 CONSUMED/EXPIRED 后再次发起。
+                #
+                # 2026-11-11 真机事故：这个异常一路抛到 HTTP 层，
+                # 用户看到的是"（服务暂时异常：IntegrityError）"——
+                # 一个**用户无法理解、也无法自行修复**的 500。
+                # 幂等键的意义本来就是"同一件事只处理一次"，
+                # 撞键说明**已经有记录了**，不是系统故障 → 回滚并按已存在处理。
+                conn.rollback()
+                logger.warning(
+                    "审批幂等键已存在，按已存在处理：key=%s",
                     record.idempotency_key,
-                    record.token_hash,
-                    record.approved_by,
-                    record.approved_at,
-                    record.consumed_at,
-                ),
-            )
-            conn.commit()
-            cursor.close()
+                )
+            finally:
+                cursor.close()
         finally:
             conn.close()
 
@@ -348,6 +380,29 @@ class MySQLApprovalRepository(ApprovalRepository):
                 f"SELECT {_MYSQL_COLUMNS} FROM approval_requests "
                 "WHERE idempotency_key=%s AND status IN ('PENDING','APPROVED') "
                 "AND expires_at > NOW() LIMIT 1",
+                (idempotency_key,),
+            )
+            row = cursor.fetchone()
+            cursor.close()
+            return self._row_to_record(row) if row else None
+        finally:
+            conn.close()
+
+    def find_by_key(self, idempotency_key: str) -> Optional[ApprovalRecord]:
+        """按幂等键查**任意状态**的记录（含 CONSUMED/EXPIRED/REVOKED）。
+
+        与 ``find_active_by_key`` 的区别：后者只找"仍可用的"（PENDING/APPROVED
+        且未过期），用于避免重复弹框；本方法用于判断
+        "这组参数是不是已经办过了"——同参数重复发起时，
+        ``uk_idempotency`` 唯一约束会拦住 INSERT，
+        必须在**插入前**就知道终态记录的存在。
+        """
+        conn = self._connect()
+        try:
+            cursor = conn.cursor(dictionary=True)
+            cursor.execute(
+                f"SELECT {_MYSQL_COLUMNS} FROM approval_requests "
+                "WHERE idempotency_key=%s LIMIT 1",
                 (idempotency_key,),
             )
             row = cursor.fetchone()
