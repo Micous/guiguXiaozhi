@@ -20,6 +20,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
 
 from xiaozhi.core.event import EventType
+from xiaozhi.repositories.errors import RepositoryUnavailable
 from xiaozhi.reliability.tracing import new_trace_id, set_trace_id
 from xiaozhi.security.approval_service import (
     ApprovalContext,
@@ -98,6 +99,11 @@ async def chat(request: Request):
     approval_token = str(
         payload.get("approvalToken") or payload.get("approval_token") or ""
     )
+    # Phase 5：客户端可选的请求幂等键（同一键重复提交只产生一个逻辑任务）。
+    # 缺省即 None —— 每个请求都是独立任务。
+    task_idempotency_key = str(
+        payload.get("idempotencyKey") or payload.get("idempotency_key") or ""
+    ).strip() or None
 
     if container.settings.auth_enabled:
         # 身份不再取自请求体：一律以 token 主体为准（P0-01）。
@@ -167,6 +173,21 @@ async def chat(request: Request):
     trace_id = new_trace_id()
     set_trace_id(trace_id)
 
+    # Phase 5（P1-01）：快速失败模式下 Mongo 是硬依赖 —— 必须在响应头
+    # 尚未发出的**此时**探测，才能以 503 拒绝；一旦进入 StreamingResponse
+    # 状态码就无法更改了（流内只能吐文本，前端拿不到可判别的失败）。
+    if container.settings.storage_fail_fast:
+        try:
+            await container.conversation_store.ping()
+        except RepositoryUnavailable:
+            logger.warning("会话存储 ping 失败，chat 拒绝：trace=%s", trace_id)
+            container.metrics.inc("storage_unavailable_total")
+            return PlainTextResponse(
+                "会话存储暂时不可用，请稍后重试。",
+                status_code=503,
+                media_type="text/plain; charset=utf-8",
+            )
+
     # format=events：结构化 SSE（每事件一行 data: {json}），
     # 供新前端/调试工具还原完整执行过程；默认裸文本，前端零改动
     events_mode = (request.query_params.get("format") or "text").lower() == "events"
@@ -186,7 +207,12 @@ async def chat(request: Request):
             async with container.shutdown.inflight_request():
                 try:
                     async for event in container.engine.run(
-                        memory_id, message, user_id=user_id
+                        memory_id, message, user_id=user_id,
+                        **(
+                            {"task_idempotency_key": task_idempotency_key}
+                            if getattr(container.settings, "task_tracking_enabled", False)
+                            else {}
+                        ),
                     ):
                         if events_mode:
                             yield event.to_sse()
@@ -205,6 +231,11 @@ async def chat(request: Request):
                             )
                         elif event.event_type == EventType.ERROR:
                             yield f"\n\n（出错了：{event.metadata.get('error')}）"
+                except RepositoryUnavailable:
+                    # Phase 5：存储故障如实说，不伪装成业务失败或空历史
+                    logger.warning("会话存储故障（流内）：trace=%s", trace_id)
+                    container.metrics.inc("storage_unavailable_total")
+                    yield "\n\n（会话存储暂时不可用，本次对话未能保存，请稍后重试。）"
                 except Exception as exc:  # 兜底：任何异常都要给用户一个可读的回复
                     logger.exception("对话异常")
                     if events_mode:

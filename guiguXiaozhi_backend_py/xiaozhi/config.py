@@ -72,6 +72,20 @@ class Settings(BaseSettings):
     mysql_database: str = "guiguxiaozhi"
     mongo_uri: str = "mongodb://localhost:27017"
     mongo_database: str = "chat_memory_db"
+    # Phase 5（P1-01，灰度默认关）：会话存储快速失败模式。
+    # true：Mongo strict（故障抛 RepositoryUnavailable 不伪装空历史）+ 不包
+    #   Resilient 本地文件降级 + chat 前置 ping 探测失败返回 503；
+    # false：一期行为（Resilient 降级），内网演示/开发不受影响。
+    # production 门禁强制要求 true（config_guard 第 7 项）。
+    storage_fail_fast: bool = False
+
+    # ---------- Phase 5（P1-02）：任务生命周期持久化（灰度默认关） ----------
+    # true：AgentTask/AgentExecution/ToolExecution/TaskEvent 落 MySQL，
+    #   启动时执行崩溃恢复扫描（超时 RUNNING→INTERRUPTED、STARTED→UNKNOWN）；
+    # false：一期行为（请求内局部状态），引擎零额外开销。
+    task_tracking_enabled: bool = False
+    # 恢复扫描：运行超过该秒数且无更新的 execution 视为进程已死
+    task_stale_after_seconds: float = 600.0
 
     # ---------- 记忆 ----------
     memory_max_messages: int = 20

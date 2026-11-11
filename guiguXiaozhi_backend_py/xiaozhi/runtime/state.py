@@ -82,6 +82,10 @@ class TurnState:
     # entry = {"tool", "success", "content", "authoritative_status"}
     write_results: List[Dict[str, Any]] = field(default_factory=list)
 
+    # ---- Phase 5 任务生命周期持久化（task_tracker 装配时由 run() 填写）----
+    task_id: Optional[str] = None
+    execution_id: Optional[str] = None
+
     # ---- 查询能力 ----
 
     def tool_can_execute(self) -> bool:

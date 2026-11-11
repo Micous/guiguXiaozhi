@@ -114,6 +114,15 @@ def validate_production_settings(settings: Settings) -> None:
             "缺少用户明确确认与一次性 token 绑定，不得执行预约/取消"
         )
 
+    # 7) 会话存储失败策略（审计 P1-01）：生产禁止把 Mongo 故障静默降级成
+    #    本地文件 —— 本地文件不是多副本共享会话的合法故障转移目标，
+    #    降级期间写的会话在恢复后成为"第二个数据源"，需要人工合并。
+    if not settings.storage_fail_fast:
+        problems.append(
+            "storage_fail_fast=false → 生产必须开启会话存储快速失败（strict Mongo）："
+            "禁止自动降级本地文件；Mongo 故障应表现为聊天 503 与 /ready 失败"
+        )
+
     if problems:
         raise ProductionConfigError(
             f"APP_ENV=production 启动被拒绝，共 {len(problems)} 项不合规：\n  - "

@@ -456,6 +456,15 @@ class EnginePhases:
                 tool_span.set_attribute("tool_name", call.name)
                 tool = self.tool_registry.get(call.name)
 
+                # ---- Phase 5：工具执行**前**落 STARTED ----
+                # 崩溃恢复时据此判断"这个工具可能有副作用"，标记为 UNKNOWN
+                # 后必须先查业务事实，不可盲目重试（否则重复挂号）。
+                tool_exec_id = None
+                if self.task_tracker is not None:
+                    tool_exec_id = self.task_tracker.tool_started(
+                        call.id, call.name, call.arguments
+                    )
+
                 if tool is None:
                     tool_span.set_error("工具未注册")
                     tool_result = ToolResult.fail(
@@ -487,6 +496,12 @@ class EnginePhases:
                 # 完成态表述以业务服务的 ToolResult 为准（不让模型总结成败）；
                 # UNKNOWN（authoritative_status）在请求收尾时换固定文案。
                 state.record_write_result(call.name, tool_result)
+
+                # ---- Phase 5：工具执行后落终态（写工具成功 → 副作用已提交）----
+                if self.task_tracker is not None:
+                    self.task_tracker.tool_finished(
+                        tool_exec_id, call.name, success=tool_result.success
+                    )
 
                 self.metrics.record_tool(call.name, tool_result.success)
                 self.metrics.observe(
@@ -948,6 +963,18 @@ class EnginePhases:
             self.metrics.inc("errors_total")
         if result.degraded:
             self.metrics.inc("degraded_total")
+
+        # ---- Phase 5：任务终态化 ----
+        # 有 error → FAILED；否则 SUCCEEDED。审批短路（等待用户确认）不是
+        # 失败 —— 那种情况任务停在 WAITING_APPROVAL，由审批服务自己的
+        # 状态机管理（approval_requests 表）。
+        if self.task_tracker is not None:
+            if result.error:
+                self.task_tracker.finish("FAILED")
+            elif state.approval_required:
+                self.task_tracker.finish("WAITING_APPROVAL")
+            else:
+                self.task_tracker.finish("SUCCEEDED")
 
         yield AgentEndEvent(
             trace_id=trace_id,

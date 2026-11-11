@@ -340,3 +340,62 @@
 1. 裸"成功了"（无预约/取消上下文）不在 claim 语义内——写模式下工具失败后模型说孤立的"成功了"不会被拦；扩正则误伤面大（知识问答"手术很成功"），归 Phase 7 医疗内容评测集定夺。
 2. UNKNOWN 无生产者（Mock 恒定 CONFIRMED）；Phase 3b `his_client` 接入后需真机复验固定文案路径。
 3. 未知 claim 换皮句式仍靠既有正则（gate 与截断同源），零日换皮还是要靠评测集补正则——gate 保证的是"检测到的绝不漏出去"，不是"什么都能检测到"。
+
+------------------------------------------------------------------------
+
+## 11. Phase 5 增量复核（2026-11-11，P1-01 存储失败策略 + P1-02 任务生命周期）
+
+> 测试基线：**479 passed / 6 skipped**（离线，新增 20 条 Phase 5 验收）。
+> 本批对应路线图 Phase 5。审计 P1-01（会话存储故障自动降级）与 P1-02（运行时任务生命周期）由 `SOURCE_CONFIRMED` 变为 **PARTIALLY_FIXED + RUNTIME_VERIFIED**（8082 独立实例真机，双开关开启）。
+
+### 11.1 P1-01 会话存储失败策略
+
+| 审计原问题 | 本批处置 |
+|---|---|
+| `ResilientConversationStore` 主存储失败即切本地文件 | `storage_fail_fast` 开关（灰度默认关）：开启后组合根**只装 strict Mongo**，不包 Resilient；production 门禁新增**第 7 项**强制要求开启 |
+| Mongo 读写异常返回空列表 → 存储故障伪装成"新会话/空历史" | strict 模式抛 `RepositoryUnavailable`（分类异常，沿用 Phase 3a 的 `repositories/errors.py`）；非 strict 保持一期行为 |
+| 会话保存无并发保护（跨实例互相覆盖丢消息） | Mongo 文档新增 `version` 字段，save 走 CAS 条件更新；版本不匹配 → 重读对方的最新内容、按**消息语义签名**合并去重、以新版本重试（最多 3 次）；耗尽后 strict 抛 `ConcurrentWriteConflict`（**拒绝覆盖**） |
+| 无存活探针 | `MongoConversationStore.ping()` + `/ready` 注册 `mongo` 探针；chat 端点在**响应头发出前**探测 → 失败返回 **503**（流式响应一旦开始就无法改状态码，只能流内吐文本） |
+
+**为什么 chat 前置 ping 而不是只在 /ready**：流式响应一旦开始（`StreamingResponse` 已发头），状态码无法再改；Mongo 中途故障只能在流内以文本告知。因此必须在进入流之前探测，才能给出前端可判别的 503。
+
+**语义签名去重的坑**：`Message.to_dict()` 含 `message_id` 与 `timestamp`（每条都不同），直接用它做去重签名会让两条内容相同的历史消息签名不等 → 合并后出现重复消息。去重必须只用语义字段（role/content/tool_call_id/tool_name/tool_calls）。
+
+### 11.2 P1-02 任务生命周期持久化
+
+数据���构与审计 4.x 目标一致，落在迁移 003（`agent_tasks` / `agent_executions` / `tool_executions` / `task_events`）：
+
+| 组件 | 位置 | 职责 |
+|---|---|---|
+| `TaskRepository` | `repositories/task_repo.py` | InMemory + MySQL 双实现；幂等键重复返回**已存在**任务（只产生一个逻辑任务） |
+| `TaskTracker` | `runtime/task_tracker.py` | 引擎与仓储之间的薄封装；**所有方法捕获仓储异常只记日志** —— 追踪是可观测性不是业务依赖，追踪库挂了也不能让用户聊不了天 |
+| 工具执行前落 STARTED | `engine_phases._execute_tools` | 崩溃恢复据此判断"这个工具可能有副作用" |
+| 工具执行后落终态 | 同上 | 写工具（预约/取消）成功 → `side_effect_committed=1`；**查询类工具成功不算副作用**（没改变外部事实） |
+| 恢复扫描 | `TaskRepository.recover_stale` | RUNNING 超时 → INTERRUPTED（其 task → FAILED）；STARTED 超时 → **UNKNOWN（只标记，绝不自动重试）**；WAITING_APPROVAL 超时 → CANCELLED |
+| 组合根接线 | `application.get_application` | `task_tracking_enabled`（灰度默认关）→ 建表（失败直接抛错）+ **启动时执行恢复扫描** |
+
+**恢复语义的关键约束**：STARTED 的工具执行被标记为 UNKNOWN 后，**必须先查业务事实**再决定是否重试。本项目的业务事实依据是预约表的 `uk_appointment_active` 唯一约束 + `create_if_absent` 原子查重写入 —— 同参数重发会得到"已有预约"而不是重复挂号。因此恢复扫描**只标记不重试**，宁可让运维/用户重问一次，也不盲目重试造成重复挂号。
+
+**幂等键来源**：客户端显式提供（请求体 `idempotencyKey`），**绝不用请求文本派生** —— 同一句话重发（例如审批后重放）在业务上是两次独立请求，文本哈希会把它们错误并成一个任务。
+
+### 11.3 验收对号（`tests/unit/test_phase5_storage_and_task.py`，20 条）
+
+| # | 审计验收 | 证据 |
+|---|---|---|
+| P1-01-1 | Mongo 不可用 → 503 / 就绪失败，绝不写本地 fallback | `test_strict_mongo_read_failure_raises_not_empty_history`、`test_strict_mongo_write_failure_raises`、`test_mongo_ping_failure_raises_repository_unavailable`、`test_production_store_assembly_never_wraps_file_fallback`（源码级断言快速失败分支里没有 FileConversationStore） |
+| P1-01-2 | 两个并发请求写同一会话不丢消息 | `test_concurrent_write_does_not_lose_messages`（CAS 冲突 → 合并重试）、`test_merge_messages_keeps_both_sides_without_duplication` |
+| P1-01-3 | 存储恢复后不需人工合并两个数据源 | 不降级 → 只有一个数据源（结构性保证） |
+| P1-02-1 | LLM 期间进程退出 → INTERRUPTED，可重试 | `test_recover_stale_marks_running_execution_interrupted` |
+| P1-02-2 | 工具成功但写回前退出 → 先查业务事实不重复提交 | `test_recover_stale_marks_started_tool_unknown_not_retried`（UNKNOWN 只标记、记录数不变） |
+| P1-02-3 | 等待审批的任务重启后可继续或过期关闭 | `test_recover_stale_closes_expired_waiting_approval_task` |
+| P1-02-4 | 取消任务后不得继续执行未开始的工具 | `test_cancelled_task_is_not_resumed_by_recovery` |
+| P1-02-5 | 同一幂等键重复提交只产生一个逻辑任务 | `test_same_idempotency_key_yields_one_logical_task` |
+
+另有：写工具成功才标 `side_effect_committed`、查询工具成功**不**标、失败工具不标、追踪故障不打断对话（`test_tracking_failure_never_breaks_conversation`）、灰度关闭时引擎行为与 Phase 4 一致（`test_engine_without_tracker_has_no_side_effect`）。
+
+### 11.4 残留
+
+1. **迁移机制尚未接入启动流程**（沿用 Phase 3a 残留）：`schema_migrations` 由运维手动执行 Migrator，建表语句仍散在 `ensure_table()`/`ensure_tables()` 里；上线前需把 `run_migrations` 挂到组合根并把散落的 CREATE TABLE 收编为迁移脚本。
+2. **UNKNOWN 的处置流程是"人工/用户重问"**：恢复扫描只标记，不会自动查业务事实并补写结果。要做到"自动对账后收敛为 CONFIRMED"需要业务侧提供查询接口（Phase 3b HIS 侧）。
+3. **任务表按 subject_id 建了索引但没有清理策略**：长期运行会无限增长，需要归档/TTL 策略（可归 Phase 6 观测集中化批次）。
+4. **审批等待中的任务与 approval_requests 表是两套状态**：审批服务自己管 PENDING→APPROVED→CONSUMED，任务表只记 WAITING_APPROVAL。两者的原子性未做跨表事务（当前靠恢复扫描的过期关闭兜底）。

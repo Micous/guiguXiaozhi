@@ -42,6 +42,8 @@ def his_ready(monkeypatch):
         "auth_secret_key": "a-32-character-minimum-secret-key-1234567890",
         "auth_bootstrap_secret": "bootstrap-secret",
         "approval_enabled": True,
+        # Phase 5（P1-01）：生产必须开启会话存储快速失败
+        "storage_fail_fast": True,
     }
 
 
@@ -87,17 +89,18 @@ def test_production_env_aliases_detected(env):
 
 
 def test_production_reports_all_problems_at_once():
-    """默认配置下 5 项不合规（画像默认关，故不含密钥项），一次报全。"""
+    """默认配置下 6 项不合规（画像默认关，故不含密钥项），一次报全。"""
     with pytest.raises(ProductionConfigError) as exc:
         validate_production_settings(prod())
     msg = str(exc.value)
-    assert "共 5 项不合规" in msg
+    assert "共 6 项不合规" in msg
     for token in (
         "permission_no_ui",
         "mysql_password",
         "slot_service_impl",
         "auth_enabled",
         "approval_enabled",
+        "storage_fail_fast",
     ):
         assert token in msg
     assert "APP_ENV=development" in msg  # 错误信息要给出可执行的修复方向
@@ -266,3 +269,20 @@ def test_production_rejects_approval_disabled(his_ready):
         validate_production_settings(prod(**{**his_ready, "approval_enabled": False}))
     assert "approval_enabled" in str(exc.value)
     assert "一次性 token" in str(exc.value)
+
+
+# ---------------------------------------------------------------- 存储门禁（P5 / P1-01）
+
+
+def test_development_storage_fail_fast_defaults_off():
+    """红线：默认仍走 Resilient 降级（内网演示不受影响）。"""
+    s = Settings(_env_file=None)
+    assert s.storage_fail_fast is False
+
+
+def test_production_rejects_storage_degradation(his_ready):
+    """生产禁止把 Mongo 故障静默降级成本地文件（会产生第二个数据源）。"""
+    with pytest.raises(ProductionConfigError) as exc:
+        validate_production_settings(prod(**{**his_ready, "storage_fail_fast": False}))
+    assert "storage_fail_fast" in str(exc.value)
+    assert "本地文件" in str(exc.value)

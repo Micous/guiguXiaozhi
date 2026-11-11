@@ -62,6 +62,7 @@ class AgentEngine(EnginePhases):
         tool_failure_threshold: int = 3,
         profile_injector=None,
         profile_service=None,
+        task_tracker=None,
     ) -> None:
         self.chat_model = chat_model
         self.tool_registry = tool_registry
@@ -82,12 +83,18 @@ class AgentEngine(EnginePhases):
         # P2 患者画像（灰度：profile_enabled=false 时两者均为 None，行为与一期完全一致）
         self.profile_injector = profile_injector
         self.profile_service = profile_service
+        # Phase 5 任务生命周期持久化（P1-02，灰度：task_tracking_enabled=false
+        # 时为 None，行为与 Phase 4 完全一致）。追踪失败绝不打断对话 ——
+        # 追踪是可观测性，不是业务依赖。
+        self.task_tracker = task_tracker
 
     async def run(
         self,
         memory_id: str,
         user_input: str,
         user_id: str = "anonymous",
+        *,
+        task_idempotency_key: Optional[str] = None,
     ) -> AsyncIterator[Event]:
         """跑一轮对话，产出事件流。
 
@@ -98,6 +105,10 @@ class AgentEngine(EnginePhases):
             4. _run_loop              主循环（预算/熔断守门 → 调模型 → 降级或收尾或执行工具）
             5. _persist_and_extract   落库 + 画像抽取钩子
             6. _finalize              指标收口 + AgentEnd
+
+        ``task_idempotency_key``（Phase 5）：客户端显式提供的幂等键。
+        **绝不用请求文本派生** —— 同一句话重发（例如审批后重放）在业务上
+        是两次独立请求，文本哈希会把它们错误并成一个任务。
         """
         trace_id = get_trace_id()
         result = AgentEngineResultHolder()
@@ -127,6 +138,17 @@ class AgentEngine(EnginePhases):
             state = self._new_turn_state(history, prep["operation_request"])
             # Phase 4：写操作模式（Response Gate 的完成态确定性门控）
             state.write_operation = bool(prep.get("write_operation"))
+
+            # 3.5 Phase 5：任务生命周期持久化（灰度关闭时 tracker 为 None，
+            #     行为与 Phase 4 完全一致）。追踪失败不打断对话。
+            if self.task_tracker is not None:
+                task_id, execution_id = self.task_tracker.begin(
+                    subject_id=user_id,
+                    session_id=memory_id,
+                    idempotency_key=task_idempotency_key,
+                )
+                state.task_id = task_id
+                state.execution_id = execution_id
 
             # 4. 主循环（最终轮数写入 loop_outcome["turns"]）
             loop_outcome: Dict[str, Any] = {}

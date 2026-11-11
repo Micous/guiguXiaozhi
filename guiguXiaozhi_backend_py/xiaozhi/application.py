@@ -39,9 +39,11 @@ from xiaozhi.repositories.appointment_repo import (
 )
 from xiaozhi.repositories.approval_repo import MySQLApprovalRepository
 from xiaozhi.repositories.session_repo import MySQLSessionRepository
+from xiaozhi.repositories.task_repo import MySQLTaskRepository
 from xiaozhi.retrieval.rag import RagService
 from xiaozhi.retrieval.vector_store import MilvusVectorStore
 from xiaozhi.runtime.engine import AgentEngine
+from xiaozhi.runtime.task_tracker import TaskTracker
 from xiaozhi.security.approval_service import ApprovalService
 from xiaozhi.security.auth import TokenService
 from xiaozhi.security.permissions import PermissionDecisionEngine
@@ -200,6 +202,30 @@ async def get_application(settings: Optional[Settings] = None) -> Application:
     trace_store.load_from_disk()
     set_default_store(trace_store)
 
+    # ---- Phase 5（P1-02）：任务生命周期持久化（灰度默认关）----
+    # 开启时：建表（失败直接抛错，不静默降级）+ 启动时执行崩溃恢复扫描。
+    # 恢复扫描只做标记（RUNNING→INTERRUPTED、STARTED→UNKNOWN），**绝不重试**：
+    # 副作用是否发生必须查业务事实（预约表唯一约束 + 原子查重写入兜底）。
+    task_tracker = None
+    if settings.task_tracking_enabled:
+        task_repo = MySQLTaskRepository(
+            settings.mysql_host,
+            settings.mysql_port,
+            settings.mysql_user,
+            settings.mysql_password,
+            settings.mysql_database,
+        )
+        task_repo.ensure_tables()
+        report = task_repo.recover_stale(settings.task_stale_after_seconds)
+        if report.interrupted_executions or report.unknown_tool_executions:
+            logger.warning(
+                "崩溃恢复扫描：中断执行 %d 个、待核实工具执行 %d 个（UNKNOWN 须查业务事实，勿重试）",
+                len(report.interrupted_executions),
+                len(report.unknown_tool_executions),
+            )
+        task_tracker = TaskTracker(task_repo, model_id=settings.ollama_chat_model)
+        logger.info("任务生命周期持久化已启用（task_tracking_enabled=true）")
+
     # ---- 运维组件 ----
     metrics = MetricsCollector()
     audit = AuditLogger(settings.audit_log_path)
@@ -268,12 +294,23 @@ async def get_application(settings: Optional[Settings] = None) -> Application:
     )
 
     # ---- 记忆 ----
-    conversation_store = ResilientConversationStore(
-        primary=MongoConversationStore(
-            settings.mongo_uri, settings.mongo_database
-        ),
-        fallback=FileConversationStore(str(Path(settings.trace_persist_dir).parent / "memory")),
-    )
+    # Phase 5（P1-01）：storage_fail_fast=true 时 Mongo strict + 不包降级 ——
+    # 存储故障表现为 503 与 /ready 失败，绝不静默切本地文件
+    # （本地文件不是多副本共享会话的合法故障转移目标，降级期间会分裂数据源）。
+    if settings.storage_fail_fast:
+        conversation_store = MongoConversationStore(
+            settings.mongo_uri,
+            settings.mongo_database,
+            strict=True,
+        )
+        logger.info("会话存储：strict 快速失败模式（storage_fail_fast=true）")
+    else:
+        conversation_store = ResilientConversationStore(
+            primary=MongoConversationStore(
+                settings.mongo_uri, settings.mongo_database
+            ),
+            fallback=FileConversationStore(str(Path(settings.trace_persist_dir).parent / "memory")),
+        )
 
     # ---- 工具 ----
     tool_registry = ToolRegistry()
@@ -319,9 +356,16 @@ async def get_application(settings: Optional[Settings] = None) -> Application:
     def _probe_mysql() -> dict:
         return {"ok": repository.list_all(limit=1) is not None}
 
+    async def _probe_mongo() -> dict:
+        # strict 模式下 Mongo 是硬依赖：挂了 /ready 必须失败（P1-01）
+        await conversation_store.ping()
+        return {"ok": True}
+
     health.register("model", _probe_model)
     health.register("milvus", _probe_milvus)
     health.register("mysql", _probe_mysql)
+    if settings.storage_fail_fast:
+        health.register("mongo", _probe_mongo)
 
     # ---- 权限 ----
     permission_engine = PermissionDecisionEngine.from_yaml(Path(settings.permissions_file))
@@ -438,6 +482,7 @@ async def get_application(settings: Optional[Settings] = None) -> Application:
         tool_failure_threshold=settings.tool_failure_threshold,
         profile_injector=profile_injector,
         profile_service=profile_service,
+        task_tracker=task_tracker,
     )
 
     return Application(

@@ -15,6 +15,15 @@
   * Mongo 异常记日志并计数，不再静默吞掉；
   * File 实现用"临时文件 + 原子替换"，进程崩溃不会写坏 JSON；
   * Resilient 降级后按冷却期自动重试主存储，成功即回归（不再一降到底）。
+
+Phase 5（2026-11-11 审计 P1-01 加固）：
+  * ``strict=True``：读写失败抛 ``RepositoryUnavailable``，不再把存储故障
+    伪装成"新会话/空历史"；production 组合根必须用 strict 且不包 Resilient
+    （Mongo 挂了 → 聊天 503 快速失败，绝不静默降级到本地文件）；
+  * Mongo 文档带 ``version`` 字段做 CAS 条件更新 —— 跨实例并发保存同一
+    会话时，过期写入不会直接覆盖：先重读合并（按消息签名去重）再重试，
+    彻底失败才报 ``ConcurrentWriteConflict``（非 strict 则留痕继续）；
+  * ``ping()``：有界存活探测（chat 前置探活 → 503、/ready 探针复用）。
 """
 
 from __future__ import annotations
@@ -30,8 +39,63 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from xiaozhi.core.message import Message
+from xiaozhi.repositories.errors import (
+    PersistenceError,
+    RepositoryError,
+    RepositoryUnavailable,
+)
 
 logger = logging.getLogger(__name__)
+
+
+class ConcurrentWriteConflict(RepositoryError):
+    """会话 CAS 并发写保护重试耗尽 —— 过期写入被拒绝且合并失败。
+
+    调用方应重试整个请求（下一轮 load 会拿到最新版本再改写）；
+    绝不能用旧快照继续覆盖（那会丢掉别的实例刚写的消息）。
+    """
+
+    def __init__(self, message: str = "会话并发写冲突，请重试") -> None:
+        super().__init__("concurrent_write_conflict", message)
+
+
+def _message_signature(message: Message) -> str:
+    """消息语义签名 —— 合并两份历史时按内容判等。
+
+    **只用语义字段**，不能用 ``to_dict()`` 全量：后者含 ``message_id`` 与
+    ``timestamp``（每条消息都不同），两条内容相同的历史消息签名会不相等
+    → 去重失效 → 合并后出现重复消息（实测踩过）。
+    """
+    return json.dumps(
+        {
+            "role": message.role.value,
+            "content": message.content,
+            "tool_call_id": message.tool_call_id,
+            "tool_name": message.tool_name,
+            "tool_calls": [
+                {"id": c.id, "name": c.name, "arguments": c.arguments}
+                for c in message.tool_calls
+            ],
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+    )
+
+
+def _merge_messages(ours: List[Message], theirs: List[Message]) -> List[Message]:
+    """合并两份会话历史：theirs（库里最新）为基底，ours 里库里没有的消息追加在后。
+
+    顺序语义：共同前缀保持库里顺序；本实例新写的消息（对方实例还没看到的）
+    排在末尾 —— 与"后写者追加"的直觉一致，避免消息乱序。
+    """
+    seen = {_message_signature(m) for m in theirs}
+    merged = list(theirs)
+    for message in ours:
+        if _message_signature(message) not in seen:
+            merged.append(message)
+            seen.add(_message_signature(message))
+    return merged
 
 
 def _decode_messages(raw: Any, memory_id: str) -> List[Message]:
@@ -132,7 +196,22 @@ class InMemoryConversationStore(ConversationStore):
 
 
 class MongoConversationStore(ConversationStore):
-    """MongoDB 实现（生产用，与 Java 版同库同集合）"""
+    """MongoDB 实现（生产用，与 Java 版同库同集合）。
+
+    strict 模式（Phase 5 / P1-01）：
+        读写失败抛 ``RepositoryUnavailable`` —— 存储故障绝不能伪装成
+        "新会话/空历史"。production 组合根必须 strict 且**不包** Resilient
+        降级（本地文件不是多副本共享会话的合法故障转移目标）。
+
+    并发写保护（CAS）：
+        文档带 ``version`` 字段，save 用条件更新（匹配版本才写）。
+        版本不匹配 = 另一个实例刚写过 → 重读它的内容、与本实例合并
+        （按消息签名去重），再以新版本重试，最多 3 次；耗尽后
+        strict 抛 ``ConcurrentWriteConflict``，非 strict 留痕放弃本次写入
+        （放弃而不是覆盖 —— 覆盖会丢对方刚写的消息）。
+    """
+
+    _CAS_MAX_ATTEMPTS = 3
 
     def __init__(
         self,
@@ -140,12 +219,17 @@ class MongoConversationStore(ConversationStore):
         database: str = "chat_memory_db",
         collection: str = "chat_messages",
         max_messages: int = 200,
+        *,
+        strict: bool = False,
     ) -> None:
         super().__init__(max_messages)
         self._uri = uri
         self._database = database
         self._collection = collection
+        self._strict = bool(strict)
         self._client = None
+        # 本实例已知的文档版本（CAS 期望值）；None = 未读过，写前先查
+        self._versions: Dict[str, int] = {}
 
     def _db(self):
         if self._client is None:
@@ -157,11 +241,30 @@ class MongoConversationStore(ConversationStore):
     def _client_uri(self) -> str:
         return self._uri
 
+    def _fail(self, action: str, memory_id: str, exc: Exception) -> Exception:
+        """把底层异常翻译成分类异常（strict 抛出；非 strict 仅留痕）。"""
+        wrapped = RepositoryUnavailable(f"会话存储不可用（{action}）: {exc}")
+        if self._strict:
+            return wrapped
+        logger.warning("会话 %s %s失败：%s", memory_id, action, exc)
+        return None
+
+    async def ping(self) -> None:
+        """有界存活探测（serverSelectionTimeoutMS 已限 3s）。失败抛分类异常。"""
+        try:
+            await asyncio.to_thread(
+                self._db().database.client.admin.command, "ping"
+            )
+        except Exception as exc:
+            raise RepositoryUnavailable(f"会话存储不可用（ping）: {exc}") from exc
+
     async def load(self, memory_id: str, limit: int = 20) -> List[Message]:
         try:
             doc = self._db().find_one({"memoryId": str(memory_id)})
         except Exception as exc:
-            logger.warning("会话 %s 读取失败（返回空历史）：%s", memory_id, exc)
+            failure = self._fail("读取", memory_id, exc)
+            if failure is not None:
+                raise failure from exc
             return []
         if not doc:
             return []
@@ -170,24 +273,81 @@ class MongoConversationStore(ConversationStore):
         except json.JSONDecodeError:
             logger.warning("会话 %s 的 content 不是合法 JSON，按空历史处理", memory_id)
             return []
+        version = int(doc.get("version") or 0)
+        self._versions[str(memory_id)] = version
         return _decode_messages(raw, str(memory_id))[-limit:]
 
     async def _save_locked(self, memory_id: str, messages: List[Message]) -> None:
         payload = json.dumps([m.to_dict() for m in messages], ensure_ascii=False, default=str)
+        key = str(memory_id)
         try:
-            self._db().update_one(
-                {"memoryId": str(memory_id)},
-                {"$set": {"content": payload}},
-                upsert=True,
-            )
+            self._save_with_cas(key, payload, messages)
+        except ConcurrentWriteConflict as exc:
+            if self._strict:
+                raise
+            # 非 strict：留痕即可（旧行为兼容），但绝不能悄悄用旧快照覆盖
+            logger.warning("会话 %s 并发写冲突放弃本次写入：%s", key, exc)
         except Exception as exc:
-            # 不阻断对话，但必须留痕 —— 静默吞掉会让"丢消息"无从排查
-            logger.warning("会话 %s 写入失败：%s", memory_id, exc)
+            failure = self._fail("写入", memory_id, exc)
+            if failure is not None:
+                raise failure from exc
+            logger.warning("会话 %s 写入失败：%s", key, exc)
+
+    def _save_with_cas(self, key: str, payload: str, messages: List[Message]) -> None:
+        """条件更新 + 冲突合并重试（同步，调用方在线程里跑）。"""
+        collection = self._db()
+        for _attempt in range(self._CAS_MAX_ATTEMPTS):
+            expected = self._versions.get(key)
+            if expected is None:
+                # 本实例没读过 → 先摸一次当前版本（不存在按 0 处理）
+                doc = collection.find_one({"memoryId": key}, {"version": 1})
+                expected = int((doc or {}).get("version") or 0)
+                self._versions[key] = expected
+            result = collection.update_one(
+                {"memoryId": key, "version": expected},
+                {"$set": {"content": payload}, "$inc": {"version": 1}},
+            )
+            if result.matched_count == 1:
+                self._versions[key] = expected + 1
+                return
+            # 版本不匹配：另一实例刚写过 → 重读合并后再试
+            doc = collection.find_one({"memoryId": key})
+            if not doc:
+                # 文档刚被删除 → 退化为首写（版本从 1 起）
+                insert = collection.update_one(
+                    {"memoryId": key},
+                    {"$set": {"content": payload}, "$setOnInsert": {"version": 1}},
+                    upsert=True,
+                )
+                if insert.matched_count == 1 or insert.upserted_id is not None:
+                    self._versions[key] = 1
+                    return
+                continue
+            try:
+                their_raw = json.loads(doc.get("content") or "[]")
+            except json.JSONDecodeError:
+                their_raw = []
+            their_messages = [
+                m for m in (Message.from_dict_safe(item) for item in their_raw) if m
+            ]
+            merged = _merge_messages(messages, their_messages)
+            merged = self._trim(merged)
+            payload = json.dumps(
+                [m.to_dict() for m in merged], ensure_ascii=False, default=str
+            )
+            self._versions[key] = int(doc.get("version") or 0)
+        raise ConcurrentWriteConflict(
+            f"会话 {key} 并发写冲突（重试 {self._CAS_MAX_ATTEMPTS} 次耗尽）"
+        )
 
     async def clear(self, memory_id: str) -> None:
         try:
             self._db().delete_one({"memoryId": str(memory_id)})
+            self._versions.pop(str(memory_id), None)
         except Exception as exc:
+            failure = self._fail("清空", memory_id, exc)
+            if failure is not None:
+                raise failure from exc
             logger.warning("会话 %s 清空失败：%s", memory_id, exc)
 
     async def close(self) -> None:
