@@ -152,6 +152,7 @@
 <script setup>
 import { onMounted, ref, watch, nextTick } from 'vue'
 import axios from 'axios'
+import { authHeaders, chatUrl, initMemoryId, newSession } from '@/api/xiaozhi'
 
 const messaggListRef = ref()
 const isSending = ref(false)
@@ -159,8 +160,18 @@ const uuid = ref()
 const inputMessage = ref('')
 const messages = ref([])
 
-onMounted(() => {
-  initUUID()
+onMounted(async () => {
+  try {
+    await initUUID()
+  } catch (e) {
+    messages.value.push({
+      isUser: false,
+      content: '登录状态异常，请重新登录或联系管理员。',
+      isTyping: false,
+      isThinking: false
+    })
+    return
+  }
   watch(messages, () => scrollToBottom(), { deep: true })
   hello()
 })
@@ -196,10 +207,11 @@ const sendRequest = (message) => {
   const lastMsg = messages.value[messages.value.length - 1]
   scrollToBottom()
 
-  axios.post('/api/xiaozhi/chat',
+  axios.post(chatUrl,
       { memoryId: uuid.value, message },
       {
         responseType: 'text',
+        headers: authHeaders(),
         onDownloadProgress: (e) => {
           const fullText = e.event.target.responseText
           lastMsg.content = convertStreamOutput(fullText)
@@ -212,19 +224,20 @@ const sendRequest = (message) => {
         isSending.value = false
       })
       .catch((error) => {
-        lastMsg.content = '网络异常，请尝试刷新页面。'
+        const status = error && error.response && error.response.status
+        lastMsg.content = status === 401
+          ? '登录已失效，请重新登录后再试。'
+          : status === 403
+            ? '无权访问该会话，请点击「开启新会话」重试。'
+            : '网络异常，请尝试刷新页面。'
         lastMsg.isTyping = false
         isSending.value = false
       })
 }
 
-const initUUID = () => {
-  let storedUUID = localStorage.getItem('user_uuid')
-  if (!storedUUID) {
-    storedUUID = Math.floor(Math.random() * 1000000)
-    localStorage.setItem('user_uuid', storedUUID)
-  }
-  uuid.value = storedUUID
+const initUUID = async () => {
+  // 认证关闭时返回一期随机 UUID；开启时由服务端签发 session_id（API 层内部处理）
+  uuid.value = await initMemoryId()
 }
 
 const convertStreamOutput = (output) => {
@@ -233,7 +246,7 @@ const convertStreamOutput = (output) => {
 }
 
 const newChat = () => {
-  localStorage.removeItem('user_uuid')
+  newSession()
   window.location.reload()
 }
 </script>
