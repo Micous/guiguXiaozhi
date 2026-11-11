@@ -45,6 +45,27 @@ from xiaozhi.security.secure_executor import ToolCall as SecureToolCall
 
 logger = logging.getLogger(__name__)
 
+# 审批闭环开启时追加给模型的说明。
+#
+# 2026-11-11 真实前端联调实测（用户报"预约挂号，没有审批弹窗"）：
+# 模型说「好的，正在为您预约呼吸内科的号，请稍等片刻。…请确认无误后点击
+# 确认按钮完成预约。」—— 同一轮**零工具调用**：
+#   1. 它把"确认"当成**自己的事**，于是不真的调工具 → 写操作没进审批门控
+#      → 后端不下发审批标记 → 前端没有确认弹窗 → 用户的挂号请求石沉大海；
+#   2. 它编出一个**并不存在**的"确认按钮"（系统里的确认窗由前端渲染，
+#      模型无从得知），用户照着找会落空。
+#
+# 告诉模型"确认窗由系统弹出、你只管调工具"，既消除幻觉指令，
+# 又让它走真正的工具路径 → 审批门控才有机会生效。
+APPROVAL_PROMPT_NOTE = (
+    "【审批说明】涉及创建或修改业务记录的操作（预约挂号、取消预约挂号等），"
+    "系统会在你调用工具后**弹出确认窗**，由用户本人核对参数并点击确认，"
+    "确认通过后操作才会真正执行。"
+    "因此：1) 你只需要**如实调用工具**并填好参数，不要描述将要执行的动作；"
+    "2) 不要让用户去点击任何按钮或自行确认——确认窗会自己弹出；"
+    "3) 工具返回“需要确认”时，只需简短告知用户在确认窗口中核对即可。"
+)
+
 
 class EnginePhases:
     # ---------- 内部阶段（上下文/模型回合/工具执行）----------
@@ -106,8 +127,18 @@ class EnginePhases:
                 profile = await self.profile_injector.build_segment(user_input, history)
                 if profile:
                     context_span.set_attribute("profile_injected", True)
+            # ---- 审批闭环说明（Phase 2）----
+            # 审批开启时，写操作会被系统拦下并弹出**确认窗**（前端渲染）。
+            # 不告诉模型这件事，它就会自己编一个不存在的确认流程——
+            # 2026-11-11 真实联调实测：模型输出"请确认无误后点击确认按钮完成预约"，
+            # 而系统里根本没有那个按钮（用户照着找会落空），
+            # 同时它把确认当成自己的事就**不会真的调工具** → 审批门控形同虚设。
+            system_prompt = self.system_prompt
+            if self._approval_enabled():
+                system_prompt = f"{system_prompt}\n\n{APPROVAL_PROMPT_NOTE}"
+                context_span.set_attribute("approval_notice_injected", True)
             context = self.context_assembler.assemble(
-                self.system_prompt, user_input, history, knowledge=knowledge, profile=profile
+                system_prompt, user_input, history, knowledge=knowledge, profile=profile
             )
             context_span.set_attribute("history_kept", len(context.history))
             context_span.set_attribute("dropped_items", context.dropped_items)
@@ -491,6 +522,15 @@ class EnginePhases:
             prior_booking=booking_executed_in_history(history),
             operation_request=operation_request,
         )
+
+    def _approval_enabled(self) -> bool:
+        """审批闭环是否已装配（写操作需一次性确认）。
+
+        以执行器上的 ``approval_service`` 为准 —— 灰度关闭时它是 None，
+        此时不注入审批说明（提示词与一期完全一致）。
+        """
+        executor = getattr(self, "secure_executor", None)
+        return getattr(executor, "approval_service", None) is not None
 
     def _time_budget_exceeded(self, started: float) -> bool:
         """请求级时间预算是否已用尽。"""
