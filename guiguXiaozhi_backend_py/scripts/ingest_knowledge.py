@@ -27,9 +27,14 @@
     python scripts/ingest_knowledge.py --rollback
     python scripts/ingest_knowledge.py --rollback --version 3
 
+    # 校验知识条目的来源/审核人/失效日期（Phase 7 合规）
+    python scripts/ingest_knowledge.py --check-meta
+    python scripts/ingest_knowledge.py --force --strict-meta
+
 退出码（给 CI / CronJob 判定用）：
     0 成功；1 失败（配置/依赖/灌库异常）；3 已有灌库任务在跑（抢锁失败）；
-    4 校验不通过（新版本行数不足，**别名未切换**，旧索引继续服务）。
+    4 校验不通过（新版本行数不足，**别名未切换**，旧索引继续服务）；
+    5 知识条目元数据不合规（缺来源/审核人/已过期，**未灌库**）。
 """
 
 from __future__ import annotations
@@ -49,6 +54,7 @@ EXIT_OK = 0
 EXIT_FAILED = 1
 EXIT_LOCKED = 3
 EXIT_VERIFY_FAILED = 4
+EXIT_META_INVALID = 5
 
 
 class SingleWriterLock:
@@ -131,6 +137,34 @@ def build_stack(settings):
     return rag, store, embedding
 
 
+def check_doc_meta(settings, *, strict: bool) -> int:
+    """校验知识条目的来源/审核人/版本/失效日期（Phase 7 合规）。
+
+    默认**只告警不阻断**：存量知识库还没补 frontmatter 时，把灌库直接打死
+    会让人"改配置绕过检查"，反而更不安全。``--strict-meta`` 才阻断
+    （CI 与上线门禁用这个）。
+    """
+    from xiaozhi.retrieval.doc_meta import REQUIRED_FIELDS, collect_meta_issues
+
+    issues = collect_meta_issues(Path(settings.knowledge_dir))
+    if not issues:
+        print(f"[meta] 全部知识条目元数据合规（必需字段：{'/'.join(REQUIRED_FIELDS)}）")
+        return EXIT_OK
+
+    print(
+        f"[meta] {len(issues)} 个知识文件元数据不合规"
+        f"（必需字段：{'/'.join(REQUIRED_FIELDS)}）",
+        file=sys.stderr,
+    )
+    for issue in issues:
+        print(f"  - {issue['file']}: {'；'.join(issue['problems'])}", file=sys.stderr)
+    if strict:
+        print("[meta] --strict-meta 已开启：拒绝灌库（旧索引继续服务）", file=sys.stderr)
+        return EXIT_META_INVALID
+    print("[meta] 未开启 --strict-meta：继续灌库，但上线前必须补齐", file=sys.stderr)
+    return EXIT_OK
+
+
 def dry_run(settings) -> int:
     """只解析 + 分块 + 统计，不连任何外部服务。"""
     from xiaozhi.retrieval.chunker import Chunker
@@ -146,6 +180,8 @@ def dry_run(settings) -> int:
     print(f"[dry-run] 文件 {len(counts)} 个，块 {len(chunks)} 个")
     for name in sorted(counts):
         print(f"  - {name}: {counts[name]} 块")
+    # 元数据状态顺便打出来：dry-run 是最常用的自检入口
+    check_doc_meta(settings, strict=False)
     return EXIT_OK
 
 
@@ -287,6 +323,16 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
     parser.add_argument("--version", type=int, default=None, help="配合 --rollback 指定版本号")
     parser.add_argument("--keep", type=int, default=2, help="保留最近 N 个版本（默认 2）")
     parser.add_argument(
+        "--check-meta",
+        action="store_true",
+        help="只校验知识条目元数据（来源/审核人/失效日期），不灌库",
+    )
+    parser.add_argument(
+        "--strict-meta",
+        action="store_true",
+        help="元数据不合规时拒绝灌库（退出码 5；CI/上线门禁用）",
+    )
+    parser.add_argument(
         "--lock-file",
         default=str(BACKEND_ROOT / "logs" / ".ingest.lock"),
         help="单写者锁文件路径",
@@ -300,6 +346,8 @@ def main(argv: Optional[list] = None) -> int:
 
     settings = get_settings()
 
+    if args.check_meta:
+        return check_doc_meta(settings, strict=True)
     if args.dry_run:
         return dry_run(settings)
 
@@ -318,6 +366,9 @@ def main(argv: Optional[list] = None) -> int:
             return list_versions(store)
         if args.rollback:
             return rollback(settings, target_version=args.version)
+        meta_code = check_doc_meta(settings, strict=args.strict_meta)
+        if meta_code != EXIT_OK:
+            return meta_code
         return asyncio.run(ingest(settings, force=args.force, keep=args.keep))
     except Exception as exc:  # 兜底：脚本不能把 traceback 直接当退出码 1 以外的东西
         print(f"[error] {type(exc).__name__}: {exc}", file=sys.stderr)

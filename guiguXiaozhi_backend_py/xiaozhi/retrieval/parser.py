@@ -15,6 +15,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
+from xiaozhi.retrieval.doc_meta import parse_frontmatter
+
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
 TABLE_ROW_RE = re.compile(r"^\s*\|.*\|\s*$")
 FENCE_RE = re.compile(r"^\s*```")
@@ -31,6 +33,9 @@ class Section:
     level: int = 0
     start_line: int = 1
     file_name: str = ""
+    # 文档级 frontmatter（来源/审核人/版本/失效日期）—— Phase 7 合规要求。
+    # 挂在每个 Section 上而不是返回二元组，避免改动所有调用方的签名。
+    doc_meta: Dict[str, str] = field(default_factory=dict)
 
     @property
     def path_str(self) -> str:
@@ -131,9 +136,17 @@ def _split_blocks(text: str) -> List[Dict[str, Any]]:
     return blocks
 
 
-def parse_markdown(text: str, file_name: str) -> List[Section]:
-    """把 markdown 解析成带标题路径的小节列表"""
+def parse_markdown(
+    text: str, file_name: str, doc_meta: Optional[Dict[str, str]] = None
+) -> List[Section]:
+    """把 markdown 解析成带标题路径的小节列表。
+
+    ``doc_meta``：文档级 frontmatter（来源/审核人/失效日期），会原样挂到
+    每个 Section 上，最终进 chunk metadata —— 检索命中后模型与审计都能
+    知道这段内容出自哪份文件、谁审过、什么时候到期。
+    """
     text = FRONTMATTER_RE.sub("", text, count=1)
+    meta = dict(doc_meta or {})
     blocks = _split_blocks(text)
 
     sections: List[Section] = []
@@ -163,6 +176,7 @@ def parse_markdown(text: str, file_name: str) -> List[Section]:
                     level=0,
                     start_line=block["start_line"],
                     file_name=file_name,
+                    doc_meta=meta,
                 )
             )
             continue
@@ -175,6 +189,7 @@ def parse_markdown(text: str, file_name: str) -> List[Section]:
                 level=heading_stack[-1][0],
                 start_line=block["start_line"],
                 file_name=file_name,
+                doc_meta=meta,
             )
         )
 
@@ -186,7 +201,8 @@ def parse_file(path: Path) -> List[Section]:
     file_name = path.name
     text = read_text(path)
     if path.suffix.lower() == ".md":
-        return parse_markdown(text, file_name)
+        meta, body = parse_frontmatter(text)
+        return parse_markdown(body, file_name, doc_meta=meta)
     # 纯文本：按空行分段
     sections: List[Section] = []
     for i, para in enumerate(p for p in text.split("\n\n") if p.strip()):

@@ -49,6 +49,8 @@ def his_ready(monkeypatch):
         "audit_sink": "file,mongo",
         "rag_ingest_on_startup": False,
         "rag_require_index": True,
+        # Phase 7：医疗知识条目必须可溯源（来源/审核人/失效日期）
+        "rag_require_doc_meta": True,
     }
 
 
@@ -94,11 +96,11 @@ def test_production_env_aliases_detected(env):
 
 
 def test_production_reports_all_problems_at_once():
-    """默认配置下 10 项不合规（画像默认关，故不含密钥项），一次报全。"""
+    """默认配置下 11 项不合规（画像默认关，故不含密钥项），一次报全。"""
     with pytest.raises(ProductionConfigError) as exc:
         validate_production_settings(prod())
     msg = str(exc.value)
-    assert "共 10 项不合规" in msg
+    assert "共 11 项不合规" in msg
     for token in (
         "permission_no_ui",
         "mysql_password",

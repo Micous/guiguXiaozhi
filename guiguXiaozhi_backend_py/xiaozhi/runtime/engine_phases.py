@@ -42,6 +42,11 @@ from xiaozhi.runtime.interceptors import TurnFacts, quality_gate
 from xiaozhi.runtime.response_gate import curate_final_reply, is_write_operation, stream_claim_is_legit
 from xiaozhi.runtime.state import TurnState
 from xiaozhi.runtime.stream_filter import StreamFilter
+from xiaozhi.security.medical_safety import (
+    BOUNDARY_PROMPT,
+    SafetyVerdict,
+    assess_medical_safety,
+)
 from xiaozhi.security.secure_executor import ToolCall as SecureToolCall
 from xiaozhi.security.approval_service import get_approval_context
 
@@ -93,6 +98,63 @@ APPROVAL_PROMPT_NOTE = (
 
 class EnginePhases:
     # ---------- 内部阶段（上下文/模型回合/工具执行）----------
+
+    async def _short_circuit_medical_safety(
+        self,
+        verdict: SafetyVerdict,
+        *,
+        memory_id: str,
+        history: List[Message],
+        user_input: str,
+        result: "AgentEngineResultHolder",
+        trace_id: str,
+        started: float,
+    ) -> AsyncIterator[Event]:
+        """Phase 7：急症/越界请求的确定性收尾（不检索、不调模型、不调工具）。
+
+        为什么必须短路而不是"提示模型按固定口径回答"：
+          * 急救指引的措辞不能有一字之差（"建议就医"≠"立刻拨 120"）；
+          * 越界请求一旦进入生成，7B 就一定会漏出诊断或用药结论
+            （提示词约束在历史事故里被反复绕过）。
+
+        落库仍走三段式（只有 user + assistant 两条）：固定话术必须进历史，
+        否则下一轮用户说"刚才那个怎么办"时上下文是断的。
+        """
+        state = self._new_turn_state(history, operation_request=False)
+        state.set_final_reply(verdict.reply)
+        result.text = verdict.reply
+
+        self.metrics.inc(f"medical_{verdict.kind}_total")
+        logger.warning(
+            "医疗安全分流（未进模型）：trace=%s kind=%s rule=%s",
+            trace_id,
+            verdict.kind,
+            verdict.rule_id,
+        )
+        with trace_span("medical.safety", trace_id=trace_id) as span:
+            span.set_attribute("kind", verdict.kind)
+            span.set_attribute("rule_id", verdict.rule_id)
+            span.set_attribute("blocked", True)
+
+        yield TextResponseEvent(
+            trace_id=trace_id,
+            metadata={"delta": verdict.reply, "medical_safety": verdict.to_metadata()},
+        )
+
+        async for _ev in self._persist_and_extract(
+            memory_id=memory_id,
+            history=history,
+            user_input=user_input,
+            state=state,
+            result=result,
+            trace_id=trace_id,
+        ):
+            yield _ev
+
+        async for _ev in self._finalize(
+            result=result, state=state, turns=0, trace_id=trace_id, started=started
+        ):
+            yield _ev
 
     async def _prepare_messages(
         self,
@@ -161,6 +223,19 @@ class EnginePhases:
             if self._approval_enabled():
                 system_prompt = f"{system_prompt}\n\n{APPROVAL_PROMPT_NOTE}"
                 context_span.set_attribute("approval_notice_injected", True)
+            # ---- Phase 7：医疗内容边界 ----
+            # 非急症、非越界的正常医疗咨询（"气管炎要注意什么饮食"）照常交给模型，
+            # 但必须约束口径：不许下诊断结论、不许推药、不许判断检查结果。
+            # 纯办理类请求（预约/取消/查号源）不含医疗词 → 提示词零变化，
+            # 保证既有工具调用行为不受影响。
+            #
+            # 这里重新判定一次（纯函数、无 IO）：宁可多算一次，也不让
+            # _prepare_messages 的调用方必须记得传 verdict —— 漏传就是漏保护。
+            safety = assess_medical_safety(user_input)
+            if safety.boundary_prompt:
+                system_prompt = f"{system_prompt}\n\n{BOUNDARY_PROMPT}"
+                context_span.set_attribute("medical_boundary_injected", True)
+                self.metrics.inc("medical_boundary_prompt_total")
             context = self.context_assembler.assemble(
                 system_prompt, user_input, history, knowledge=knowledge, profile=profile
             )

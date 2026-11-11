@@ -144,7 +144,7 @@ curl http://localhost:8081/ready     # readiness（依赖 Ollama/Milvus/MySQL/Mo
 - 密钥（`MYSQL_PASSWORD`、`AUTH_SECRET_KEY`、`HIS_API_TOKEN`…）一律环境注入，
   `.dockerignore` 已排除 `.env`。
 
-## 7. 生产启动门禁速查（10 项）
+## 7. 生产启动门禁速查（11 项）
 
 `APP_ENV=production` 会在连接任何外部服务之前聚合校验并拒绝启动：
 
@@ -157,7 +157,69 @@ curl http://localhost:8081/ready     # readiness（依赖 Ollama/Milvus/MySQL/Mo
 7. `storage_fail_fast=true`；
 8. 禁止 `slot_service_impl=local_his`；
 9. `audit_fail_closed=true` 且 `audit_sink` 含 `mongo`；
-10. `rag_ingest_on_startup=false` 且 `rag_require_index=true`。
+10. `rag_ingest_on_startup=false` 且 `rag_require_index=true`；
+11. `rag_require_doc_meta=true`（知识条目必须有来源/审核人/失效日期）。
 
 **当前第 4 项恒不满足**，所以 `production` 必然启动失败 —— 这是刻意的，
 真实 HIS 沙箱验收通过前不要放开。
+
+## 8. 医疗安全门控（Phase 7）
+
+产品边界方案 A：只做「信息解释 + 分诊引导」，不做诊断/处方/剂量。
+
+### 8.1 哪些请求不会进模型
+
+| 类型 | 判定 | 输出 |
+|---|---|---|
+| 急症 | 强信号（叫不醒/大出血/抽搐/半身不遂/误服…）或弱信号 + 主体/当下性/求助口吻 | 固定急救话术（120/110、不要自行驾车、不要喂水喂药、CPR/AED） |
+| 自伤 | 自杀意念或方法表露 | 独立话术（120/110 + 心理援助热线 + 不要独处） |
+| 越界 | 诊断结论 / 处方 / 剂量 / 报告结论 / 重症预后 | 固定边界话术 + 可代做的三件事 |
+
+这些请求 **0.0x 秒返回**、`model.calls == 0`；话术会落进历史（下一轮上下文不断）。
+
+### 8.2 指标
+
+```bash
+curl -s http://127.0.0.1:8081/metrics/prometheus | grep medical_
+```
+
+- `medical_emergency_total` / `medical_self_harm_total` / `medical_out_of_scope_total`：
+  分流次数。**急症计数是业务看板第一行**——它同时说明"分流在工作"和"有多少用户是按急症主诉进来的"；
+- `medical_boundary_prompt_total`：正常医疗咨询里注入了边界提示的次数。
+
+指标突然为 0 而线上有急诊类会话 → 先查 `medical_safety.py` 是否被改坏
+（`tests/eval/medical_safety_eval.json` 49 条是行为契约）。
+
+### 8.3 知识条目元数据（合规）
+
+```bash
+# 只校验（不连任何外部服务）
+python scripts/ingest_knowledge.py --check-meta
+
+# 灌库时强制校验（不合规 → 退出码 5，旧索引继续服务）
+python scripts/ingest_knowledge.py --force --strict-meta
+```
+
+每个知识 markdown 头部必须有：
+
+```markdown
+---
+source: 北京协和医院官网 · 就医指南
+reviewer: 医务处 张××
+reviewed_at: 2026-11-01
+expires_at: 2027-11-01
+version: 2026-10
+---
+```
+
+- **过期**（`expires_at` < 今天）会被判不合规：医院指南到期必须复审，不是"上线后一直用旧版"；
+- 开发态只告警（启动日志 `知识库有 N 个文件元数据不合规`），production 门禁第 11 项强制；
+- 元数据会随 chunk 一起进向量库 `metadata`，检索命中即可溯源。
+
+### 8.4 改动医疗规则时
+
+1. 改 `xiaozhi/security/medical_safety.py`；
+2. 跑 `pytest tests/unit/test_phase7_medical_safety.py -q`（评测集 49 条 + 话术合规 + 短路）；
+3. 任何一条 expect 漂移，先看该条 `note` 判断是"规则错了"还是"预期该更新"——
+   **不要为了让测试变绿改 expect**（那是把契约改掉）；
+4. 改固定话术必须同步改合规断言（药名/剂量/诊断词黑名单）。

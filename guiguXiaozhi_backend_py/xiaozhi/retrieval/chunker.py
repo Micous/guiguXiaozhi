@@ -15,6 +15,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional
 
+from xiaozhi.retrieval.doc_meta import storable_meta
 from xiaozhi.retrieval.parser import Section, content_hash
 
 # 中文句子边界：句末标点之后，或行尾（换行本身必须保留，
@@ -133,6 +134,9 @@ class Chunker:
                     "heading": section.heading,
                     "parts": [],
                     "start_line": section.start_line,
+                    # 文档级来源/审核元数据（Phase 7）：随块一起进向量库，
+                    # 检索命中即可溯源
+                    "doc_meta": dict(getattr(section, "doc_meta", {}) or {}),
                 }
                 order.append(key)
             grouped[key]["parts"].append(section.content)
@@ -173,6 +177,15 @@ class Chunker:
                     "content_hash": content_hash(piece),
                     "chunk_index": len(chunks),
                 }
+                # 只合并白名单字段（source/reviewer/version/expires_at…），
+                # 不让任意 frontmatter 键进检索元数据
+                metadata.update(
+                    {
+                        k: v
+                        for k, v in storable_meta(group["doc_meta"]).items()
+                        if k not in metadata
+                    }
+                )
                 chunks.append(
                     Chunk(
                         id=cid,

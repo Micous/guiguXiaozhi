@@ -36,6 +36,14 @@ DEFAULT_COUNTERS = (
     "audit_write_failed_total",
     # Phase 6：共享限流后端（Redis）故障次数。非零意味着聊天正在 503。
     "rate_limit_backend_errors_total",
+    # Phase 7：医疗安全分流次数（按处置类型分开计数）。
+    # 急症计数是上线后的**业务看板第一行**：它同时说明"分流在工作"
+    # 和"有多少用户是按急症主诉进来的"。
+    "medical_emergency_total",
+    "medical_self_harm_total",
+    "medical_out_of_scope_total",
+    # 放行但注入了医疗边界提示的次数（正常医疗咨询的规模）
+    "medical_boundary_prompt_total",
 )
 
 

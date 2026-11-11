@@ -162,6 +162,16 @@ def validate_production_settings(settings: Settings) -> None:
             "索引为空/不可达时应拒绝启动，而不是降级成『没有知识检索的医疗问答』"
         )
 
+    # 11) 知识条目合规元数据（Phase 7）：来源/审核人/复核日期/失效日期。
+    #     医疗内容必须可溯源 —— 出问题时第一个问题是"这条内容谁写的、谁审的、
+    #     依据是什么、什么时候到期"。缺这四个字段的条目在法律上不可举证。
+    if not settings.rag_require_doc_meta:
+        problems.append(
+            "rag_require_doc_meta=false → 生产必须校验知识条目元数据："
+            "每个知识文件都要在 frontmatter 声明 source / reviewer / reviewed_at / expires_at"
+            "（医疗内容需可溯源、可追责，过期条目必须复审）"
+        )
+
     if problems:
         raise ProductionConfigError(
             f"APP_ENV=production 启动被拒绝，共 {len(problems)} 项不合规：\n  - "

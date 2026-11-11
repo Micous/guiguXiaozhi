@@ -30,6 +30,7 @@ from xiaozhi.reliability.tracing import get_trace_id, trace_span
 from xiaozhi.runtime.engine_phases import EnginePhases
 from xiaozhi.runtime.persister import ConversationPersister
 from xiaozhi.runtime.stream_filter import trim_to_sentence as _trim_to_sentence
+from xiaozhi.security.medical_safety import assess_medical_safety
 from xiaozhi.security.secure_executor import SecureToolExecutor
 from xiaozhi.tools.registry import ToolRegistry
 
@@ -123,6 +124,25 @@ class AgentEngine(EnginePhases):
 
             # 1. 读历史
             history = await self._load_history(memory_id, trace_id)
+
+            # 1.5 Phase 7：医疗安全确定性门控。
+            #     急症（胸痛/呼吸困难/大出血/意识障碍…）与越界请求（诊断/处方/剂量）
+            #     **不进检索、不进模型**，直接下发固定话术：
+            #     7B 对"我爸胸痛晕倒了"会答"建议尽快到医院就诊"——语气对、处置错，
+            #     真正的答案是立刻拨 120 且不要搬动/喂水。这种错误不能交给概率。
+            safety = assess_medical_safety(user_input)
+            if safety.blocked:
+                async for _ev in self._short_circuit_medical_safety(
+                    safety,
+                    memory_id=memory_id,
+                    history=history,
+                    user_input=user_input,
+                    result=result,
+                    trace_id=trace_id,
+                    started=started,
+                ):
+                    yield _ev
+                return
 
             # 2. 检索知识 + 组装上下文
             prep: Dict[str, Any] = {}

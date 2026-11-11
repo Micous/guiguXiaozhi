@@ -41,6 +41,7 @@ from xiaozhi.repositories.appointment_repo import (
 from xiaozhi.repositories.approval_repo import MySQLApprovalRepository
 from xiaozhi.repositories.session_repo import MySQLSessionRepository
 from xiaozhi.repositories.task_repo import MySQLTaskRepository
+from xiaozhi.retrieval.doc_meta import collect_meta_issues
 from xiaozhi.retrieval.rag import RagService
 from xiaozhi.retrieval.vector_store import MilvusVectorStore
 from xiaozhi.runtime.engine import AgentEngine
@@ -411,6 +412,26 @@ async def get_application(settings: Optional[Settings] = None) -> Application:
                 f"{stats.error or '集合内没有任何块'}。请先运行 "
                 "python scripts/ingest_knowledge.py --force 再启动。"
             )
+
+    # ---- Phase 7：知识条目合规元数据（来源/审核人/复核日期/失效日期）----
+    # 只读挂载也必须查：索引可以用，但内容可能已过期或不可溯源。
+    # 开发态只告警（存量知识库还没补齐 frontmatter 时也要能跑），
+    # production 门禁强制 rag_require_doc_meta=true → 直接拒绝启动。
+    meta_issues = collect_meta_issues(Path(settings.knowledge_dir))
+    if meta_issues:
+        detail = "；".join(
+            f"{item['file']}（{'、'.join(item['problems'])}）" for item in meta_issues[:5]
+        )
+        if settings.rag_require_doc_meta:
+            raise ProductionConfigError(
+                f"知识库有 {len(meta_issues)} 个文件元数据不合规（rag_require_doc_meta=true）："
+                f"{detail}。请补齐 frontmatter 的 source/reviewer/reviewed_at/expires_at。"
+            )
+        logger.warning(
+            "知识库有 %d 个文件元数据不合规（来源/审核人/失效日期缺失或已过期）：%s",
+            len(meta_issues),
+            detail,
+        )
     # ---- 院内系统 ----
     doctor_service = VectorStoreDoctorService(
         retrieve_all_chunks=vector_store.all_texts,

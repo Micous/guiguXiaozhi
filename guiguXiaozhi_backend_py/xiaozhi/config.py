@@ -85,6 +85,12 @@ class Settings(BaseSettings):
     # true：只读挂载必须拿到非空索引，否则拒绝启动（生产要求）；
     # false：索引空/不可达时降级为"无知识检索"，/health 仍 ok（开发友好）。
     rag_require_index: bool = False
+    # ---------- Phase 7：知识条目合规元数据 ----------
+    # 知识库 markdown 必须在 frontmatter 里声明 source / reviewer /
+    # reviewed_at / expires_at（医疗内容要可溯源、可追责）。
+    # true：启动与灌库都**严格校验**，有缺失/过期条目则拒绝（生产要求）；
+    # false：只告警不阻断（开发友好；存量知识库还没补齐时也能跑）。
+    rag_require_doc_meta: bool = False
 
     # ---------- 检索 ----------
     rag_max_results: int = 2
