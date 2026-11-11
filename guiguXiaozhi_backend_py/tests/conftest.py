@@ -9,6 +9,25 @@ from __future__ import annotations
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def isolate_local_env(monkeypatch):
+    """离线单测必须不受仓库 ``.env`` 的本地运行配置影响。
+
+    2026-11-11：本机为「默认登录页」在 ``guiguXiaozhi_backend_py/.env`` 里打开了
+    AUTH_ENABLED，导致 ``test_docs_available_in_development`` 这类断言默认态的
+    用例误读到认证开启。环境变量优先级高于 .env，这里统一把灰度开关钉回关闭态；
+    单个用例仍可自行 ``monkeypatch.setenv`` 覆盖（LIFO 撤销不会串味）。
+    """
+    from xiaozhi.config import reset_settings
+
+    monkeypatch.setenv("APP_ENV", "development")
+    monkeypatch.setenv("AUTH_ENABLED", "false")
+    monkeypatch.setenv("PROFILE_ENABLED", "false")
+    reset_settings()
+    yield
+    reset_settings()
+
+
 def pytest_addoption(parser):
     parser.addoption(
         "--run-integration",

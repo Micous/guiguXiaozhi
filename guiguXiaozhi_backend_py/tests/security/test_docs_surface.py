@@ -29,7 +29,8 @@ def test_docs_hidden_when_auth_enabled(monkeypatch):
 
 def test_docs_available_in_development(monkeypatch):
     """红线：默认（认证关闭）行为与一期完全一致，文档照常可用。"""
-    monkeypatch.delenv("AUTH_ENABLED", raising=False)
+    # 显式置 false（而非 delenv）：本机 .env 可能开启了认证，delenv 会让它生效
+    monkeypatch.setenv("AUTH_ENABLED", "false")
     reset_settings()
     try:
         paths = _registered_paths()

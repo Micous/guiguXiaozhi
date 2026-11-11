@@ -45,5 +45,18 @@ class ToolRegistry:
         """转成 Ollama /api/chat 的 tools 数组"""
         return [d.to_tool_payload() for d in self._definitions.values()]
 
+    def validate_contracts(self) -> List[str]:
+        """Phase 2：注册期契约体检，返回全部问题（组合根在审批开启时 fail-fast）。
+
+        不做静默降级：未知风险级别 / 未声明幂等的写工具，宁可拒绝启动也不能
+        让执行器在运行时猜「这个工具到底能不能写」。
+        """
+        problems: List[str] = []
+        for name, definition in self._definitions.items():
+            reason = definition.validate_contract()
+            if reason:
+                problems.append(f"{name}: {reason}")
+        return problems
+
     def __len__(self) -> int:
         return len(self._tools)

@@ -70,6 +70,11 @@ class BookAppointmentTool(Tool):
             ],
             risk_level=RiskLevel.WRITE,
             permissions_required=["appointment:write"],
+            # Phase 2：写操作契约 —— 必须经用户明确确认、幂等、结果可核验
+            approval_required=True,
+            idempotency_required=True,
+            result_schema={"type": "object", "properties": {"success": {"type": "boolean"}}},
+            retry_policy="query_before_retry",
         )
 
     def __init__(
@@ -211,6 +216,11 @@ class CancelAppointmentTool(Tool):
             ],
             risk_level=RiskLevel.DESTRUCTIVE,
             permissions_required=["appointment:cancel"],
+            # Phase 2：删除类副作用同样必须确认；幂等由仓储查重兜底
+            approval_required=True,
+            idempotency_required=True,
+            result_schema={"type": "object", "properties": {"success": {"type": "boolean"}}},
+            retry_policy="query_before_retry",
         )
 
     def __init__(self, repository: AppointmentRepository) -> None:
