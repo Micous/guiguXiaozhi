@@ -132,6 +132,20 @@ class ReleaseResult:
 
 
 @dataclass
+class CancellationResult:
+    """退号结果。
+
+    ``uncertain=True`` 表示**退号结果不确定**（超时）—— 此时绝不能对用户说
+    "取消成功"（医院侧可能还留着号），也不能说"取消失败"（可能已经退了）。
+    应保持待核实状态。
+    """
+
+    released: bool
+    message: str = ""
+    uncertain: bool = False
+
+
+@dataclass
 class ReconciliationEntry:
     """一条对账结论。"""
 
@@ -348,3 +362,49 @@ class HisSlotService(SlotService):
         except HisUncertainError as exc:
             logger.warning("HIS 查单结果不确定（id=%s）：%s", external_booking_id[:12], exc)
             raise
+
+    # ---------- 退号 ----------
+
+    def cancel_booking(
+        self,
+        external_booking_id: str,
+        *,
+        idempotency_key: Optional[str] = None,
+    ) -> CancellationResult:
+        """退号（用户取消预约）—— 把号源还给医院。
+
+        与 ``release_hold`` 的区别：``release_hold`` 释放的是**未落单**的预占；
+        ``cancel_booking`` 退掉的是**已挂号**的单。两者都把号源还回去，
+        但语义不同（审计追踪要能区分"没挂上"与"挂了又退了"）。
+
+        返回 ``CancellationResult``：
+          * ``released=True``  → 退号成功；
+          * ``released=False, uncertain=True`` → **结果不确定**（超时），
+            绝不能当成"退成功"（用户到院发现没退比退不掉更糟）；
+          * ``released=False`` → 明确失败（可如实告知用户）。
+        """
+        if not external_booking_id:
+            return CancellationResult(
+                released=False,
+                message="缺少外部挂号单号，无法退号。",
+            )
+        key = idempotency_key or build_idempotency_key(
+            "cancel", external_booking_id
+        )
+        try:
+            self._client.cancel_booking(
+                external_booking_id, idempotency_key=key
+            )
+        except HisRejectedError as exc:
+            logger.warning("HIS 退号被拒绝（id=%s）：%s", external_booking_id[:12], exc)
+            return CancellationResult(
+                released=False, message=str(exc)
+            )
+        except HisUncertainError as exc:
+            logger.warning(
+                "HIS 退号结果不确定（id=%s）：%s", external_booking_id[:12], exc
+            )
+            return CancellationResult(
+                released=False, message=str(exc), uncertain=True
+            )
+        return CancellationResult(released=True, message="退号成功。")

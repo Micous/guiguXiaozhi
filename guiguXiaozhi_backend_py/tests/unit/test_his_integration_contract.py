@@ -164,6 +164,10 @@ class _FakeHisHandler(BaseHTTPRequestHandler):
                     return
                 state.hold_count += 1
                 hold_id = f"hold-{state.hold_count}"
+                # 预占 → 号被占住（currentPreNum+1）
+                slot = state.slots.get("slot-1")
+                if slot is not None:
+                    slot["currentPreNum"] = slot.get("currentPreNum", 0) + 1
                 payload = {
                     "holdId": hold_id,
                     "clinicForRegistId": "slot-1",
@@ -183,8 +187,14 @@ class _FakeHisHandler(BaseHTTPRequestHandler):
                 payload = {"clinicMasterId": booking_id}
                 state.bookings[booking_id] = {
                     "clinicMasterId": booking_id,
+                    "clinicForRegistId": "slot-1",
                     "status": "REGISTERED",
                 }
+                # 确认 → 预占转挂号（pre-1, num+1）
+                slot = state.slots.get("slot-1")
+                if slot is not None:
+                    slot["currentPreNum"] = max(0, slot.get("currentPreNum", 0) - 1)
+                    slot["currentNum"] = slot.get("currentNum", 0) + 1
                 if idem:
                     state.idempotency[idem] = payload
             self._send(200, {"code": 200, "msg": "ok", "data": payload})
@@ -192,7 +202,29 @@ class _FakeHisHandler(BaseHTTPRequestHandler):
         if self.path.endswith("/release"):
             with state.lock:
                 state.release_count += 1
+                slot = state.slots.get("slot-1")
+                if slot is not None:
+                    slot["currentPreNum"] = max(0, slot.get("currentPreNum", 0) - 1)
             self._send(200, {"code": 200, "msg": "released", "data": {}})
+            return
+        if self.path.endswith("/cancel"):
+            # 退号：挂号单置 CANCELLED（号源归还由 fake 的 slots 记账体现）
+            booking_id = str(body.get("clinicMasterId") or body.get("bookingId") or "")
+            with state.lock:
+                booking = state.bookings.get(booking_id)
+                if booking is None:
+                    self._send(200, {"code": 500, "msg": "挂号单不存在", "data": None})
+                    return
+                if booking.get("status") == "CANCELLED":
+                    self._send(200, {"code": 500, "msg": "该挂号单已退号", "data": None})
+                    return
+                booking["status"] = "CANCELLED"
+                # 退号 → 号源归还（真实语义：号回到池子里）
+                slot_id = booking.get("clinicForRegistId")
+                slot = state.slots.get(slot_id)
+                if slot is not None:
+                    slot["currentNum"] = max(0, slot.get("currentNum", 0) - 1)
+            self._send(200, {"code": 200, "msg": "ok", "data": {"cancelled": True}})
             return
         self._send(200, {"code": 404, "msg": "no route", "data": None})
 
@@ -703,3 +735,58 @@ def test_hold_and_confirm_use_different_idempotency_keys(fake_his):
     rows = repo.list_all()
     assert rows[0].external_booking_id, "外部单号未落库，对账无从下手"
     assert rows[0].patient_ref, "患者引用未落库"
+
+
+# ==================================================================== 退号链路
+
+
+def test_cancel_notifies_his_and_returns_slot(fake_his):
+    """取消预约 → **必须先退 HIS**（号源归还），再改本地状态。
+
+    2026-11-11 真机暴露：CancelAppointmentTool 构造时 slot_service 传 None
+    → 服务层跳过 HIS 退号 → 本地说"取消成功"但医院侧单子还在、号源没回。
+    """
+    base_url, state = fake_his
+    repo = InMemoryAppointmentRepository()
+    client = _client(base_url)
+    slot = HisSlotService(client)
+    service = AppointmentService(repo, slot, patient_ref_salt="salt")
+
+    # 先约上
+    booked = service.book(
+        username="张三",
+        id_card=VALID_ID,
+        department="呼吸内科",
+        date="2026-11-30",
+        time="上午",
+    )
+    assert booked.outcome == BookingOutcome.CREATED, booked.message
+    slot_after_book = slot.check("呼吸内科", "2026-11-30", "上午")
+    assert slot_after_book.remaining < slot_after_book.remaining + 1  # 号被扣了
+
+    # 再取消
+    cancelled = service.cancel(
+        username="张三",
+        id_card=VALID_ID,
+        department="呼吸内科",
+        date="2026-11-30",
+        time="上午",
+    )
+    assert cancelled.outcome == BookingOutcome.CREATED, cancelled.message
+    # 本地状态迁移
+    assert repo.list_all()[0].status == AppointmentStatus.CANCELLED
+    # HIS 侧：号源归还 + 挂号单已退
+    booking_id = booked.appointment.external_booking_id
+    assert booking_id
+    his_booking = client.query_booking(booking_id)
+    assert his_booking.status == "CANCELLED", "HIS 侧挂号单没有退号"
+    slot_after_cancel = slot.check("呼吸内科", "2026-11-30", "上午")
+    assert slot_after_cancel.remaining == slot_after_book.remaining + 1, "号源没有归还"
+
+
+def test_cancel_tool_receives_slot_service():
+    """取消工具必须拿到号源服务（否则退不了号）。"""
+    from xiaozhi.tools.appointment_tools import CancelAppointmentTool
+
+    tool = CancelAppointmentTool(InMemoryAppointmentRepository(), object())
+    assert tool._service._slot_service is not None, "取消工具没拿到号源服务"

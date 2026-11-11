@@ -123,6 +123,17 @@ def validate_production_settings(settings: Settings) -> None:
             "禁止自动降级本地文件；Mongo 故障应表现为聊天 503 与 /ready 失败"
         )
 
+    # 8) 号源适配器：本地 HIS 替身绝不能上生产。
+    #    它是**开发/联调**用的行为替身（数据在本地 JSON 里），
+    #    生产用它等于"预约结果只存在本机" —— 比 Mock 更危险
+    #    （Mock 至少不会让人误以为真挂号了）。
+    if settings.slot_service_impl.strip().lower() == "local_his":
+        problems.append(
+            "slot_service_impl='local_his' → 生产禁止使用本地 HIS 替身："
+            "号源与挂号单只存在本机，重启即丢，且不具备医院侧事实效力；"
+            "生产必须接真实 HIS"
+        )
+
     if problems:
         raise ProductionConfigError(
             f"APP_ENV=production 启动被拒绝，共 {len(problems)} 项不合规：\n  - "

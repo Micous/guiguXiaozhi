@@ -19,7 +19,9 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Tuple
+
+import logging
 
 from xiaozhi.repositories.approval_repo import (
     ApprovalRecord,
@@ -27,6 +29,8 @@ from xiaozhi.repositories.approval_repo import (
     ApprovalStatus,
 )
 from xiaozhi.security.principal import ANONYMOUS, Principal
+
+logger = logging.getLogger(__name__)
 
 # 统一使用 naive local time：MySQL 的 NOW() 也是服务器本地时间，
 # 用 utcnow 会和容器/系统时区错开 8 小时，导致审批刚签发就「过期」。
@@ -237,6 +241,10 @@ class ApprovalService:
             tool_name=tool_name,
             canonical_args_hash=args_hash,
             args_preview=mask_sensitive_args(canonical_args),
+            # 发起轮的可执行参数 —— 执行轮以它为准（用户确认的是哪组参数，
+            # 系统就按哪组执行；模型两轮输出不一致时不能把用户卡在"确认无效"）。
+            # ⚠️ 含明文身份证号，与 appointment 表同安全水位，绝不回显前端。
+            canonical_args=dict(canonical_args),
             resource_scope=f"{session_id}:{tool_name}",
             status=ApprovalStatus.PENDING,
             expires_at=now + timedelta(seconds=self.ttl_seconds),
@@ -313,8 +321,23 @@ class ApprovalService:
         session_id: str,
         tool_name: str,
         canonical_args: Dict[str, Any],
-    ) -> ApprovalRecord:
-        """执行前重新计算参数哈希并原子消费；任何不符一律抛 ApprovalRejected。"""
+    ) -> Tuple[ApprovalRecord, Dict[str, Any]]:
+        """执行前原子消费；返回 (记录, **实际要执行的参数**)。
+
+        ⚠️ 2026-11-11 真机事故后的口径调整：
+
+        审批弹窗展示的是**发起轮**的参数，用户确认后执行轮由模型**重新生成**
+        一遍 —— 7b 模型两轮输出不完全一致（实测：发起轮带 ``doctor_name``，
+        执行轮漏了它），硬比 ``canonical_args_hash`` 会让"用户点了确认却被拒"
+        （``invalid_or_replayed``）。
+
+        现在的语义：**以用户确认过的那组参数执行**。参数不匹配时返回
+        审批记录里的参数；记录里没有参数（旧数据）才拒绝。
+
+        这**不是放宽安全边界**：用户能改的只有参数值，而参数值恰恰就是
+        用户确认过的那份 —— 改不出越权行为。token 一次性消费、跨用户、
+        跨会话、跨工具、过期这五道边界全部由仓储层原子消费保证。
+        """
         if not token:
             raise ApprovalRejected("missing_token", "缺少审批 token")
         args_hash = canonical_args_hash(canonical_args)
@@ -332,7 +355,19 @@ class ApprovalService:
             raise ApprovalRejected(
                 "invalid_or_replayed", "审批无效：已使用、已过期、参数变更或不属于当前用户"
             )
-        return record
+        if record.canonical_args_hash == args_hash:
+            # 完全一致 → 用模型这次的参数
+            return record, canonical_args
+        if not record.canonical_args:
+            # 旧记录没有存可执行参数 → 只能维持严格拒绝
+            raise ApprovalRejected(
+                "invalid_or_replayed", "审批无效：参数与确认时不一致"
+            )
+        logger.info(
+            "审批参数与执行轮不一致，按用户确认的参数执行：tool=%s",
+            tool_name,
+        )
+        return record, dict(record.canonical_args)
 
     def list_for_subject(self, principal: Principal) -> list:
         return [self.detail(r.approval_id, principal) for r in self.repository.list_for_subject(principal.subject_id)]

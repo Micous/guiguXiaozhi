@@ -46,7 +46,7 @@ from __future__ import annotations
 import hashlib
 import logging
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from xiaozhi.repositories.appointment_repo import (
     Appointment,
@@ -600,6 +600,17 @@ class AppointmentService:
                 message="未找到可取消的预约记录，请核对姓名、身份证号、科室、日期和时段。",
             )
 
+        # ---- 真实 HIS：先退 HIS，再改本地 ----
+        # 顺序不能反：本地说"取消成功"而医院还留着号 → 用户到院发现没退，
+        # 这比"退不掉"更糟。所以**HIS 退号成功才允许本地置为 CANCELLED**。
+        cancel_result = self._cancel_on_his(existing)
+        if cancel_result is not None and not cancel_result.get("ok"):
+            return CancellationResult(
+                outcome=cancel_result.get("outcome", BookingOutcome.FAILED),
+                message=cancel_result.get("message", "取消预约失败，请稍后重试。"),
+                appointment=existing,
+            )
+
         try:
             cancelled = self._repository.cancel(existing.id)
         except NotFound:
@@ -642,6 +653,66 @@ class AppointmentService:
         if row is not None and row.status == AppointmentStatus.CANCELLED:
             return row
         return None
+
+    # ---------- 退号（HIS 侧） ----------
+
+    def _cancel_on_his(self, appointment: Appointment) -> Optional[Dict[str, Any]]:
+        """在 HIS 侧退号。返回 None 表示"不需要退"（可继续本地取消）。
+
+        返回 dict 时：``ok=True`` 表示已退号、可继续；
+        ``ok=False`` 时带 ``outcome`` 与 ``message``，调用方据此**中止**本地取消。
+
+        三种情形：
+          * 号源服务不支持退号（Mock）→ 返回 None → 只改本地（保持一期行为）；
+          * HIS 明确拒绝 → ok=False → 如实告知"取消失败"，本地**保持原状态**；
+          * HIS 结果不确定（超时）→ ok=False + outcome=UNKNOWN → 用户看到
+            "退号结果核实中"，本地**保持原状态**（绝不能先本地取消再祈祷）。
+        """
+        if not hasattr(self._slot_service, "cancel_booking"):
+            return None
+        external_id = appointment.external_booking_id
+        if not external_id:
+            # 本地没有外部单号（可能是旧数据或预占阶段失败）→ 无法退号
+            logger.warning(
+                "预约 id=%s 无外部单号，跳过 HIS 退号（只改本地状态）", appointment.id
+            )
+            return None
+
+        try:
+            result = self._slot_service.cancel_booking(
+                external_id,
+                idempotency_key=_his_idempotency_key(
+                    "cancel",
+                    appointment.username,
+                    appointment.id_card,
+                    appointment.department,
+                    appointment.date,
+                    appointment.time,
+                ),
+            )
+        except Exception as exc:  # 兜底：退号异常不能把本地状态改掉
+            logger.warning("HIS 退号异常（预约 id=%s）：%s", appointment.id, exc)
+            return {
+                "ok": False,
+                "outcome": BookingOutcome.FAILED,
+                "message": "取消请求未能送达医院系统，请稍后重试或联系窗口。",
+            }
+
+        if getattr(result, "released", False):
+            return {"ok": True}
+
+        if getattr(result, "uncertain", False):
+            return {
+                "ok": False,
+                "outcome": BookingOutcome.UNKNOWN,
+                "message": "退号结果正在核实，请勿重复提交。",
+            }
+
+        return {
+            "ok": False,
+            "outcome": BookingOutcome.FAILED,
+            "message": getattr(result, "message", "") or "取消预约失败，请稍后重试。",
+        }
 
     # ---------- 查询 ----------
 

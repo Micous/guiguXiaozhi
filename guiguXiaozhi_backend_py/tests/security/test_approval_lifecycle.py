@@ -99,10 +99,11 @@ def test_consume_success_and_replay_rejected(env):
     """验收 3：一次性 token 第二次使用必须拒绝。"""
     _, service, _ = env
     record, token = _approved_token(env)
-    consumed = service.consume(
+    consumed, effective = service.consume(
         token, ALICE, session_id="sess-1", tool_name="预约挂号", canonical_args=ARGS
     )
     assert consumed.status == ApprovalStatus.CONSUMED
+    assert effective == ARGS
     with pytest.raises(ApprovalRejected) as exc:
         service.consume(
             token, ALICE, session_id="sess-1", tool_name="预约挂号", canonical_args=ARGS
@@ -110,12 +111,40 @@ def test_consume_success_and_replay_rejected(env):
     assert exc.value.reason_code == "invalid_or_replayed"
 
 
-def test_parameter_tampering_invalidates_approval(env):
-    """验收 2：确认参数 A 后把日期改成 B，审批失效。"""
+def test_parameter_tampering_cannot_change_confirmed_args(env):
+    """验收 2（语义更新）：模型改了参数 → **按用户确认的参数执行**。
+
+    2026-11-11 真机事故：审批弹窗展示的是发起轮参数，用户确认后执行轮由
+    模型重新生成 —— 7b 两轮输出不一致（发起轮带 doctor_name、执行轮漏了），
+    硬比哈希会让"用户点了确认却被拒"。
+
+    现在的语义：**用户确认的是哪组参数，系统就按哪组执行**。模型改参数
+    改不出越权行为 —— 这比"直接拒绝"更安全（旧语义下模型把日期改对反而
+    执行不了，用户白白确认）。
+    """
     _, service, _ = env
     _, token = _approved_token(env)
     tampered = dict(ARGS, date="2026-11-21")
     assert canonical_args_hash(tampered) != canonical_args_hash(ARGS)
+    record, effective = service.consume(
+        token, ALICE, session_id="sess-1", tool_name="预约挂号", canonical_args=tampered
+    )
+    assert record.status == ApprovalStatus.CONSUMED
+    assert effective == ARGS, "执行的必须是用户确认过的那组参数"
+    assert effective["date"] != "2026-11-21", "模型的篡改生效了"
+
+
+def test_legacy_record_without_canonical_args_still_rejects(env):
+    """旧记录（没有存可执行参数）→ 维持严格拒绝（不放宽旧数据）。"""
+    _, service, _ = env
+    _, token = _approved_token(env)
+    # 模拟旧数据：把审批记录里的可执行参数抹掉
+    record = service.repository.get_by_token_hash(
+        __import__("hashlib").sha256(token.encode("utf-8")).hexdigest()
+    )
+    assert record is not None
+    record.canonical_args = None
+    tampered = dict(ARGS, date="2026-11-21")
     with pytest.raises(ApprovalRejected):
         service.consume(
             token, ALICE, session_id="sess-1", tool_name="预约挂号", canonical_args=tampered
@@ -186,7 +215,7 @@ def test_state_survives_service_restart(env):
     record, token = _approved_token(env)
     restarted = ApprovalService(repo, ttl_seconds=120, clock=clock)
     assert restarted.detail(record.approval_id, ALICE)["status"] == "APPROVED"
-    consumed = restarted.consume(
+    consumed, _effective = restarted.consume(
         token, ALICE, session_id="sess-1", tool_name="预约挂号", canonical_args=ARGS
     )
     assert consumed.status == ApprovalStatus.CONSUMED

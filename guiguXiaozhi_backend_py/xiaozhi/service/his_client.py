@@ -193,6 +193,7 @@ class HisClient:
             "hold": "/clinicForRegist/hold",
             "confirm": "/currentRegister/add",
             "release": "/clinicForRegist/release",
+            "cancel": "/currentRegister/cancel",
         }
         if paths:
             self._paths.update({k: v for k, v in paths.items() if v})
@@ -332,12 +333,17 @@ class HisClient:
             idempotency_key=idempotency_key,
         )
         data = response.data if isinstance(response.data, dict) else {}
-        slot = self._to_slot(data) if data.get("clinicForRegistId") else None
+        slot = self._to_slot(data) if (
+            data.get("clinicForRegistId") or data.get("clinic_for_regist_id")
+        ) else None
         return HisHold(
             held=bool(data.get("holdId") or data.get("hold_id")),
             hold_id=str(data.get("holdId") or data.get("hold_id") or ""),
             external_booking_id=str(
-                data.get("clinicMasterId") or data.get("bookingId") or ""
+                data.get("clinicMasterId")
+                or data.get("clinic_master_id")
+                or data.get("bookingId")
+                or ""
             ),
             slot=slot,
             message=response.msg,
@@ -362,6 +368,7 @@ class HisClient:
             confirmed=True,
             external_booking_id=str(
                 data.get("clinicMasterId")
+                or data.get("clinic_master_id")
                 or data.get("bookingId")
                 or data.get("registId")
                 or ""
@@ -405,12 +412,36 @@ class HisClient:
             found=True,
             external_booking_id=str(
                 data.get("clinicMasterId")
+                or data.get("clinic_master_id")
                 or data.get("bookingId")
                 or external_booking_id
             ),
             status=str(data.get("status") or data.get("registStatus") or ""),
             message=response.msg,
         )
+
+    def cancel_booking(
+        self,
+        external_booking_id: str,
+        *,
+        idempotency_key: str = "",
+    ) -> bool:
+        """退号（用户取消预约）—— 把号源还给医院。
+
+        ⚠️ **真实 HIS 的退号接口在参考项目里没有调研**（端点路径未知），
+        所以路径做成可配置（默认 ``/currentRegister/cancel``）。
+        沙箱到位后按实际对齐即可。
+
+        退号失败**必须让上层知道**：本地说"取消成功"而医院还留着号，
+        用户到院发现没退 —— 这是比"退不掉"更糟的结果。
+        """
+        self.request(
+            "POST",
+            self._cancel_path(),
+            body={"clinicMasterId": external_booking_id},
+            idempotency_key=idempotency_key or None,
+        )
+        return True
 
     # ---------- 端点路径（可配置，等沙箱到位后对齐） ----------
 
@@ -423,8 +454,11 @@ class HisClient:
     def _release_path(self) -> str:
         return self._paths.get("release", "/clinicForRegist/release")
 
+    def _cancel_path(self) -> str:
+        return self._paths.get("cancel", "/currentRegister/cancel")
+
     def configure_paths(self, **paths: str) -> None:
-        """覆盖端点路径（沙箱对齐时用；键：hold / confirm / release）。"""
+        """覆盖端点路径（沙箱对齐时用；键：hold / confirm / release / cancel）。"""
         self._paths.update({k: v for k, v in paths.items() if v})
 
     # ---------- 字段映射 ----------
@@ -433,7 +467,8 @@ class HisClient:
     def _to_slot(row: Dict[str, Any]) -> HisSlot:
         """HIS 行 → ``HisSlot``。
 
-        兼容两种命名：驼峰（``currentNum``）与下划线（``current_num``），
+        兼容三种命名：驼峰（``currentNum``，参考项目风格）、下划线
+        （``current_num``，本地 HIS 替身风格）、以及少数字段缺失。
         医院侧实现差异很大，两个都认。
         """
 

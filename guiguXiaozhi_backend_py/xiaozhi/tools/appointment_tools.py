@@ -154,10 +154,15 @@ class BookAppointmentTool(Tool):
         if result.outcome == BookingOutcome.ALREADY_EXISTS:
             existing = result.appointment
             doctor_text = f"（医生：{existing.doctor_name or '未指定'}）" if existing else ""
-            return ToolResult.fail(
+            # ⚠️ 返回 **成功**而不是失败：重复预约是**幂等命中**（用户想要
+            # "确保约上"这个目标已经达成），不是操作失败。
+            # 真机实测：返回 fail 时模型看到失败信号就**自己编了失败原因**
+            #（"可能是号源刚刚被占满"）—— 用户被误导，以为真没约上。
+            return ToolResult.ok(
                 f"您在{data['department']} {data['date']} {data['time']}"
-                f"已有预约{doctor_text}，请勿重复预约。",
+                f"已有预约{doctor_text}，无需重复预约。",
                 error_type="DuplicateAppointment",
+                already_exists=True,
             )
         if result.outcome == BookingOutcome.NO_SLOT:
             return ToolResult.fail(
@@ -246,12 +251,20 @@ class CancelAppointmentTool(Tool):
             retry_policy="query_before_retry",
         )
 
-    def __init__(self, repository: AppointmentRepository) -> None:
+    def __init__(
+        self,
+        repository: AppointmentRepository,
+        slot_service: Optional[SlotService] = None,
+    ) -> None:
         self.repository = repository
         # Phase 3a：取消 = 状态迁移，业务规则在服务层。
-        # 取消不需要号源服务（slot_service 传 None）；
-        # 本工具只用 cancel，book 的号源检查走 BookAppointmentTool。
-        self._service = AppointmentService(repository, None)
+        #
+        # Phase 3b 修正：取消**需要**号源服务 —— 真实 HIS 里退号必须通知医院
+        # （否则"本地说取消了、医院还留着号"，用户到院发现没退）。
+        # 之前这里传 None，导致服务层跳过 HIS 退号、只改本地状态
+        # （真机实测：号源 current_num 没回落，HIS 侧单子仍是 REGISTERED）。
+        # slot_service 保持可选（默认 None = 只改本地，历史行为）。
+        self._service = AppointmentService(repository, slot_service)
 
     async def call(self, params: Dict[str, Any]) -> Any:
         from xiaozhi.core.tool import ToolResult
@@ -296,6 +309,14 @@ class CancelAppointmentTool(Tool):
             )
         if result.outcome == BookingOutcome.FAILED:
             # 业务层已经给了可读文案（未找到 / 已取消 / 失败）
+            if "无需重复取消" in result.message:
+                # 已经是取消态 → **幂等命中**（目标已达成），返回成功。
+                # 与重复预约同理：返回 fail 会让模型自己编失败原因。
+                return ToolResult.ok(
+                    result.message,
+                    error_type="AlreadyCancelled",
+                    already_cancelled=True,
+                )
             error_type = "NotFound" if "未找到" in result.message else "PersistenceError"
             return ToolResult.fail(result.message, error_type=error_type)
         return ToolResult.fail(

@@ -207,8 +207,15 @@ async def test_approved_token_executes_with_bound_args():
     assert tool.received == ARGS
 
 
-async def test_tampered_args_invalidate_approval():
-    """验收 2：确认参数 A 后模型把日期改成 B → 拒绝。"""
+async def test_tampered_args_cannot_change_confirmed_execution():
+    """验收 2（语义更新）：模型改了参数 → **按用户确认的参数执行**。
+
+    2026-11-11 真机事故：执行轮模型重新生成的参数与审批时不一致
+    （7b 两轮输出不稳定），硬比哈希会让"用户点了确认却被拒"。
+
+    现在的语义：**执行的是用户确认过的那组参数** —— 模型改参数改不出
+    越权行为（比"直接拒绝"更强：拒绝会让用户白白确认）。
+    """
     executor, service, tool = _build()
     token = await _make_token(executor, service, tool)
     _ctx(token)
@@ -219,9 +226,11 @@ async def test_tampered_args_invalidate_approval():
         ),
         tool,
     )
-    assert result.error_type == "ApprovalRejected"
-    assert result.metadata["approval"]["reason_code"] == "invalid_or_replayed"
-    assert tool.call_count == 0
+    assert result.success, result.content
+    assert tool.call_count == 1
+    # 关键断言：工具收到的是**确认过的**日期，不是模型改的那个
+    assert tool.received["date"] == ARGS["date"]
+    assert tool.received["date"] != "2026-11-21"
 
 
 async def test_token_replay_is_rejected():

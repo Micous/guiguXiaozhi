@@ -53,6 +53,7 @@ from xiaozhi.service.impl.VectorStoreDoctorService import VectorStoreDoctorServi
 from xiaozhi.service.doctor_service import DoctorService
 from xiaozhi.service.his_client import HisClient
 from xiaozhi.service.his_slot_service import HisSlotService
+from xiaozhi.service.local_his import LocalHisServer
 from xiaozhi.service.slot_service import MockSlotService, SlotService
 from xiaozhi.tools.appointment_tools import (
     BookAppointmentTool,
@@ -96,12 +97,16 @@ class Application:
     session_access: Optional[SessionAccess] = None
     # P2 审批闭环（灰度：approval_enabled=false 时为 None）
     approval_service: Optional[ApprovalService] = None
+    # 本地 HIS 替身（slot_service_impl=local_his 时非 None）
+    local_his_server: Optional[LocalHisServer] = None
 
     async def aclose(self) -> None:
         """优雅停机：释放连接"""
         await self.chat_model.aclose()
         await self.embedding_model.aclose()
         await self.conversation_store.close()
+        if self.local_his_server is not None:
+            self.local_his_server.stop()
         self.audit.close()
 
 
@@ -147,11 +152,19 @@ def load_system_prompt(doctor_service=None) -> str:
     return text
 
 
-def _build_slot_service(settings: Settings, doctor_service: DoctorService) -> SlotService:
+def _build_slot_service(
+    settings: Settings,
+    doctor_service: DoctorService,
+    *,
+    local_his_server=None,
+) -> SlotService:
     """按配置装配号源适配器（组合根唯一装配点）。
 
-    ``mock``：本地模拟（内网演示用）。
-    ``his``：真实医院 HIS（Phase 3b）—— 需要 ``HIS_API_BASE_URL`` 等配置。
+    ``mock``：本地模拟（内网演示用，一步式，无预占/退号语义）。
+    ``local_his``：**本地 HIS 替身**（推荐给开发/联调）—— 行为完整的
+      预占/确认/释放/退号/查单，号源**真的会被扣与归还**，零外部进程
+      （内嵌在应用进程的后台线程里），状态落本地 JSON 文件。
+    ``his``：真实医院 HIS —— 需要 ``HIS_API_BASE_URL`` 等配置。
 
     ⚠️ 关键红线：**只有真正连上真实 HIS 并通过端到端验收之后**，
     才允许把适配器名登记进 ``config_guard.IMPLEMENTED_REAL_SLOT_ADAPTERS``，
@@ -163,6 +176,35 @@ def _build_slot_service(settings: Settings, doctor_service: DoctorService) -> Sl
     impl = settings.slot_service_impl.strip().lower()
     if impl == "mock":
         return MockSlotService(doctor_service)
+    if impl == "local_his":
+        # 本地 HIS 替身：内嵌启动，号源从**本院真实医生排班**生成
+        # （保证"号源里有的医生"与"查询专家工具返回的医生"一致，
+        #  不会出现用户约不到但能查到的割裂）。
+        if local_his_server is None:
+            raise ProductionConfigError(
+                "slot_service_impl='local_his' 但本地 HIS 服务未装配："
+                "请检查组合根的装配顺序。"
+            )
+        roster = []
+        for dept in doctor_service.list_departments() or []:
+            for doctor in doctor_service.list_doctors(dept) or []:
+                roster.append({"department": doctor.department, "name": doctor.name})
+        count = local_his_server.seed_from_roster(
+            roster, limit_num=settings.local_his_limit_num
+        )
+        base_url = local_his_server.start()
+        logger.info(
+            "号源适配器：本地 HIS 替身（%s，排班 %d 条，限号 %d）",
+            base_url,
+            count,
+            settings.local_his_limit_num,
+        )
+        client = HisClient(
+            base_url,
+            token=settings.his_api_token or "local-his",
+            timeout=settings.his_api_timeout,
+        )
+        return HisSlotService(client, org_id=settings.his_org_id)
     if impl == "his":
         if not settings.his_api_base_url.strip():
             raise ProductionConfigError(
@@ -177,6 +219,7 @@ def _build_slot_service(settings: Settings, doctor_service: DoctorService) -> Sl
                 "hold": settings.his_hold_path,
                 "confirm": settings.his_confirm_path,
                 "release": settings.his_release_path,
+                "cancel": settings.his_cancel_path,
             }
             or None,
         )
@@ -310,7 +353,20 @@ async def get_application(settings: Optional[Settings] = None) -> Application:
         retrieve_all_chunks=vector_store.all_texts,
         roster_file=settings.rag_excluded_files[0] if settings.rag_excluded_files else "doctors.md",
     )
-    slot_service = _build_slot_service(settings, doctor_service)
+    # 本地 HIS 替身（slot_service_impl=local_his 时才启动）：
+    # 内嵌后台线程 + ThreadingHTTPServer，零外部进程；状态落本地 JSON。
+    local_his_server = None
+    if settings.slot_service_impl.strip().lower() == "local_his":
+        local_his_server = LocalHisServer(
+            persist_path=(
+                Path(settings.local_his_state_path)
+                if settings.local_his_state_path.strip()
+                else None
+            )
+        )
+    slot_service = _build_slot_service(
+        settings, doctor_service, local_his_server=local_his_server
+    )
 
     # ---- 仓储 ----
     repository = MySQLAppointmentRepository(
@@ -354,7 +410,8 @@ async def get_application(settings: Optional[Settings] = None) -> Application:
             ),
             QuerySlotTool(slot_service, doctor_service),
             QueryDoctorsTool(doctor_service),
-            CancelAppointmentTool(repository),
+            # 取消也要号源服务（真实 HIS 退号必须通知医院）
+            CancelAppointmentTool(repository, slot_service),
         ]
     )
 
@@ -536,6 +593,7 @@ async def get_application(settings: Optional[Settings] = None) -> Application:
         audit=audit,
         health=health,
         rate_limiter=rate_limiter,
+        local_his_server=local_his_server,
         shutdown=shutdown,
         profile_service=profile_service,
         token_service=token_service,

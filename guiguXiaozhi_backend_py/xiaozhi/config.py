@@ -48,6 +48,13 @@ class Settings(BaseSettings):
     his_release_path: str = ""
     # 患者引用脱敏盐（P0-06：业务主键逐步切到 patient_ref，盐必须由环境注入）
     his_patient_ref_salt: str = ""
+    # 退号端点路径（真实 HIS 的退号接口未调研，做成可配置）
+    his_cancel_path: str = ""
+    # ---- 本地 HIS 替身（slot_service_impl=local_his 时生效）----
+    # 每人每天的限号数（号源池大小）
+    local_his_limit_num: int = 5
+    # 状态持久化文件（留空 = 只在内存中，重启丢失号源状态）
+    local_his_state_path: str = ""
 
     # ---------- 服务 ----------
     host: str = "127.0.0.1"

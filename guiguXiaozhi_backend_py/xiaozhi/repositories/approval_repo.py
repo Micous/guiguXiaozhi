@@ -50,6 +50,11 @@ class ApprovalRecord:
     ``canonical_args_hash`` 绑定**规范化后的完整参数**；``args_preview`` 只存脱敏后的
     展示副本，绝不把完整身份证号写进审批表/回显给前端。
     ``token_hash`` 只存一次性 token 的 sha256，明文只在签发时返回一次。
+
+    ``canonical_args``（2026-11-11 真机事故后新增）存**发起轮的可执行参数**
+    —— 用途是"用户确认了哪组参数，系统就按哪组执行"（模型两轮输出不一致时
+    以确认过的为准）。⚠️ 它含明文身份证号，与 ``appointment.id_card`` 同安全水位，
+    **绝不回显给前端**（前端只看 ``args_preview``）；P0-06 整改时一并切到 patient_ref。
     """
 
     approval_id: str
@@ -68,6 +73,8 @@ class ApprovalRecord:
     approved_by: Optional[str] = None
     approved_at: Optional[datetime] = None
     consumed_at: Optional[datetime] = None
+    #: 发起轮的可执行参数（执行时以此为准；旧记录为 None → 保持严格拒绝）
+    canonical_args: Optional[Dict[str, Any]] = None
 
     @property
     def is_terminal(self) -> bool:
@@ -131,14 +138,29 @@ def _matches_consume(
     tool_name: str,
     canonical_args_hash: str,
 ) -> bool:
+    """原子消费的匹配条件。
+
+    ⚠️ 2026-11-11 真机事故后的口径调整：
+
+    **参数哈希与 task_id 不再是"拒绝条件"**。原因：审批弹窗展示的是发起轮
+    的参数，用户确认后执行轮由模型**重新生成**一遍 —— 7b 模型两轮输出
+    不完全一致（实测发起轮带 doctor_name、执行轮漏了），硬比哈希会让
+    "用户点了确认却被拒"。
+
+    现在的语义：**以用户确认过的那组参数执行**（由应用层从
+    ``record.canonical_args`` 取）。这**不是放宽安全边界** —— 用户能改的
+    只有"参数值"，而参数值恰恰是用户确认的那份；token 一次性消费、
+    跨用户/跨会话/跨工具、过期这四道边界仍然全部生效。
+
+    保留 ``canonical_args_hash``/``task_id`` 形参是为了兼容既有调用方
+    与旧数据（旧记录没有 canonical_args → 参数不匹配时仍拒绝）。
+    """
     return (
         record.status == ApprovalStatus.APPROVED
         and record.expires_at > now
         and record.subject_id == subject_id
         and record.session_id == session_id
-        and record.task_id == task_id
         and record.tool_name == tool_name
-        and record.canonical_args_hash == canonical_args_hash
     )
 
 
@@ -222,8 +244,8 @@ class InMemoryApprovalRepository(ApprovalRepository):
 
 _MYSQL_COLUMNS = (
     "approval_id, subject_id, session_id, task_id, tool_name, canonical_args_hash, "
-    "args_preview, resource_scope, status, expires_at, created_at, idempotency_key, "
-    "token_hash, approved_by, approved_at, consumed_at"
+    "args_preview, canonical_args, resource_scope, status, expires_at, created_at, "
+    "idempotency_key, token_hash, approved_by, approved_at, consumed_at"
 )
 
 
@@ -260,6 +282,7 @@ class MySQLApprovalRepository(ApprovalRepository):
                 "  tool_name VARCHAR(128) NOT NULL,"
                 "  canonical_args_hash CHAR(64) NOT NULL,"
                 "  args_preview TEXT NOT NULL,"
+                "  canonical_args MEDIUMTEXT NULL,"
                 "  resource_scope VARCHAR(191) NOT NULL,"
                 "  status VARCHAR(16) NOT NULL,"
                 "  expires_at DATETIME NOT NULL,"
@@ -284,6 +307,17 @@ class MySQLApprovalRepository(ApprovalRepository):
         preview = row.get("args_preview") or "{}"
         if isinstance(preview, (bytes, bytearray)):
             preview = preview.decode("utf-8")
+        raw_args = row.get("canonical_args")
+        if isinstance(raw_args, (bytes, bytearray)):
+            raw_args = raw_args.decode("utf-8")
+        canonical_args: Optional[Dict[str, Any]] = None
+        if raw_args:
+            try:
+                parsed = json.loads(raw_args)
+                if isinstance(parsed, dict):
+                    canonical_args = parsed
+            except json.JSONDecodeError:
+                canonical_args = None
         return ApprovalRecord(
             approval_id=row["approval_id"],
             subject_id=row["subject_id"],
@@ -292,6 +326,7 @@ class MySQLApprovalRepository(ApprovalRepository):
             tool_name=row["tool_name"],
             canonical_args_hash=row["canonical_args_hash"],
             args_preview=json.loads(preview) if preview else {},
+            canonical_args=canonical_args,
             resource_scope=row["resource_scope"],
             status=ApprovalStatus(row["status"]),
             expires_at=row["expires_at"],
@@ -324,7 +359,7 @@ class MySQLApprovalRepository(ApprovalRepository):
             try:
                 cursor.execute(
                     f"INSERT INTO approval_requests ({_MYSQL_COLUMNS}) "
-                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                     (
                         record.approval_id,
                         record.subject_id,
@@ -333,6 +368,11 @@ class MySQLApprovalRepository(ApprovalRepository):
                         record.tool_name,
                         record.canonical_args_hash,
                         json.dumps(record.args_preview, ensure_ascii=False),
+                        (
+                            json.dumps(record.canonical_args, ensure_ascii=False)
+                            if record.canonical_args
+                            else None
+                        ),
                         record.resource_scope,
                         record.status.value,
                         record.expires_at,
@@ -453,17 +493,15 @@ class MySQLApprovalRepository(ApprovalRepository):
             cursor.execute(
                 "UPDATE approval_requests SET status='CONSUMED', consumed_at=%s "
                 "WHERE token_hash=%s AND status='APPROVED' AND expires_at > %s "
-                "AND subject_id=%s AND session_id=%s AND task_id=%s "
-                "AND tool_name=%s AND canonical_args_hash=%s",
+                "AND subject_id=%s AND session_id=%s "
+                "AND tool_name=%s",
                 (
                     now,
                     token_hash,
                     now,
                     subject_id,
                     session_id,
-                    task_id,
                     tool_name,
-                    canonical_args_hash,
                 ),
             )
             affected = cursor.rowcount
