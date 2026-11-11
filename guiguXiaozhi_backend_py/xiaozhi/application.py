@@ -51,6 +51,8 @@ from xiaozhi.security.secure_executor import SecureToolExecutor
 from xiaozhi.security.session_access import SessionAccess
 from xiaozhi.service.impl.VectorStoreDoctorService import VectorStoreDoctorService
 from xiaozhi.service.doctor_service import DoctorService
+from xiaozhi.service.his_client import HisClient
+from xiaozhi.service.his_slot_service import HisSlotService
 from xiaozhi.service.slot_service import MockSlotService, SlotService
 from xiaozhi.tools.appointment_tools import (
     BookAppointmentTool,
@@ -148,14 +150,40 @@ def load_system_prompt(doctor_service=None) -> str:
 def _build_slot_service(settings: Settings, doctor_service: DoctorService) -> SlotService:
     """按配置装配号源适配器（组合根唯一装配点）。
 
-    目前只有 MockSlotService。Phase 3b 实现 HisSlotService 后在此加分支，
-    并同步把适配器名登记进 config_guard.IMPLEMENTED_REAL_SLOT_ADAPTERS，
-    production 门禁才会放行。填了未实现的名字要在任何外部连接前就报错，
-    不能等到工具层才发现号源是假的。
+    ``mock``：本地模拟（内网演示用）。
+    ``his``：真实医院 HIS（Phase 3b）—— 需要 ``HIS_API_BASE_URL`` 等配置。
+
+    ⚠️ 关键红线：**只有真正连上真实 HIS 并通过端到端验收之后**，
+    才允许把适配器名登记进 ``config_guard.IMPLEMENTED_REAL_SLOT_ADAPTERS``，
+    production 门禁才会放行。适配层代码写完 ≠ 可以宣称"真实挂号可用"。
+
+    填了未实现的名字要在任何外部连接前就报错，不能等到工具层才发现
+    号源是假的。
     """
     impl = settings.slot_service_impl.strip().lower()
     if impl == "mock":
         return MockSlotService(doctor_service)
+    if impl == "his":
+        if not settings.his_api_base_url.strip():
+            raise ProductionConfigError(
+                "slot_service_impl='his' 但未配置 HIS_API_BASE_URL："
+                "请设置医院 HIS 网关地址后重启。"
+            )
+        client = HisClient(
+            settings.his_api_base_url,
+            token=settings.his_api_token,
+            timeout=settings.his_api_timeout,
+            paths={
+                "hold": settings.his_hold_path,
+                "confirm": settings.his_confirm_path,
+                "release": settings.his_release_path,
+            }
+            or None,
+        )
+        logger.info(
+            "号源适配器：真实 HIS（base=%s）", settings.his_api_base_url
+        )
+        return HisSlotService(client, org_id=settings.his_org_id)
     raise ProductionConfigError(
         f"号源适配器 {settings.slot_service_impl!r} 尚未实现："
         "请在 xiaozhi/service/ 下实现 HisSlotService 并在组合根注册后再启动。"
@@ -318,7 +346,12 @@ async def get_application(settings: Optional[Settings] = None) -> Application:
     # 模型优先选它 —— 查号源放前面时模型会先查号源然后就"口头确认"而不真正下单）。
     tool_registry.register_all(
         [
-            BookAppointmentTool(repository, slot_service, doctor_service),
+            BookAppointmentTool(
+                repository,
+                slot_service,
+                doctor_service,
+                patient_ref_salt=settings.his_patient_ref_salt,
+            ),
             QuerySlotTool(slot_service, doctor_service),
             QueryDoctorsTool(doctor_service),
             CancelAppointmentTool(repository),

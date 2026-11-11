@@ -86,13 +86,18 @@ class BookAppointmentTool(Tool):
         repository: AppointmentRepository,
         slot_service: SlotService,
         doctor_service: DoctorService,
+        *,
+        patient_ref_salt: str = "",
     ) -> None:
         self.repository = repository
         self.slot_service = slot_service
         self.doctor_service = doctor_service
         # Phase 3a：业务规则（状态机、原子查重写入、异常分类）收敛到服务层；
         # 工具层只负责"参数校验 → 调服务 → 转述结果"。
-        self._service = AppointmentService(repository, slot_service)
+        # Phase 3b：patient_ref_salt 用于生成脱敏患者引用（P0-06 方向）。
+        self._service = AppointmentService(
+            repository, slot_service, patient_ref_salt=patient_ref_salt
+        )
         # 本院真实科室清单 —— 注入工具描述，避免模型自己编科室名。
         # 2026-11-10 真实联调：用户问"内科"，本院没有泛化的"内科"，
         # 模型被拒后**编了一个"呼吸科"**（真名是"呼吸内科"），

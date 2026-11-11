@@ -399,3 +399,71 @@
 2. **UNKNOWN 的处置流程是"人工/用户重问"**：恢复扫描只标记，不会自动查业务事实并补写结果。要做到"自动对账后收敛为 CONFIRMED"需要业务侧提供查询接口（Phase 3b HIS 侧）。
 3. **任务表按 subject_id 建了索引但没有清理策略**：长期运行会无限增长，需要归档/TTL 策略（可归 Phase 6 观测集中化批次）。
 4. **审批等待中的任务与 approval_requests 表是两套状态**：审批服务自己管 PENDING→APPROVED→CONSUMED，任务表只记 WAITING_APPROVAL。两者的原子性未做跨表事务（当前靠恢复扫描的过期关闭兜底）。
+
+------------------------------------------------------------------------
+
+## 12. Phase 3b 增量复核（2026-11-11，P0-03 真实 HIS 适配层）
+
+> 测试基线：**506 passed / 6 skipped**（离线，新增 24 条 HIS 契约测试）。
+> 本批对应路线图 Phase 3b 的**适配层部分**。P0-03 状态：`SOURCE_CONFIRMED` →
+> **`PARTIALLY_FIXED`（适配层就绪）+ EXTERNAL_DEPENDENCY（真实沙箱未接）**。
+>
+> ⚠️ **重要口径**：本批**没有**让 production 可以启动。
+> `config_guard.IMPLEMENTED_REAL_SLOT_ADAPTERS` 仍为空 —— 有测试专门钉死这一点
+> （`test_his_adapter_not_yet_released_to_production`）。**适配层写完 ≠ 真实挂号可用**。
+
+### 12.1 交付了什么
+
+| 组件 | 位置 | 职责 |
+|---|---|---|
+| `HisClient` | `service/his_client.py` | 协议层：统一响应包 `R{code,msg,data}` 解包、Sa-Token 认证、幂等键头、**错误分类**（超时/5xx → 不确定；4xx/code≠200 → 明确失败）、字段映射（驼峰/下划线双认） |
+| `HisSlotService` | `service/his_slot_service.py` | 业务层：号源查询/预占/确认/释放/查单；剩余号 = `limitNum − currentNum − currentPreNum` |
+| `AppointmentService._book_with_hold` | `service/appointment_service.py` | 两段式流程：查重 → 预占 → 落库 HOLDING → 确认 → CONFIRMED；失败释放预占 + FAILED；不确定 → UNKNOWN |
+| `ReconcileJob` | `service/his_reconcile.py` | UNKNOWN 对账：查 HIS 业务事实 → CONFIRMED / CANCELLED / FAILED；三条纪律（无据不猜、查单不确定不改状态、可重入） |
+| 迁移 004 | `migrations/sql/004_appointment_his_fields.sql` | 预约表补 `external_booking_id` / `external_hold_id` / `patient_ref` / `reconciled_at` / `reconcile_attempts`；`active_marker` 扩展为「CANCELLED/FAILED 均为终态」 |
+| 组合根装配 | `application._build_slot_service` | `slot_service_impl=his` → `HisSlotService`；端点路径/超时/机构号/token 全部可配置 |
+
+### 12.2 契约/混沌测试（`tests/unit/test_his_integration_contract.py`，24 条）
+
+用 fake HIS server（HTTP 层）覆盖**我们这边的语义**，与医院实现无关：
+
+* 统一响应包：HTTP 200 但 `code != 200` → 业务失败（**HTTP 200 ≠ 成功**）；
+* 剩余号必须扣掉预占数（并发超卖的根源）；
+* **幂等**：同一键重发 → 同一结果；**并发 20 次同一键 → HIS 只处理 1 次**；不同键独立；
+* 幂等键是 sha256，**不含身份证号**（不会进 HIS 侧日志）；
+* **超时 = 不确定**（`HisUncertainError`）→ 本地 UNKNOWN，**不是 FAILED**；
+* 5xx → 不确定；4xx → 明确失败；
+* 确认失败 → **释放预占**（号源不被白占）+ 本地 FAILED；
+* 对账：有单 → CONFIRMED；无单 → FAILED；无外部单号 → 跳过；查单不确定 → 保持 UNKNOWN + attempts+1；超阈值 → 跳过并告警；可重入；
+* 本地查重与 HIS 号源是**两道独立防线**；
+* FAILED 是终态 → 同一时段可重新预约（不占唯一约束）。
+
+### 12.3 真机暴露并修复的两个设计缺陷
+
+用 fake HIS server 做真机联调（8082，`slot_service_impl=his`）时暴露：
+
+1. **本地查重在预占之后** → 重复预约时「白预占再白释放」（fake 侧 hold=1 / release=1），
+   用户白等一轮跨网络调用，真实环境下号源被短暂占用。
+   **修复**：查重前置（廉价检查先做）；竞态由 HIS 侧预占原子性 + 落库唯一约束两道防线兜住。
+2. **hold 与 confirm 共用同一个幂等键** → HIS 侧按幂等键去重时，"确认"会命中"预占"的记录
+   → **号被占住但挂号单没落成（号泄漏）**。
+   **修复**：幂等键带操作前缀（`hold` / `confirm` / `release`），同一操作的重试仍幂等。
+
+两条都补了回归测试（`test_local_duplicate_check_happens_before_hold`、
+`test_hold_and_confirm_use_different_idempotency_keys`）。
+
+### 12.4 仍然存在的口径差异（不要误读为「真实挂号可用」）
+
+1. **没有连过真实医院系统**：fake HIS 是按参考项目契约造的**替身**，端点路径、字段名、
+   科室/时段枚举、认证方式都可能与真实实现不同。对接清单见 `docs/his-sandbox-onboarding.md`。
+2. **退号接口完全未知**：参考项目未调研，取消预约目前**只改本地状态**，不通知 HIS ——
+   真实上线前必须补，否则"本地说取消了、医院还留着"。
+3. **HIS 侧幂等语义未验证**：我们带了 `X-Idempotency-Key`，但医院侧是否识别、保留多久未知。
+   **如果 HIS 不支持幂等，网络抖动就会重复挂号** —— 这是上线前必须确认的项。
+4. **预占与落单可能无法拆分**：参考项目是「先扣号源再落单」的组合动作（无独立预占端点）。
+   若真实 HIS 也如此，失败回滚路径不成立，需要「释放接口」或「对账 Job 清理僵尸预占」。
+5. **P0-06 只做了方向**：`patient_ref`（带盐 sha256）已落库，但**存量数据与本地查重键仍依赖
+   明文 `id_card`** —— 切换业务主键需要配套迁移（数据回填 + 双写期 + 唯一约束变更）。
+6. **UNKNOWN 的自动对账未接生产调度**：`ReconcileJob` 已实现且可重入，但目前没有 cron /
+   CronJob 装配 —— 上线前需挂定时任务。
+7. **患者主档未接**：真实 HIS 挂号单要挂患者主档（`PatMasterIndex`），先查档/建档的流程未实现。

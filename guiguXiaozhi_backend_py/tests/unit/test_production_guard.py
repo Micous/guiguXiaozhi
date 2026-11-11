@@ -218,10 +218,45 @@ def test_build_slot_service_returns_mock_in_development():
 def test_build_slot_service_rejects_unregistered_adapter():
     """填了未实现的适配器名要明确报错，不能悄悄退回 Mock。"""
     from xiaozhi.application import _build_slot_service
+    from xiaozhi.config_guard import ProductionConfigError
+
+    with pytest.raises(ProductionConfigError) as exc:
+        _build_slot_service(dev(slot_service_impl="not_exist"), object())
+    assert "尚未实现" in str(exc.value)
+
+
+def test_build_slot_service_builds_his_adapter_when_configured():
+    """Phase 3b：``his`` 分支能装配出真实适配器（配置齐全时）。"""
+    from xiaozhi.application import _build_slot_service
+    from xiaozhi.service.his_slot_service import HisSlotService
+
+    settings = dev(
+        slot_service_impl="his",
+        his_api_base_url="http://his-sandbox.example.internal",
+        his_api_token="sandbox-token",
+    )
+    service = _build_slot_service(settings, object())
+    assert isinstance(service, HisSlotService)
+
+
+def test_build_slot_service_his_requires_base_url():
+    """选了 his 却没有网关地址 → 明确报错（不能静默退回 Mock）。"""
+    from xiaozhi.application import _build_slot_service
+    from xiaozhi.config_guard import ProductionConfigError
 
     with pytest.raises(ProductionConfigError) as exc:
         _build_slot_service(dev(slot_service_impl="his"), object())
-    assert "尚未实现" in str(exc.value)
+    assert "HIS_API_BASE_URL" in str(exc.value)
+
+
+def test_his_adapter_not_yet_released_to_production():
+    """钉死当前事实：适配层写完 ≠ 真实挂号可用。
+
+    ``IMPLEMENTED_REAL_SLOT_ADAPTERS`` 仍为空 —— 只有完成真实沙箱端到端
+    验收后，才允许把 "his" 登记进去。防止有人看到代码就宣称"已可上线"。
+    """
+    assert config_guard.IMPLEMENTED_REAL_SLOT_ADAPTERS == frozenset()
+    assert "his" not in config_guard.IMPLEMENTED_REAL_SLOT_ADAPTERS
 
 
 # ---------------------------------------------------------------- 认证门禁（P1-A）

@@ -61,6 +61,9 @@ class AppointmentStatus(str, Enum):
     ``REQUESTED → HOLDING → CONFIRMED``：请求 → 预占 → 确认；
     ``UNKNOWN``：结果核实中（外部号源超时等，需要对账）；
     ``CANCELLED``：已取消（**不物理删除**，保留审计痕迹）。
+
+    Phase 3b（审计 P0-03）补充 ``FAILED``：对账确认 HIS 侧确实没有
+    这条单 → 本地收敛为失败（区别于 UNKNOWN 的"还不知道"）。
     """
 
     REQUESTED = "REQUESTED"
@@ -68,6 +71,8 @@ class AppointmentStatus(str, Enum):
     CONFIRMED = "CONFIRMED"
     UNKNOWN = "UNKNOWN"
     CANCELLED = "CANCELLED"
+    #: 对账后确认外部**没有**这条单（终态，与 UNKNOWN 的"不确定"不同）
+    FAILED = "FAILED"
 
 
 #: 可以被取消的状态（已取消/未确认的不能再取消）
@@ -77,6 +82,20 @@ CANCELLABLE_STATUSES = (
     AppointmentStatus.CONFIRMED,
     AppointmentStatus.UNKNOWN,
 )
+
+#: **终态**状态 —— 不再占用"活跃预约"名额，同一时段可重新预约。
+#:
+#: 与数据库生成列 ``active_marker`` 的表达式必须一致：
+#: ``IF(status IN ('CANCELLED','FAILED'), NULL, 1)``。
+#: 口径不一致的后果：查重把已失败的记录当重复（用户约不上），
+#: 或者唯一约束拒绝对失败记录的重新预约。
+TERMINAL_STATUSES = (
+    AppointmentStatus.CANCELLED,
+    AppointmentStatus.FAILED,
+)
+
+#: 终态状态值的 SQL IN 列表（供仓储拼查询用）
+_TERMINAL_STATUS_SQL = ", ".join(f"'{s.value}'" for s in TERMINAL_STATUSES)
 
 
 @dataclass
@@ -93,6 +112,17 @@ class Appointment:
     # ---- Phase 3a 新增 ----
     status: AppointmentStatus = AppointmentStatus.CONFIRMED
     version: int = 1
+    # ---- Phase 3b 新增（HIS 对接）----
+    #: HIS 侧挂号单 id（ClinicMaster.id）—— 对账的唯一凭据
+    external_booking_id: Optional[str] = None
+    #: HIS 侧预占 id —— 释放/确认时使用
+    external_hold_id: Optional[str] = None
+    #: 患者引用（脱敏内部引用）—— P0-06 整改方向：业务主键应逐步切到它
+    patient_ref: Optional[str] = None
+    #: 最后一次对账完成时间（None = 从未对账）
+    reconciled_at: Optional[str] = None
+    #: 对账尝试次数（连续失败达阈值后告警）
+    reconcile_attempts: int = 0
 
     def key(self) -> Tuple[str, str, str, str, str]:
         """防重复预约的判定键（不含医生 —— 同科室同时段只能有一条）
@@ -117,6 +147,21 @@ class Appointment:
         """
         raw = "|".join((username, id_card, department, date, time))
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:64]
+
+    @staticmethod
+    def make_patient_ref(id_card: str, salt: str = "") -> str:
+        """生成患者引用（脱敏）。
+
+        真实上线后应该用 ``patient_ref`` 做业务主键而不是明文身份证
+        （P0-06）。这里给的是**过渡实现**：带盐 sha256 前 32 位，
+        不可逆但对同一身份证稳定 —— 可以跨请求关联同一患者，
+        又不会把明文身份证送到 HIS 或日志里。
+
+        ⚠️ 带盐是必须的：不带盐的话，身份证号空间有限（可暴力枚举），
+        等于没脱敏。盐由部署配置注入，不进代码库。
+        """
+        raw = f"{salt}|{id_card}"
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
 
 
 class AppointmentRepository(ABC):
@@ -165,6 +210,38 @@ class AppointmentRepository(ABC):
 
         记录不存在抛 ``NotFound``；已取消抛 ``InvalidState``。
         """
+
+    @abstractmethod
+    def update_status(
+        self,
+        appointment_id: int,
+        status: AppointmentStatus,
+        *,
+        expected_version: Optional[int] = None,
+        external_booking_id: Optional[str] = None,
+        external_hold_id: Optional[str] = None,
+        reconciled_at: Optional[datetime] = None,
+        reconcile_attempts: Optional[int] = None,
+    ) -> Appointment:
+        """状态迁移（Phase 3b 对账用）。
+
+        * ``expected_version`` 给定时做**乐观锁**：版本不匹配抛
+          ``InvalidState``（说明有人并发改过，对账不能盲目覆盖）；
+        * HIS 字段只在**显式传入**时更新（``None`` = 不动）——
+          对账拿不到外部单号时不能把已有值抹成 NULL。
+
+        记录不存在抛 ``NotFound``。
+        """
+
+    @abstractmethod
+    def list_by_status(
+        self, status: AppointmentStatus, limit: int = 50
+    ) -> List[Appointment]:
+        """按状态取记录（对账 Job 扫描 UNKNOWN 用）。"""
+
+    @abstractmethod
+    def get_by_id(self, appointment_id: int) -> Optional[Appointment]:
+        """按主键取单条记录（对账 Job 回读/测试断言用）。"""
 
     @abstractmethod
     def delete(self, appointment_id: int) -> bool:
@@ -241,10 +318,18 @@ class MySQLAppointmentRepository(AppointmentRepository):
             doctor_name=row.get("doctor_name"),
             status=status,
             version=int(row.get("version") or 1),
+            # ---- Phase 3b：HIS 对接字段（旧库可能没有这些列 → 取不到就是 None）----
+            external_booking_id=row.get("external_booking_id"),
+            external_hold_id=row.get("external_hold_id"),
+            patient_ref=row.get("patient_ref"),
+            reconciled_at=row.get("reconciled_at"),
+            reconcile_attempts=int(row.get("reconcile_attempts") or 0),
         )
 
     _SELECT_COLUMNS = (
-        "id, username, id_card, department, date, time, doctor_name, status, version"
+        "id, username, id_card, department, date, time, doctor_name, status, version, "
+        "external_booking_id, external_hold_id, patient_ref, reconciled_at, "
+        "reconcile_attempts"
     )
 
     def find_duplicate(self, appointment: Appointment) -> Optional[Appointment]:
@@ -254,7 +339,7 @@ class MySQLAppointmentRepository(AppointmentRepository):
             cursor.execute(
                 f"SELECT {self._SELECT_COLUMNS} FROM appointment "
                 "WHERE username=%s AND id_card=%s AND department=%s "
-                "AND date=%s AND time=%s AND status <> 'CANCELLED' LIMIT 1",
+                f"AND date=%s AND time=%s AND status NOT IN ({_TERMINAL_STATUS_SQL}) LIMIT 1",
                 (
                     appointment.username,
                     appointment.id_card,
@@ -300,23 +385,7 @@ class MySQLAppointmentRepository(AppointmentRepository):
         try:
             cursor = conn.cursor()
             now = datetime.now()
-            cursor.execute(
-                "INSERT INTO appointment (username, id_card, department, date, time, "
-                "doctor_name, status, version, created_at, updated_at) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-                (
-                    appointment.username,
-                    appointment.id_card,
-                    appointment.department,
-                    appointment.date,
-                    appointment.time,
-                    appointment.doctor_name,
-                    appointment.status.value,
-                    appointment.version,
-                    now,
-                    now,
-                ),
-            )
+            cursor.execute(self._INSERT_SQL, self._insert_params(appointment, now))
             conn.commit()
             appointment.id = cursor.lastrowid
             cursor.close()
@@ -326,6 +395,37 @@ class MySQLAppointmentRepository(AppointmentRepository):
             raise self._translate(exc, "写入预约") from exc
         finally:
             conn.close()
+
+    # Phase 3b：插入语句集中一处 —— save 与 create_if_absent 共用，
+    # 避免"一处加了 HIS 字段另一处忘了"的漏写（这类漏写只在真机暴露）。
+    _INSERT_SQL = (
+        "INSERT INTO appointment (username, id_card, department, date, time, "
+        "doctor_name, status, version, external_booking_id, external_hold_id, "
+        "patient_ref, reconciled_at, reconcile_attempts, created_at, updated_at) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
+    )
+
+    @staticmethod
+    def _insert_params(
+        appointment: Appointment, now: datetime
+    ) -> Tuple[Any, ...]:
+        return (
+            appointment.username,
+            appointment.id_card,
+            appointment.department,
+            appointment.date,
+            appointment.time,
+            appointment.doctor_name,
+            appointment.status.value,
+            appointment.version,
+            appointment.external_booking_id,
+            appointment.external_hold_id,
+            appointment.patient_ref,
+            appointment.reconciled_at,
+            appointment.reconcile_attempts,
+            now,
+            now,
+        )
 
     def create_if_absent(self, appointment: Appointment) -> Tuple[Appointment, bool]:
         """原子"查重 + 写入"。
@@ -341,7 +441,7 @@ class MySQLAppointmentRepository(AppointmentRepository):
             cursor.execute(
                 f"SELECT {self._SELECT_COLUMNS} FROM appointment "
                 "WHERE username=%s AND id_card=%s AND department=%s "
-                "AND date=%s AND time=%s AND status <> 'CANCELLED' LIMIT 1 "
+                f"AND date=%s AND time=%s AND status NOT IN ({_TERMINAL_STATUS_SQL}) LIMIT 1 "
                 "FOR UPDATE",
                 (
                     appointment.username,
@@ -358,23 +458,7 @@ class MySQLAppointmentRepository(AppointmentRepository):
                 return self._row_to_appointment(row), False
 
             now = datetime.now()
-            cursor.execute(
-                "INSERT INTO appointment (username, id_card, department, date, time, "
-                "doctor_name, status, version, created_at, updated_at) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-                (
-                    appointment.username,
-                    appointment.id_card,
-                    appointment.department,
-                    appointment.date,
-                    appointment.time,
-                    appointment.doctor_name,
-                    appointment.status.value,
-                    appointment.version,
-                    now,
-                    now,
-                ),
-            )
+            cursor.execute(self._INSERT_SQL, self._insert_params(appointment, now))
             conn.commit()
             appointment.id = cursor.lastrowid
             cursor.close()
@@ -429,6 +513,121 @@ class MySQLAppointmentRepository(AppointmentRepository):
         finally:
             conn.close()
 
+    def update_status(
+        self,
+        appointment_id: int,
+        status: AppointmentStatus,
+        *,
+        expected_version: Optional[int] = None,
+        external_booking_id: Optional[str] = None,
+        external_hold_id: Optional[str] = None,
+        reconciled_at: Optional[datetime] = None,
+        reconcile_attempts: Optional[int] = None,
+    ) -> Appointment:
+        """状态迁移（Phase 3b 对账用）。"""
+        from xiaozhi.repositories.errors import InvalidState
+
+        conn = self._connect()
+        try:
+            cursor = conn.cursor(dictionary=True)
+            cursor.execute(
+                f"SELECT {self._SELECT_COLUMNS} FROM appointment WHERE id=%s",
+                (appointment_id,),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                cursor.close()
+                raise NotFound(f"预约记录不存在（id={appointment_id}）")
+            current = self._row_to_appointment(row)
+            if (
+                expected_version is not None
+                and current.version != expected_version
+            ):
+                # 乐观锁失败：有人并发改过这条记录 → 对账不能盲目覆盖
+                cursor.close()
+                raise InvalidState(
+                    f"预约记录已被并发修改（期望 version={expected_version}，"
+                    f"实际 {current.version}），跳过本次对账"
+                )
+
+            sets = ["status=%s", "version=version+1", "updated_at=NOW()"]
+            params: List[Any] = [status.value]
+            # HIS 字段只在显式传入时更新（None = 不动）——
+            # 对账查不到外部单号时不能把已有值抹成 NULL
+            if external_booking_id is not None:
+                sets.append("external_booking_id=%s")
+                params.append(external_booking_id)
+            if external_hold_id is not None:
+                sets.append("external_hold_id=%s")
+                params.append(external_hold_id)
+            if reconciled_at is not None:
+                sets.append("reconciled_at=%s")
+                params.append(reconciled_at)
+            if reconcile_attempts is not None:
+                sets.append("reconcile_attempts=%s")
+                params.append(reconcile_attempts)
+            params.append(appointment_id)
+            cursor.execute(
+                f"UPDATE appointment SET {', '.join(sets)} WHERE id=%s", tuple(params)
+            )
+            conn.commit()
+            cursor.close()
+            current.status = status
+            current.version += 1
+            if external_booking_id is not None:
+                current.external_booking_id = external_booking_id
+            if external_hold_id is not None:
+                current.external_hold_id = external_hold_id
+            if reconciled_at is not None:
+                current.reconciled_at = reconciled_at
+            if reconcile_attempts is not None:
+                current.reconcile_attempts = reconcile_attempts
+            return current
+        except (NotFound, InvalidState):
+            raise
+        except Exception as exc:
+            conn.rollback()
+            raise self._translate(exc, "更新预约状态") from exc
+        finally:
+            conn.close()
+
+    def list_by_status(
+        self, status: AppointmentStatus, limit: int = 50
+    ) -> List[Appointment]:
+        """按状态取记录（对账 Job 扫描 UNKNOWN 用）。"""
+        conn = self._connect()
+        try:
+            cursor = conn.cursor(dictionary=True)
+            cursor.execute(
+                f"SELECT {self._SELECT_COLUMNS} FROM appointment "
+                "WHERE status=%s ORDER BY id ASC LIMIT %s",
+                (status.value, max(1, int(limit))),
+            )
+            rows = cursor.fetchall()
+            cursor.close()
+            return [self._row_to_appointment(row) for row in rows]
+        except Exception as exc:
+            raise self._translate(exc, "按状态查询预约") from exc
+        finally:
+            conn.close()
+
+    def get_by_id(self, appointment_id: int) -> Optional[Appointment]:
+        """按主键取单条记录。"""
+        conn = self._connect()
+        try:
+            cursor = conn.cursor(dictionary=True)
+            cursor.execute(
+                f"SELECT {self._SELECT_COLUMNS} FROM appointment WHERE id=%s",
+                (appointment_id,),
+            )
+            row = cursor.fetchone()
+            cursor.close()
+            return self._row_to_appointment(row) if row else None
+        except Exception as exc:
+            raise self._translate(exc, "查询预约") from exc
+        finally:
+            conn.close()
+
     def delete(self, appointment_id: int) -> bool:
         """物理删除（仅运维/数据清理用）。"""
         conn = self._connect()
@@ -475,7 +674,7 @@ class InMemoryAppointmentRepository(AppointmentRepository):
             for row in self._rows:
                 if (
                     row.key() == appointment.key()
-                    and row.status != AppointmentStatus.CANCELLED
+                    and row.status not in TERMINAL_STATUSES
                 ):
                     return row
         return None
@@ -501,7 +700,7 @@ class InMemoryAppointmentRepository(AppointmentRepository):
             for row in self._rows:
                 if (
                     row.key() == appointment.key()
-                    and row.status != AppointmentStatus.CANCELLED
+                    and row.status not in TERMINAL_STATUSES
                 ):
                     return row, False
             self._seq += 1
@@ -521,6 +720,55 @@ class InMemoryAppointmentRepository(AppointmentRepository):
                     row.version += 1
                     return row
         raise NotFound(f"预约记录不存在（id={appointment_id}）")
+
+    def update_status(
+        self,
+        appointment_id: int,
+        status: AppointmentStatus,
+        *,
+        expected_version: Optional[int] = None,
+        external_booking_id: Optional[str] = None,
+        external_hold_id: Optional[str] = None,
+        reconciled_at: Optional[datetime] = None,
+        reconcile_attempts: Optional[int] = None,
+    ) -> Appointment:
+        from xiaozhi.repositories.errors import InvalidState
+
+        with self._lock:
+            for row in self._rows:
+                if row.id == appointment_id:
+                    if expected_version is not None and row.version != expected_version:
+                        raise InvalidState(
+                            f"预约记录已被并发修改（期望 version={expected_version}，"
+                            f"实际 {row.version}），跳过本次对账"
+                        )
+                    row.status = status
+                    row.version += 1
+                    # HIS 字段只在显式传入时更新（None = 不动）
+                    if external_booking_id is not None:
+                        row.external_booking_id = external_booking_id
+                    if external_hold_id is not None:
+                        row.external_hold_id = external_hold_id
+                    if reconciled_at is not None:
+                        row.reconciled_at = reconciled_at
+                    if reconcile_attempts is not None:
+                        row.reconcile_attempts = reconcile_attempts
+                    return row
+        raise NotFound(f"预约记录不存在（id={appointment_id}）")
+
+    def list_by_status(
+        self, status: AppointmentStatus, limit: int = 50
+    ) -> List[Appointment]:
+        with self._lock:
+            matched = [row for row in self._rows if row.status == status]
+            return matched[: max(1, int(limit))]
+
+    def get_by_id(self, appointment_id: int) -> Optional[Appointment]:
+        with self._lock:
+            for row in self._rows:
+                if row.id == appointment_id:
+                    return row
+        return None
 
     def delete(self, appointment_id: int) -> bool:
         with self._lock:

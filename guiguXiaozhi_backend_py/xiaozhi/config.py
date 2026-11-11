@@ -33,6 +33,21 @@ class Settings(BaseSettings):
     # 号源适配器选择（组合根据此装配）：mock = 本地模拟排班；
     # 真实 HIS 适配器在 Phase 3b 落地后于 application._build_slot_service 注册。
     slot_service_impl: str = "mock"
+    # ---- Phase 3b：真实 HIS 对接配置（slot_service_impl=his 时必填）----
+    # 网关地址（HIS 暴露的 REST 网关，不是数据库直连）
+    his_api_base_url: str = ""
+    # 认证 token（Sa-Token 等，由医院侧签发；**不进代码库**，走环境注入）
+    his_api_token: str = ""
+    # 单次调用超时（秒）—— 超时会被归类为"结果不确定"→ UNKNOWN
+    his_api_timeout: float = 10.0
+    # 医院机构号（orgId）
+    his_org_id: str = ""
+    # 端点路径（不同医院实现差异大，做成可配置；空则用默认值）
+    his_hold_path: str = ""
+    his_confirm_path: str = ""
+    his_release_path: str = ""
+    # 患者引用脱敏盐（P0-06：业务主键逐步切到 patient_ref，盐必须由环境注入）
+    his_patient_ref_salt: str = ""
 
     # ---------- 服务 ----------
     host: str = "127.0.0.1"
