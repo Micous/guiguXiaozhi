@@ -8,6 +8,7 @@
   * **权限不可自报**：token 里的 scopes 由服务端按 subject_id 计算
     （``scopes_for_subject``），客户端传什么都不会进 token；
   * **校验算法固定**：只接受 HS256，杜绝 alg=none / 算法混淆；
+  * **校验受众**：``aud`` 必须与本服务一致，别处签发的 token 不接受；
   * ``bootstrap_secret`` 仅用于内网演示换 token，比较用 ``compare_digest``
     防时序侧信道；正式环境必须换掉这个端点。
 """
@@ -74,6 +75,7 @@ class TokenService:
         secret_key: str,
         ttl_seconds: int = 3600,
         issuer: str = "xiaozhi-local",
+        audience: str = "xiaozhi-chat",
         bootstrap_secret: str = "",
         ops_subjects: Iterable[str] = (),
     ) -> None:
@@ -82,6 +84,7 @@ class TokenService:
         self._secret = secret_key
         self._ttl = max(1, int(ttl_seconds))
         self._issuer = issuer
+        self._audience = audience
         self._bootstrap_secret = bootstrap_secret
         self._ops_subjects = frozenset(ops_subjects or ())
         self._algorithm = "HS256"
@@ -110,6 +113,7 @@ class TokenService:
             "scopes": sorted(self.scopes_for_subject(subject)),
             "roles": [],
             "iss": self._issuer,
+            "aud": self._audience,
             "iat": ts,
             "exp": ts + self._ttl,
             "jti": secrets.token_hex(8),
@@ -117,7 +121,7 @@ class TokenService:
         return jwt.encode(payload, self._secret, algorithm=self._algorithm)
 
     def verify(self, token: str) -> Principal:
-        """校验签名/过期/签发方，返回不可变身份主体。"""
+        """校验签名/过期/签发方/受众，返回不可变身份主体。"""
         if not token or not token.strip():
             raise InvalidTokenError("token 为空")
         try:
@@ -126,7 +130,8 @@ class TokenService:
                 self._secret,
                 algorithms=[self._algorithm],  # 固定算法，杜绝 alg 混淆
                 issuer=self._issuer,
-                options={"require": ["exp", "iat", "sub", "iss"]},
+                audience=self._audience,
+                options={"require": ["exp", "iat", "sub", "iss", "aud"]},
             )
         except jwt.ExpiredSignatureError as exc:
             raise ExpiredTokenError("令牌已过期") from exc

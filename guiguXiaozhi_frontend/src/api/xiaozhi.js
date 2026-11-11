@@ -68,6 +68,18 @@ export async function initMemoryId() {
   return localStorage.getItem(SESSION_KEY) || createSession()
 }
 
+/** 「开启新会话」前尽力撤销服务端旧会话（best-effort，失败不阻断用户操作） */
+export async function revokeSession() {
+  if (!AUTH_ENABLED) return
+  const sid = localStorage.getItem(SESSION_KEY)
+  if (!sid) return
+  try {
+    await axios.delete(`${SESSION_URL}/${encodeURIComponent(sid)}`, { headers: authHeaders() })
+  } catch (e) {
+    // 撤销失败只影响旧 id 的回收，不阻断开启新会话
+  }
+}
+
 /** 「开启新会话」：清掉本地会话标识，reload 后由服务端重新签发 */
 export function newSession() {
   localStorage.removeItem(LEGACY_UUID_KEY)

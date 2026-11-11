@@ -340,3 +340,45 @@ def test_auth_disabled_keeps_legacy_behaviour(auth_off):
     assert client.delete("/profile/any-key").status_code == 200
     assert client.post("/v1/sessions").status_code == 404
     assert client.post("/v1/auth/token", json={}).status_code == 404
+
+
+
+# ---------------------------------------------------------------- 会话撤销（P0-01 验收 7）
+
+
+def test_revoke_session_makes_old_id_unusable(auth_on):
+    client, _, tokens, _ = auth_on
+    alice = tokens.issue("alice")
+    sid = _new_session(client, alice)
+
+    resp = client.delete(f"/v1/sessions/{sid}", headers=_headers(alice))
+    assert resp.status_code == 200
+    assert resp.json()["revoked"] is True
+
+    chat = client.post(
+        "/xiaozhi/chat",
+        json={"memoryId": sid, "message": "你好"},
+        headers=_headers(alice),
+    )
+    assert chat.status_code == 403
+
+
+def test_revoke_other_users_session_forbidden(auth_on):
+    client, _, tokens, _ = auth_on
+    alice, bob = tokens.issue("alice"), tokens.issue("bob")
+    sid = _new_session(client, alice)
+
+    resp = client.delete(f"/v1/sessions/{sid}", headers=_headers(bob))
+    assert resp.status_code == 403
+
+    chat = client.post(
+        "/xiaozhi/chat",
+        json={"memoryId": sid, "message": "你好"},
+        headers=_headers(alice),
+    )
+    assert chat.status_code == 200
+
+
+def test_revoke_requires_token(auth_on):
+    client, *_ = auth_on
+    assert client.delete("/v1/sessions/s-whatever").status_code == 401

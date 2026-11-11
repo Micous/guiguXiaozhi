@@ -177,3 +177,40 @@ def test_anonymous_has_no_scopes():
     assert ANONYMOUS.subject_id == "anonymous"
     assert ANONYMOUS.scopes == frozenset()
     assert not ANONYMOUS.has_scope(CHAT_WRITE_SCOPE)
+
+
+# ---------------------------------------------------------------- audience（审计 P0-01 验收 6）
+
+
+def test_issued_token_carries_audience(service):
+    payload = jwt.decode(
+        service.issue("alice"), SECRET, algorithms=["HS256"], audience="xiaozhi-chat"
+    )
+    assert payload["aud"] == "xiaozhi-chat"
+
+
+def test_wrong_audience_rejected(service):
+    """给别的系统签发的 token（同密钥、同签发方）不得被本服务接受。"""
+    other = TokenService(SECRET, issuer=ISSUER, audience="another-service")
+    with pytest.raises(InvalidTokenError):
+        service.verify(other.issue("alice"))
+
+
+def test_missing_audience_rejected(service):
+    import time
+
+    now = int(time.time())
+    token = jwt.encode(
+        {
+            "sub": "alice",
+            "scopes": [],
+            "roles": [],
+            "iss": ISSUER,
+            "iat": now,
+            "exp": now + 3600,
+        },
+        SECRET,
+        algorithm="HS256",
+    )
+    with pytest.raises(InvalidTokenError):
+        service.verify(token)

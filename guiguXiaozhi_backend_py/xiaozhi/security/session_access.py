@@ -59,3 +59,17 @@ class SessionAccess:
             raise SessionNotFoundError("会话不存在")
         if owner != principal.subject_id:
             raise SessionForbiddenError("会话不属于当前用户")
+
+    def revoke(self, session_id: str, principal: Principal) -> bool:
+        """撤销本人会话（审计 P0-01 验收 7）。
+
+        以「物理删除归属记录」实现撤销：删除后 get_owner 返回 None，
+        assert_owner 立即抛 SessionNotFoundError，旧 session_id 无法再读写。
+        先查归属再删，保证任何人不能撤销别人的会话；返回 False 表示已不存在。
+        """
+        owner = self._repo.get_owner(session_id)
+        if owner is None:
+            return False
+        if owner != principal.subject_id:
+            raise SessionForbiddenError("会话不属于当前用户")
+        return self._repo.delete(session_id)

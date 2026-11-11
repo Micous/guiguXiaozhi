@@ -30,7 +30,7 @@ from xiaozhi.security.principal import (
     SESSION_CREATE_SCOPE,
     Principal,
 )
-from xiaozhi.security.session_access import SessionAccessError
+from xiaozhi.security.session_access import SessionAccessError, SessionForbiddenError
 from xiaozhi.server.trace_view import render_trace_page
 
 logger = logging.getLogger(__name__)
@@ -216,6 +216,25 @@ async def create_session(request: Request):
     if not principal.has_scope(SESSION_CREATE_SCOPE):
         return JSONResponse({"detail": "需要 session:create 权限"}, status_code=403)
     return {"session_id": container.session_access.create(principal)}
+
+
+@router.delete("/v1/sessions/{session_id}")
+@router.delete("/api/v1/sessions/{session_id}")  # 直连后端的别名
+async def revoke_session(session_id: str, request: Request):
+    """撤销本人会话（审计 P0-01 验收 7）：撤销后旧 id 不能再读写。
+
+    先查归属再删，跨用户撤销一律 403；「已不存在」返回 revoked=false，
+    不泄露别人的 session_id 是否曾存在。
+    """
+    container = _container(request)
+    if not container.settings.auth_enabled:
+        return JSONResponse({"detail": "认证未启用"}, status_code=404)
+    principal = _require_principal(request)
+    try:
+        removed = container.session_access.revoke(session_id, principal)
+    except SessionForbiddenError:
+        return JSONResponse({"detail": "无权操作该会话"}, status_code=403)
+    return {"revoked": removed, "session_id": session_id}
 
 
 @router.get("/health")

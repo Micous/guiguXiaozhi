@@ -118,6 +118,7 @@ class Settings(BaseSettings):
     auth_bootstrap_secret: str = ""  # 本地过渡：/api/v1/auth/token 的换取凭证
     auth_token_ttl_seconds: int = 3600
     auth_issuer: str = "xiaozhi-local"
+    auth_audience: str = "xiaozhi-chat"  # JWT 受众，防止别处签发的 token 被本服务接受
     auth_ops_subjects: List[str] = Field(default_factory=list)  # 可访问运维端点的主体
 
     # ---------- 可观测 ----------

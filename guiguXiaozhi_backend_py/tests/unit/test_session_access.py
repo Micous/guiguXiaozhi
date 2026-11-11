@@ -70,3 +70,25 @@ def test_delete_session(access):
     assert access._repo.delete(sid) is True
     with pytest.raises(SessionNotFoundError):
         access.assert_owner(sid, ALICE)
+
+
+
+# ---------------------------------------------------------------- 撤销（审计 P0-01 验收 7）
+
+
+def test_revoke_makes_session_unusable(access):
+    sid = access.create(ALICE)
+    assert access.revoke(sid, ALICE) is True
+    with pytest.raises(SessionNotFoundError):
+        access.assert_owner(sid, ALICE)
+
+
+def test_revoke_cannot_touch_other_users_session(access):
+    sid = access.create(ALICE)
+    with pytest.raises(SessionForbiddenError):
+        access.revoke(sid, BOB)
+    access.assert_owner(sid, ALICE)  # 越权撤销不得破坏归属记录
+
+
+def test_revoke_unknown_session_is_idempotent(access):
+    assert access.revoke("s-never-issued", ALICE) is False

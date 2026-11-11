@@ -174,6 +174,7 @@ async def get_application(settings: Optional[Settings] = None) -> Application:
             secret_key=settings.auth_secret_key,
             ttl_seconds=settings.auth_token_ttl_seconds,
             issuer=settings.auth_issuer,
+            audience=settings.auth_audience,
             bootstrap_secret=settings.auth_bootstrap_secret,
             ops_subjects=settings.auth_ops_subjects,
         )

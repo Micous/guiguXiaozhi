@@ -152,7 +152,7 @@
 <script setup>
 import { onMounted, ref, watch, nextTick } from 'vue'
 import axios from 'axios'
-import { AUTH_ENABLED, authHeaders, chatUrl, initMemoryId, newSession, setToken } from '@/api/xiaozhi'
+import { AUTH_ENABLED, authHeaders, chatUrl, initMemoryId, newSession, revokeSession, setToken } from '@/api/xiaozhi'
 
 const messaggListRef = ref()
 const isSending = ref(false)
@@ -249,7 +249,8 @@ const convertStreamOutput = (output) => {
   return output.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\n/g, '<br>')
 }
 
-const newChat = () => {
+const newChat = async () => {
+  await revokeSession() // 先撤销服务端旧会话，再清本地标识并重载
   newSession()
   window.location.reload()
 }
