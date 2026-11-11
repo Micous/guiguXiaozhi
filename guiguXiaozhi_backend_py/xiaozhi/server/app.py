@@ -14,6 +14,7 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from xiaozhi.application import get_application
+from xiaozhi.config import get_settings
 from xiaozhi.core.message import Role
 
 logger = logging.getLogger(__name__)
@@ -21,10 +22,17 @@ logger = logging.getLogger(__name__)
 
 def create_app() -> FastAPI:
     """创建应用（组合根在 lifespan 里装配）"""
+    # 认证开启时不注册 FastAPI 自动文档：/docs /openapi.json 会泄露全部
+    # 端点与参数结构，必须与 /metrics /audit /traces 一样收口。
+    # 认证关闭（默认、开发态）保持原样，行为零变更。
+    auth_enabled = get_settings().auth_enabled
     app = FastAPI(
         title="硅谷小智 · Python 后端",
         description="Spring Boot + LangChain4j 后端的 Python 重写版（自研 Harness，不依赖 Agent 框架）",
         version="1.0.0",
+        docs_url=None if auth_enabled else "/docs",
+        redoc_url=None if auth_enabled else "/redoc",
+        openapi_url=None if auth_enabled else "/openapi.json",
     )
 
     @asynccontextmanager
