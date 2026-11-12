@@ -887,3 +887,76 @@ Phase 7 的做法是收紧提示词，收住了；但那终归是概率约束：
    （方案 A 允许分诊引导，是否算越界需要医务处口径）；
 4. **`7B` 仍会自填当天日期**（未动）；
 5. **`production` 仍恒定拒绝启动**（`IMPLEMENTED_REAL_SLOT_ADAPTERS` 为空）。
+
+---
+
+## 18. HIS 边界韧性增量复核（2026-11-12，真机演练）
+
+本轮不改业务语义，只把 HIS 调用在**超时 / 网络波动 / 各类报错**下的分类做实。
+改造前 `his_client.py` 只有「超时 → UNKNOWN」一条主线，"其余"里混着语义
+相反的四种东西（详见 `踩坑与优化记录.md` 第 25 章）。
+
+### 18.1 交付物
+
+| 类型 | 文件 |
+|---|---|
+| 新增韧性层 | `xiaozhi/service/his_resilience.py`（分类 / 退避 / 总时限 / 熔断 / 脱敏） |
+| 客户端改造 | `his_client.py`（禁用重定向与代理、响应体上限、结构校验、错误详情脱敏、写操作自动派生幂等键） |
+| 业务层收敛 | `his_slot_service.py`（不可用/认证/拒绝/不确定四类分开）、`his_reconcile.py`（无单号时按幂等键查证） |
+| 组合根 | `config.py` 增 `his_*` 参数、`application.py` 装配策略与熔断器 |
+| 本地 HIS 替身加固 | `local_his.py`（release/cancel 幂等、hold TTL、byKey 查单、请求体上限、异常兜底、故障注入） |
+| 真机演练 | `scripts/his_fault_drill.py`（沙箱 19）、`scripts/local_his_fault_drill.py`（替身 19）、`scripts/his_full_flow_check.py`（7 类接口 10） |
+| 回归护栏 | `tests/unit/test_local_his_boundaries.py`（15 条） |
+
+### 18.2 分类矩阵（定稿）
+
+| 现象 | 分类 | 本地状态 |
+|---|---|---|
+| 读超时 / 连接中途断开 / 5xx / 系统类业务码 | `HisUncertainError` | UNKNOWN + 对账 |
+| 成功码但缺 `holdId`/`clinicMasterId`、畸形 JSON、响应体超限 | `HisUncertainError` | UNKNOWN |
+| 连接被拒绝 / DNS 失败 / 429 / 熔断打开 | `HisUnavailableError` | **明确"暂时不可用"，不产生 UNKNOWN** |
+| HTTP 4xx / 明确业务拒绝码 | `HisRejectedError` | 明确失败 |
+| 401/403 | `HisAuthError` | 明确失败，不重试 |
+
+**超时 ≠ 失败**：HIS 可能已扣号落单，说失败会诱导用户重试 → 重复挂号；
+反过来把"连接根本没建立"说成"核实中"会产生永远收敛不了的 UNKNOWN。
+
+### 18.3 验收
+
+| 项 | 结果 |
+|---|---|
+| 沙箱真机边界演练 | 19/19（18081 + Docker MySQL） |
+| 本地替身真机边界演练 | 19/19（18082 正常 TTL / 18083 TTL=1） |
+| 7 类接口 + 全流程 | 10/10（`his_full_flow_check.py`） |
+| **院方数据单一源核验** | **26/26**（内嵌替身 + 沙箱，`his_single_source_check.py`） |
+| 全量单测 | **763 passed / 6 skipped** |
+| ruff `E9,F63,F7,F82,F811` | 全链路通过 |
+
+### 18.5 院方数据单一源（2026-11-12 架构收敛）
+
+本项目定位是**本地学习/迭代**，目标是把医院 HIS **尽量真实地模拟**出来，
+不是真的接院方系统；要求「所有院方数据只在 HIS」，且**将来真接 HIS 时
+改动集中在适配层、别的业务代码不动**。据此收敛：
+
+- **HIS 自持全部院方主档**：`sys_dept` / `sys_doctor` / `clinic_index` →
+  `clinic_schedule` → `clinic_for_regist` / `clinic_master` / `pat_master_index`，
+  定义收敛在 `xiaozhi/service/his_catalog.py`（HIS 域）。
+- **应用侧只读 HIS**：新增 `HisDoctorService` 实现既有 `DoctorService`
+  抽象，查科室/查医生/工具描述清单/系统提示词/姓名错位校验全部走
+  HIS `/dept/list`、`/doctor/list`；`doctors.md` 退化为 HIS 的导入源文件。
+  删除组合根 `seed_from_roster` 的反向喂数据。
+- **患者引用由 HIS 签发**：`_book_with_hold` 在预占前调 `ensure_patient()`，
+  落单用 HIS 返回的 `patientRef`（详见 `ops-runbook.md` 11.7）。
+- **工具层 / 业务层 / 提示词零改动**：只换注入的实现。
+- **端点集中**：14 个 HIS 端点全部收进 `HisClient._paths` + `config.his_*_path`；
+  「接真 HIS 唯一改动点」清单见 `docs/his-sandbox-onboarding.md` 第 0.5 节。
+
+### 18.4 残留
+
+1. ~~患者主档引用体系未切~~ → **已闭合**（见 18.5 / runbook 11.7）；
+2. **院方真实 HIS 未验证**：这是**备查项而非阻断项** —— 本项目目标是高保真
+   模拟，`IMPLEMENTED_REAL_SLOT_ADAPTERS` 为空是刻意的安全门；
+3. **熔断阈值 / 超时**目前是代码默认值，真接院方时要按实测 P99 调整；
+4. **错误分类里的业务码表**是通用猜测，接入院方后要按实际 `R.code` 枚举对齐；
+5. **`mock` 模式**（默认）仍是纯离线兜底，不是院方数据源；演示/联调请用
+   `SLOT_SERVICE_IMPL=local_his`。默认值被既有契约测试钉死，未改。

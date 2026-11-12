@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from xiaozhi.config import Settings, get_settings
 from xiaozhi.config_guard import ProductionConfigError, validate_production_settings
@@ -54,7 +54,13 @@ from xiaozhi.security.secure_executor import SecureToolExecutor
 from xiaozhi.security.session_access import SessionAccess
 from xiaozhi.service.impl.VectorStoreDoctorService import VectorStoreDoctorService
 from xiaozhi.service.doctor_service import DoctorService
+from xiaozhi.service.his_catalog import load_his_catalog
 from xiaozhi.service.his_client import HisClient
+from xiaozhi.service.his_doctor_service import HisCatalogUnavailable, HisDoctorService
+from xiaozhi.service.his_resilience import (
+    CircuitBreaker as HisCircuitBreaker,
+    RetryPolicy as HisRetryPolicy,
+)
 from xiaozhi.service.his_slot_service import HisSlotService
 from xiaozhi.service.local_his import LocalHisServer
 from xiaozhi.service.slot_service import MockSlotService, SlotService
@@ -155,18 +161,44 @@ def load_system_prompt(doctor_service=None) -> str:
     return text
 
 
+def _his_paths(settings: Settings) -> Dict[str, str]:
+    """院方端点映射 —— **接真实 HIS 时唯一需要配置的地方**。
+
+    所有 HIS 端点（号源 / 预占 / 落单 / 退号 / 查单 / 患者主档 /
+    科室字典 / 医生名录）都集中在这张表，工具层与业务层不感知路径。
+    """
+    return {
+        "slots": settings.his_slots_path,
+        "slot": settings.his_slot_path,
+        "hold": settings.his_hold_path,
+        "confirm": settings.his_confirm_path,
+        "release": settings.his_release_path,
+        "cancel": settings.his_cancel_path,
+        "booking": settings.his_booking_path,
+        "byKey": settings.his_by_key_path,
+        "bookings": settings.his_bookings_path,
+        "patient": settings.his_patient_path,
+        "patients": settings.his_patients_path,
+        "depts": settings.his_depts_path,
+        "dept": settings.his_dept_path,
+        "doctors": settings.his_doctors_path,
+    }
+
+
 def _build_slot_service(
     settings: Settings,
     doctor_service: DoctorService,
     *,
     local_his_server=None,
+    metrics=None,
 ) -> SlotService:
     """按配置装配号源适配器（组合根唯一装配点）。
 
-    ``mock``：本地模拟（内网演示用，一步式，无预占/退号语义）。
+    ``mock``：纯离线兜底（无 HIS 时的单测/演示，一步式，无预占语义）。
     ``local_his``：**本地 HIS 替身**（推荐给开发/联调）—— 行为完整的
       预占/确认/释放/退号/查单，号源**真的会被扣与归还**，零外部进程
       （内嵌在应用进程的后台线程里），状态落本地 JSON 文件。
+      院方主档（科室/医生/排班）由 **HIS 自己装载**，组合根不再喂数据。
     ``his``：真实医院 HIS —— 需要 ``HIS_API_BASE_URL`` 等配置。
 
     ⚠️ 关键红线：**只有真正连上真实 HIS 并通过端到端验收之后**，
@@ -176,38 +208,49 @@ def _build_slot_service(
     填了未实现的名字要在任何外部连接前就报错，不能等到工具层才发现
     号源是假的。
     """
+    # HIS 边界韧性：重试（写操作仅带幂等键时）/ 整体时限 / 熔断 / 响应体上限。
+    # 组合根是唯一装配点，配置全部由 Settings 注入，不在协议层写死。
+    resilience = dict(
+        retry_policy=HisRetryPolicy(
+            max_attempts=settings.his_max_attempts,
+            retry_writes=settings.his_retry_writes,
+        ),
+        breaker=HisCircuitBreaker(
+            failure_threshold=settings.his_breaker_threshold,
+            recovery_timeout=settings.his_breaker_recovery_seconds,
+        ),
+        max_response_bytes=settings.his_max_response_bytes,
+        metrics=metrics,
+    )
+
     impl = settings.slot_service_impl.strip().lower()
     if impl == "mock":
         return MockSlotService(doctor_service)
     if impl == "local_his":
-        # 本地 HIS 替身：内嵌启动，号源从**本院真实医生排班**生成
-        # （保证"号源里有的医生"与"查询专家工具返回的医生"一致，
-        #  不会出现用户约不到但能查到的割裂）。
+        # 本地 HIS 替身：内嵌启动，**HIS 自持院方主档**（科室字典 +
+        # 医生名录 + 排班 + 号源全部由同一份快照生成）。之前是组合根把
+        # 知识库名录反向 seed 给 HIS，方向反了，且会留下第二份院方数据。
         if local_his_server is None:
             raise ProductionConfigError(
                 "slot_service_impl='local_his' 但本地 HIS 服务未装配："
                 "请检查组合根的装配顺序。"
             )
-        roster = []
-        for dept in doctor_service.list_departments() or []:
-            for doctor in doctor_service.list_doctors(dept) or []:
-                roster.append({"department": doctor.department, "name": doctor.name})
-        count = local_his_server.seed_from_roster(
-            roster, limit_num=settings.local_his_limit_num
-        )
         base_url = local_his_server.start()
         logger.info(
-            "号源适配器：本地 HIS 替身（%s，排班 %d 条，限号 %d）",
+            "号源适配器：本地 HIS 替身（%s，限号 %d，主档由 HIS 自持）",
             base_url,
-            count,
             settings.local_his_limit_num,
         )
         client = HisClient(
             base_url,
             token=settings.his_api_token or "local-his",
             timeout=settings.his_api_timeout,
+            paths=_his_paths(settings),
+            **resilience,
         )
-        return HisSlotService(client, org_id=settings.his_org_id)
+        return HisSlotService(
+            client, org_id=settings.his_org_id, patient_master_enabled=True
+        )
     if impl == "his":
         if not settings.his_api_base_url.strip():
             raise ProductionConfigError(
@@ -218,18 +261,15 @@ def _build_slot_service(
             settings.his_api_base_url,
             token=settings.his_api_token,
             timeout=settings.his_api_timeout,
-            paths={
-                "hold": settings.his_hold_path,
-                "confirm": settings.his_confirm_path,
-                "release": settings.his_release_path,
-                "cancel": settings.his_cancel_path,
-            }
-            or None,
+            paths=_his_paths(settings),
+            **resilience,
         )
         logger.info(
             "号源适配器：真实 HIS（base=%s）", settings.his_api_base_url
         )
-        return HisSlotService(client, org_id=settings.his_org_id)
+        return HisSlotService(
+            client, org_id=settings.his_org_id, patient_master_enabled=True
+        )
     raise ProductionConfigError(
         f"号源适配器 {settings.slot_service_impl!r} 尚未实现："
         "请在 xiaozhi/service/ 下实现 HisSlotService 并在组合根注册后再启动。"
@@ -433,25 +473,60 @@ async def get_application(settings: Optional[Settings] = None) -> Application:
             len(meta_issues),
             detail,
         )
-    # ---- 院内系统 ----
-    doctor_service = VectorStoreDoctorService(
-        retrieve_all_chunks=vector_store.all_texts,
-        roster_file=settings.rag_excluded_files[0] if settings.rag_excluded_files else "doctors.md",
-    )
-    # 本地 HIS 替身（slot_service_impl=local_his 时才启动）：
-    # 内嵌后台线程 + ThreadingHTTPServer，零外部进程；状态落本地 JSON。
+    # ---- 院内系统：唯一数据源 = HIS ----
+    # 院方数据（科室字典 / 医生名录 / 排班 / 号源 / 挂号单 / 患者主档）
+    # 只允许有一个源。local_his / his 模式下，连「查询科室 / 查询医生」
+    # 都通过 HisDoctorService 读 HIS 的 REST 字典接口，不再从知识库
+    # doctors.md 单独解析一份（那会造成"查得到但约不到"的割裂）。
+    #
+    # mock 是**无 HIS 时的纯离线兜底**（默认配置，契约测试钉死不改）；
+    # 真实联调/演示请用 SLOT_SERVICE_IMPL=local_his，接入院方系统用 his。
+    impl = settings.slot_service_impl.strip().lower()
     local_his_server = None
-    if settings.slot_service_impl.strip().lower() == "local_his":
+    if impl == "local_his":
+        # 内嵌后台线程 + ThreadingHTTPServer，零外部进程；状态落本地 JSON。
+        # catalog 由 HIS 自己装载 —— 组合根不再反向喂 roster。
         local_his_server = LocalHisServer(
             persist_path=(
                 Path(settings.local_his_state_path)
                 if settings.local_his_state_path.strip()
                 else None
-            )
+            ),
+            catalog=load_his_catalog(org_id=settings.his_org_id),
+            limit_num=settings.local_his_limit_num,
         )
-    slot_service = _build_slot_service(
-        settings, doctor_service, local_his_server=local_his_server
+
+    # mock 分支需要一个 doctor_service 来生成内存排班；HIS 分支先用
+    # 占位对象，装配完成后立刻换成 HisDoctorService（下面几行）。
+    doctor_service: DoctorService = VectorStoreDoctorService(
+        retrieve_all_chunks=vector_store.all_texts,
+        roster_file=settings.rag_excluded_files[0] if settings.rag_excluded_files else "doctors.md",
     )
+    slot_service = _build_slot_service(
+        settings, doctor_service,
+        local_his_server=local_his_server,
+        metrics=metrics,
+    )
+    if isinstance(slot_service, HisSlotService):
+        # 号源与名录复用**同一个** HisClient（同一套重试/熔断/端点映射）
+        doctor_service = HisDoctorService(
+            slot_service.client, org_id=settings.his_org_id
+        )
+        try:
+            doctor_service.ensure_loaded()
+        except HisCatalogUnavailable as exc:
+            # 空名单不能静默降级：模型拿不到权威科室名单就会编造科室名。
+            # 宁可拒绝启动，也不能给用户一份假字典。
+            raise ProductionConfigError(
+                f"HIS 院方主档未就绪，拒绝启动：{exc}"
+            ) from exc
+        logger.info("院方名录适配器：HIS REST（与号源同一数据源）")
+    else:
+        logger.warning(
+            "院方名录适配器：离线知识库兜底（slot_service_impl=%s）。"
+            "此模式不是院方数据源，演示/联调请改用 local_his 或 his。",
+            impl,
+        )
 
     # ---- 仓储 ----
     # Phase 8-B（P0-06）：开启后身份证号密文落库 + HMAC 指纹查重。

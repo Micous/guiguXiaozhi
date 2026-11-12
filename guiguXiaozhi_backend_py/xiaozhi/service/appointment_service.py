@@ -288,9 +288,21 @@ class AppointmentService:
                                      ├─ 确认失败   → 释放预占 + FAILED
                                      └─ 落库失败   → 释放预占 + FAILED
         """
+        # ---- 0. 患者主档：院方引用必须由 HIS 签发 ----
+        # 患者主档编码体系属于院方数据，本地 sha256 派生值直接落单会被
+        # 真实 HIS 拒绝（独立沙箱真机核验已复现「患者主档不存在」）。
+        # 建档是**只读主档 / 幂等建档**，不占号源，所以放在预占之前：
+        # 失败时不用先占号再释放，也 avoid 白扣号源。
         patient_ref = Appointment.make_patient_ref(
             id_card, self._patient_ref_salt
         )
+        if getattr(self._slot_service, "patient_master_enabled", False):
+            resolved = self._ensure_patient_in_his(
+                username=username, id_card=id_card
+            )
+            if isinstance(resolved, BookingResult):
+                return resolved
+            patient_ref = resolved
 
         # ---- 0.5 本地查重**前置**到预占之前 ----
         # 2026-11-11 真机暴露：先预占再查重，会"白预占再白释放"
@@ -344,6 +356,14 @@ class AppointmentService:
         )
         if getattr(hold, "uncertain", False):
             # 预占结果不确定：号源可能已被占住 → UNKNOWN，不能当失败
+            #
+            # 超时且没拿到 holdId 时，把**幂等键**留下作为对账凭据
+            # （``idem:`` 前缀区分语义）。否则这条 UNKNOWN 既没有外部单号
+            # 也没有预占号，对账 Job 会永远跳过 → 死结。
+            hold_ref = getattr(hold, "hold_id", "") or ""
+            if not hold_ref:
+                idem = getattr(hold, "idempotency_key", "") or ""
+                hold_ref = f"idem:{idem}" if idem else ""
             logger.warning("HIS 预占结果不确定，进入 UNKNOWN：%s/%s %s", department, date, time)
             pending = self._persist_pending(
                 username=username,
@@ -354,7 +374,7 @@ class AppointmentService:
                 doctor_name=doctor_name,
                 patient_ref=patient_ref,
                 status=AppointmentStatus.UNKNOWN,
-                external_hold_id=getattr(hold, "hold_id", "") or None,
+                external_hold_id=hold_ref or None,
                 external_booking_id=getattr(hold, "external_booking_id", "") or None,
                 message="号源锁定结果正在核实，请稍后确认是否预约成功。",
             )
@@ -475,6 +495,59 @@ class AppointmentService:
             message="预约成功。",
             appointment=confirmed,
         )
+
+    def _ensure_patient_in_his(
+        self, *, username: str, id_card: str
+    ) -> Any:
+        """向 HIS 建档并取得院方患者引用；失败时按边界分类收敛。
+
+        返回 ``str``（HIS 的 patientRef）或 ``BookingResult``（明确失败/
+        不可用）。**绝不静默降级回本地派生引用** —— 那会造出「本地约上了、
+        医院没这个患者」的脏数据，正是用户要求避免的第二份院方数据。
+
+        分类纪律（与预占/落单一致）：
+          * 超时 / 5xx / 系统类业务码 → 结果不确定，但此时**还没占号**，
+            重试不会重复挂号，按"暂时不可用"明确告知用户稍后重试；
+          * 明确业务拒绝 / 认证失败 → 明确失败；
+          * 院方没有建档端点 → 明确报错（配置问题，不能假装成功）。
+        """
+        from xiaozhi.service.his_client import (
+            HisAuthError,
+            HisPatientMasterUnsupported,
+            HisRejectedError,
+            HisUnavailableError,
+            HisUncertainError,
+        )
+
+        key = _his_idempotency_key("patient", username, id_card, "", "", "")
+        try:
+            return self._slot_service.ensure_patient(  # type: ignore[attr-defined]
+                id_card, username, idempotency_key=key
+            )
+        except HisPatientMasterUnsupported as exc:
+            logger.error("HIS 未提供患者建档接口，拒绝以本地引用落单：%s", exc)
+            return BookingResult(
+                outcome=BookingOutcome.FAILED,
+                message="医院系统未开通患者建档功能，暂时无法预约。",
+            )
+        except (HisUnavailableError, HisAuthError, HisUncertainError) as exc:
+            logger.warning("HIS 建档不可用（尚未占号）：%s", exc)
+            return BookingResult(
+                outcome=BookingOutcome.FAILED,
+                message=str(exc) or "医院患者主档暂时不可用，请稍后重试。",
+            )
+        except HisRejectedError as exc:
+            logger.warning("HIS 建档被拒绝：%s", exc)
+            return BookingResult(
+                outcome=BookingOutcome.FAILED,
+                message=str(exc) or "医院患者主档校验未通过。",
+            )
+        except Exception as exc:  # noqa: BLE001 - 适配层异常不能冲垮业务层
+            logger.warning("HIS 建档异常：%s", exc)
+            return BookingResult(
+                outcome=BookingOutcome.FAILED,
+                message="医院患者主档暂时不可用，请稍后重试。",
+            )
 
     def _persist_pending(
         self,

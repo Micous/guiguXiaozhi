@@ -30,8 +30,11 @@ class Settings(BaseSettings):
     # 注意：production 是一个**门禁**而非"更快的配置"，当前仓库没有真实 HIS 适配器，
     # 因此该模式下必然启动失败（这是刻意的，见 config_guard.py）。
     app_env: str = "development"
-    # 号源适配器选择（组合根据此装配）：mock = 本地模拟排班；
-    # 真实 HIS 适配器在 Phase 3b 落地后于 application._build_slot_service 注册。
+    # 号源适配器选择（组合根据此装配）：
+    #   mock       = 无 HIS 时的纯离线兜底（默认；**不是院方数据源**）
+    #   local_his  = 本地高保真 HIS 替身（推荐演示/联调，HIS 自持主档）
+    #   his        = 真实医院 HIS 网关
+    # 后两者下，科室字典/医生名录/号源/预约/退号/查单**全部只读 HIS**。
     slot_service_impl: str = "mock"
     # ---- Phase 3b：真实 HIS 对接配置（slot_service_impl=his 时必填）----
     # 网关地址（HIS 暴露的 REST 网关，不是数据库直连）
@@ -40,16 +43,36 @@ class Settings(BaseSettings):
     his_api_token: str = ""
     # 单次调用超时（秒）—— 超时会被归类为"结果不确定"→ UNKNOWN
     his_api_timeout: float = 10.0
+    # ---- HIS 边界韧性（超时 / 网络波动 / 报错）----
+    # 总尝试次数（含首次）。写操作只有带幂等键时才会重试（= 同键重放查证）
+    his_max_attempts: int = 2
+    # 院方 HIS 若未实现幂等，必须设为 false：否则超时重试会重复扣号源
+    his_retry_writes: bool = True
+    # 连续基础设施失败达阈值 → 熔断快速失败，避免请求堆满线程池
+    his_breaker_threshold: int = 5
+    his_breaker_recovery_seconds: float = 20.0
+    # 响应体上限（字节）：故障 HIS 可能吐回整页 HTML 或无限流
+    his_max_response_bytes: int = 1 << 20
     # 医院机构号（orgId）
     his_org_id: str = ""
-    # 端点路径（不同医院实现差异大，做成可配置；空则用默认值）
-    his_hold_path: str = ""
-    his_confirm_path: str = ""
-    his_release_path: str = ""
+    # ---- 院方端点映射：接真实 HIS 时**只改这里**（空 = 用参考项目默认路径）----
+    # 全部 HIS 端点集中配置，避免散落在业务代码里；见 his_client._paths。
+    his_slots_path: str = ""       # 号源查询 GET
+    his_slot_path: str = ""        # 号表实例前缀（拼 /{id}）
+    his_hold_path: str = ""        # 预占 POST
+    his_confirm_path: str = ""     # 落单 POST
+    his_release_path: str = ""     # 释放预占 POST
+    his_cancel_path: str = ""      # 退号 POST
+    his_booking_path: str = ""     # 查单前缀（拼 /{id}）
+    his_by_key_path: str = ""      # 按幂等键查单前缀
+    his_bookings_path: str = ""    # 挂号单列表 GET
+    his_patient_path: str = ""     # 患者建档 POST
+    his_patients_path: str = ""    # 患者主档查询 GET
+    his_depts_path: str = ""       # 科室字典 GET
+    his_dept_path: str = ""        # 科室详情前缀（拼 /{id}）
+    his_doctors_path: str = ""     # 医生名录 GET
     # 患者引用脱敏盐（P0-06：业务主键逐步切到 patient_ref，盐必须由环境注入）
     his_patient_ref_salt: str = ""
-    # 退号端点路径（真实 HIS 的退号接口未调研，做成可配置）
-    his_cancel_path: str = ""
     # ---- 本地 HIS 替身（slot_service_impl=local_his 时生效）----
     # 每人每天的限号数（号源池大小）
     local_his_limit_num: int = 5

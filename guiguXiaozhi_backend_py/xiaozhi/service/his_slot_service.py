@@ -50,14 +50,18 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from xiaozhi.service.his_client import (
+    HisAuthError,
     HisBooking,
     HisBookingStatus,
     HisClient,
     HisHold,
+    HisPatientMasterUnsupported,
     HisRejectedError,
     HisSlot,
+    HisUnavailableError,
     HisUncertainError,
 )
+from xiaozhi.service.his_resilience import MSG_AUTH, MSG_UNAVAILABLE
 from xiaozhi.service.slot_service import SlotAvailability, SlotService
 
 logger = logging.getLogger(__name__)
@@ -103,10 +107,18 @@ class SlotHoldResult:
     slot: Optional[HisSlot] = None
     message: str = ""
     uncertain: bool = False  # True = 结果不确定，必须对账
+    #: 预占超时且没拿到 holdId 时，这个键是**唯一的对账线索**：
+    #: HIS 侧留着 (幂等键 → 预占/挂号单) 的关联，凭它能问出有没有落单。
+    idempotency_key: str = ""
 
     @classmethod
-    def uncertain_result(cls, message: str) -> "SlotHoldResult":
-        return cls(held=False, message=message, uncertain=True)
+    def uncertain_result(
+        cls, message: str, *, idempotency_key: str = ""
+    ) -> "SlotHoldResult":
+        return cls(
+            held=False, message=message, uncertain=True,
+            idempotency_key=idempotency_key,
+        )
 
 
 @dataclass
@@ -129,6 +141,8 @@ class ReleaseResult:
 
     released: bool
     message: str = ""
+    #: True = 释放结果不确定（HIS 超时）—— 号源可能仍被占着，需对账/运维清理
+    uncertain: bool = False
 
 
 @dataclass
@@ -174,11 +188,25 @@ class HisSlotService(SlotService):
         *,
         dept_resolver=None,
         org_id: str = "",
+        patient_master_enabled: bool = False,
     ) -> None:
         self._client = client
         # 科室名 → HIS 科室 id 的解析器（不同医院编码体系不同，做成可注入）
         self._dept_resolver = dept_resolver
         self._org_id = org_id
+        #: 落单前是否向 HIS 建档、使用 HIS 签发的患者引用。
+        #: 组合根装配 local_his / his 时打开；直接构造（离线契约测试）保持
+        #: 关闭，避免给没有建档端点的 fake HIS 增加新的协议要求。
+        self.patient_master_enabled = bool(patient_master_enabled)
+
+    @property
+    def client(self) -> HisClient:
+        """同一个 HIS 客户端实例 —— 供 ``HisDoctorService`` 复用。
+
+        号源与院方名录走同一个连接/熔断/重试状态，避免出现"号源通、
+        字典不通"却各自重试一遍的割裂。
+        """
+        return self._client
 
     # ---------- 查询 ----------
 
@@ -203,6 +231,13 @@ class HisSlotService(SlotService):
         )
         try:
             slots = self._client.query_slots(query.to_params())
+        except HisUnavailableError as exc:
+            # 请求确定没送达 → "暂时不可用"，**不是** "结果核实中"
+            logger.warning("HIS 不可用（请求未送达）：%s", exc)
+            return SlotAvailability.none(MSG_UNAVAILABLE)
+        except HisAuthError as exc:
+            logger.warning("HIS 认证失败：%s", exc)
+            return SlotAvailability.none(MSG_AUTH)
         except HisRejectedError as exc:
             return SlotAvailability.none(f"医院系统拒绝了号源查询：{exc}")
         except HisUncertainError as exc:
@@ -269,13 +304,19 @@ class HisSlotService(SlotService):
         }
         try:
             hold: HisHold = self._client.hold_slot(payload, idempotency_key=key)
+        except (HisUnavailableError, HisAuthError) as exc:
+            # 请求没送达 / 认证失败 → 确定没执行，明确失败即可，不制造 UNKNOWN
+            logger.warning("HIS 预占未送达（幂等键=%s）：%s", key[:12], exc)
+            return SlotHoldResult(held=False, message=str(exc))
         except HisRejectedError as exc:
             return SlotHoldResult(held=False, message=str(exc))
         except HisUncertainError as exc:
-            # 预占结果不确定：号源可能已经被占住 → 交给对账，不当失败
+            # 预占结果不确定：号源可能已经被占住 → 交给对账，不当失败。
+            # 带上幂等键：这是"没拿到单号"时唯一能查证的凭据。
             logger.warning("HIS 预占结果不确定（幂等键=%s）：%s", key[:12], exc)
             return SlotHoldResult.uncertain_result(
-                "号源锁定结果正在核实，请稍后确认是否预约成功。"
+                "号源锁定结果正在核实，请稍后确认是否预约成功。",
+                idempotency_key=key,
             )
         if not hold.held:
             return SlotHoldResult(held=False, message=hold.message or "号源预占失败。")
@@ -313,6 +354,9 @@ class HisSlotService(SlotService):
             booking: HisBooking = self._client.confirm_hold(
                 payload, idempotency_key=key
             )
+        except (HisUnavailableError, HisAuthError) as exc:
+            logger.warning("HIS 落单未送达（幂等键=%s）：%s", key[:12], exc)
+            return BookingResult(confirmed=False, message=str(exc))
         except HisRejectedError as exc:
             return BookingResult(confirmed=False, message=str(exc))
         except HisUncertainError as exc:
@@ -345,8 +389,12 @@ class HisSlotService(SlotService):
             logger.warning("释放 HIS 预占失败（hold=%s）：%s", hold_id[:12], exc)
             return ReleaseResult(released=False, message=str(exc))
         except HisUncertainError as exc:
+            # 超时 = 不确定：号源可能还占着，也可能已经释放。
+            # 标记出来，让运维/对账知道有残留风险，不能当"已释放"了事。
             logger.warning("释放 HIS 预占结果不确定（hold=%s）：%s", hold_id[:12], exc)
-            return ReleaseResult(released=False, message=str(exc))
+            return ReleaseResult(
+                released=False, message=str(exc), uncertain=True
+            )
         return ReleaseResult(released=True, message="号源已释放。")
 
     # ---------- 查单（对账） ----------
@@ -362,6 +410,59 @@ class HisSlotService(SlotService):
         except HisUncertainError as exc:
             logger.warning("HIS 查单结果不确定（id=%s）：%s", external_booking_id[:12], exc)
             raise
+
+    def query_booking_by_idempotency_key(self, key: str) -> HisBookingStatus:
+        """按幂等键查单 —— 解开「落单超时且没拿到单号」的对账死结。
+
+        HIS 侧保存着 ``幂等键 → 预占 → 挂号单`` 的关联。本地 UNKNOWN
+        记录即使没有 ``external_booking_id``，只要留了预占时的幂等键，
+        就能问出"这个动作到底落单了没有"，避免永远停在 UNKNOWN。
+        """
+        try:
+            return self._client.query_booking_by_idempotency_key(key)
+        except HisRejectedError as exc:
+            if exc.code == 404:
+                return HisBookingStatus(found=False)
+            raise
+        except HisUncertainError as exc:
+            logger.warning("HIS 按幂等键查单结果不确定（key=%s）：%s", key[:12], exc)
+            raise
+
+    def ensure_patient(
+        self, id_no: str, name: str, *, idempotency_key: str = ""
+    ) -> str:
+        """向 HIS 建档 / 查主档，返回 **HIS 侧**的患者引用。
+
+        ⚠️ 患者主档引用的编码体系由院方决定，不能用本地
+        ``Appointment.make_patient_ref()`` 的 sha256 派生值直接落单
+        （真机联调已复现「患者主档不存在」→ 落单被拒）。
+
+        分类纪律：
+          * 成功 → 返回 HIS 的 ``patientRef``；
+          * 成功但没给引用 → ``HisUncertainError``（建档可能已成功）；
+          * 明确 404（院方没实现建档端点）→ ``HisPatientMasterUnsupported``，
+            由业务层决定是否降级（production 下应拒绝启动/预约）；
+          * 其余失败原样上抛，交给业务层按「确定失败 / 不确定」收敛。
+
+        幂等键基于身份证号派生的哈希，绝不把明文身份证送进 HIS 日志。
+        """
+        key = idempotency_key or build_idempotency_key("patient", id_no)
+        try:
+            result = self._client.create_patient(
+                {"idNo": id_no, "name": name}, idempotency_key=key
+            )
+        except HisRejectedError as exc:
+            if exc.code == 404:
+                raise HisPatientMasterUnsupported(
+                    "院方 HIS 未提供患者建档接口", code=404, detail=exc.detail
+                ) from exc
+            raise
+        ref = str(result.get("patientRef") or result.get("patient_ref") or "")
+        if not ref:
+            raise HisUncertainError(
+                "HIS 建档未返回患者引用，建档结果待核实。"
+            )
+        return ref
 
     # ---------- 退号 ----------
 
@@ -395,6 +496,10 @@ class HisSlotService(SlotService):
             self._client.cancel_booking(
                 external_booking_id, idempotency_key=key
             )
+        except (HisUnavailableError, HisAuthError) as exc:
+            # 请求没送达 → 确定没退成，如实告知失败（本地状态保持不变）
+            logger.warning("HIS 退号未送达（id=%s）：%s", external_booking_id[:12], exc)
+            return CancellationResult(released=False, message=str(exc))
         except HisRejectedError as exc:
             logger.warning("HIS 退号被拒绝（id=%s）：%s", external_booking_id[:12], exc)
             return CancellationResult(

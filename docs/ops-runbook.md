@@ -323,3 +323,193 @@ curl -s http://127.0.0.1:8081/metrics/prometheus | grep medical_output
 3. **必须先补误伤反例再改规则**：这套规则的历史事故全是"拦对了越界，顺手把正常话删了"
    （泛动词 `用` 把"可以先用物理降温"判成用药建议）；
 4. 真机复验用"不带边界提示词"的直连脚本（模拟提示词失效），否则看不出这层有没有在工作。
+
+------------------------------------------------------------------------
+
+## 11. HIS 边界故障演练与处置（2026-11-12）
+
+### 11.1 分类口径（排障时先对表，别急着改状态）
+
+| 客户端异常 | 含义 | 本地状态 | 处置 |
+|---|---|---|---|
+| `HisUncertainError` | 请求可能已被 HIS 执行 | `UNKNOWN` | **不要手工改状态**，等对账 Job 查业务事实 |
+| `HisUnavailableError` | 请求确定没送达（连接拒绝/DNS/429/熔断） | 明确失败 | 检查网关/网络/限流，恢复后用户可重试 |
+| `HisAuthError` | token 过期或权限不足 | 明确失败 | 换 `HIS_API_TOKEN`，不要重试 |
+| `HisRejectedError` | HIS 明确业务拒绝 | `FAILED` | 如实告知用户（号满/患者不存在等） |
+| `HisCircuitOpenError` | 熔断打开，请求未发出 | 明确失败 | 查 HIS 健康；恢复后半开自动探测 |
+
+**红线**：`UNKNOWN` 只能由对账 Job 收敛。任何"看起来像失败"的手工改状态，
+在 HIS 其实已落单的情况下都会导致用户重复挂号。
+
+### 11.2 配置项（`Settings`，组合根是唯一装配点）
+
+| 配置 | 默认 | 说明 |
+|---|---|---|
+| `HIS_API_TIMEOUT` | 10.0 | 单次 socket 超时；整体预算 = timeout × attempts + 1s |
+| `HIS_MAX_ATTEMPTS` | 2 | 总尝试次数（含首次），指数退避 + 抖动 |
+| `HIS_RETRY_WRITES` | true | **院方未实现幂等时必须设 false**，否则超时重试会重复扣号源 |
+| `HIS_BREAKER_THRESHOLD` | 5 | 连续基础设施失败达阈值熔断；业务拒绝不计数 |
+| `HIS_BREAKER_RECOVERY_SECONDS` | 20.0 | OPEN → 半开探测的等待时间 |
+| `HIS_MAX_RESPONSE_BYTES` | 1048576 | 响应体上限，防止故障 HIS 吐整页 HTML/无限流 |
+
+熔断状态可由 `HisClient.breaker.snapshot()` 观察（`state` / `consecutive_failures`）。
+指标走 `metrics.inc` 动态计数：`his_requests_total`、`his_retries_total`、
+`his_uncertain_total`、`his_unavailable_total`、`his_rejected_total`、
+`his_auth_failure_total`、`his_circuit_open_total`、
+`his_malformed_response_total`、`his_oversize_response_total`。
+
+### 11.3 真机演练（改任何 HIS 代码后都要跑）
+
+```bash
+# 1. 起沙箱（Docker MySQL 3307 + HTTP 18081）
+docker compose -f his_sandbox/docker-compose.yml up -d
+./.venv/bin/python -m his_sandbox.seed --reset
+/usr/bin/env -i HOME=$HOME PATH=/usr/local/bin:/usr/bin:/bin \
+  NO_PROXY='*' no_proxy='*' ./.venv/bin/python -m his_sandbox.server --no-seed
+
+# 2. 打真实 HTTP 的边界演练（19 条，不用 fake server）
+NO_PROXY='*' no_proxy='*' ./.venv/bin/python scripts/his_fault_drill.py
+
+# 3. 契约回归（离线，保护既有语义）
+./.venv/bin/python -m pytest tests/ -q
+```
+
+`detached` 启动必须剥离沙箱注入（`env -i` + `NO_PROXY='*'`），否则本机代理
+会把 18081 请求送出去，表现为莫名 502。演练脚本开头会调 `/_admin/reset-fault`
+重置 `flaky` / `timeout_once` 计数，可重复跑。
+
+故障注入方式：请求头 `X-His-Fault: <name>` 或环境变量 `HIS_SANDBOX_FAULT`。
+pre-route（业务未执行）：`reject_hold`、`http429`、`auth_fail`、`system_busy`、
+`pii_leak`、`malformed_json`、`oversize`、`redirect`、`connection_reset`、
+`slow_drip`、`flaky`；post-route（业务已提交）：`timeout`、`timeout_once`、
+`http500`、`business_fail`。
+
+### 11.4 对账：无外部单号时怎么办
+
+预占超时会落 `external_hold_id = "idem:<幂等键>"`。`ReconcileJob` 见到
+`idem:` 前缀会调 `query_booking_by_idempotency_key()`，走 HIS 的
+`GET /currentRegister/byKey/{key}`：
+
+- 查到挂号单 → 收敛 CONFIRMED / CANCELLED，并把外部单号补回本地（否则退不了号）；
+- 明确查不到 → 收敛 FAILED（确实没挂上，号源由 hold TTL 回收）；
+- 查单本身不确定 → 保持 UNKNOWN + `attempts+1`，达 `max_attempts` 告警人工介入。
+
+院方若没有按幂等键查单的端点，这条 UNKNOWN 会走"跳过 + 告警"，**这是保守
+设计不是 bug**：没有业务事实就不能猜。接入真实 HIS 时需要与院方确认该能力。
+
+### 11.5 本地 HIS 替身也要单独演练（8081 当前模式）
+
+**两套实现必须分别打**：`his_sandbox`（18081，MySQL）和
+`xiaozhi/service/local_his.py`（本机 8081 内嵌，JSON 文件）共用
+`HisClient` / `ReconcileJob`，但服务端状态机是各自实现的。只演练沙箱会
+漏掉替身侧的缺口（真机复现过：缺 byKey 端点导致对账把 UNKNOWN 误判
+成 FAILED）。
+
+启动两个独立进程（务必 `env -i` + `NO_PROXY='*'`，否则本机代理会把
+请求送出去表现为 502）：
+
+```bash
+cd guiguXiaozhi_backend_py
+LOCAL_HIS_LIMIT=200 ./.venv/bin/python -m xiaozhi.service.local_his 18082 &
+LOCAL_HIS_HOLD_TTL=1 LOCAL_HIS_LIMIT=200 \
+  ./.venv/bin/python -m xiaozhi.service.local_his 18083 &
+./.venv/bin/python scripts/local_his_fault_drill.py
+```
+
+`LOCAL_HIS_LIMIT` 必须够大：UNKNOWN 用例会**故意**残留预占（那正是要验的
+中间态），默认 5 个号跑到中段就号满，后续用例会被误判成"业务拒绝"。
+`LOCAL_HIS_HOLD_TTL=1` 用于验证预占过期回收，生产/演示保持默认 600s。
+
+替身侧故障注入只支持写操作：`X-His-Fault: timeout`（业务已提交但不回
+响应）、`http500`（业务已提交但返回 500），用于验证"超时 = UNKNOWN +
+同幂等键重放收敛"。
+
+| 症状 | 先查什么 |
+|---|---|
+| 重放被回"预占不存在/已退号" | 请求是否带 `X-Idempotency-Key`；`HisClient` 写操作会自动派生，裸 HTTP 才走严格语义 |
+| UNKNOWN 迟迟不收敛 | `ReconcileJob` 是否走 `idem:` 分支；HIS 是否有 `GET /currentRegister/byKey/{key}` |
+| 号源越来越少 | 预占 TTL 是否生效；旧持久化文件（无 `expires_at`）重启后会补 TTL |
+| 413 变成"不确定" | 服务端是否在**读掉请求体之前**就返 413（TCP RST 会吞掉响应） |
+| 查号源恒为空 | 本地替身按日期展开号表，查询必须带 `clinicDate` |
+
+### 11.6 七类接口真机核验（2026-11-12）
+
+在 18081 沙箱上逐项打过，**7/7 接口 + 全流程走通**（可复跑：
+`./.venv/bin/python scripts/his_full_flow_check.py`，10/10 通过）：
+
+| # | 接口 | 结果 |
+|---|---|---|
+| 1 | `GET /clinicForRegist/list` 号源查询 | OK（120 条号表 / 剩余 600） |
+| 2 | `POST /clinicForRegist/hold` 预占 | OK |
+| 3 | `POST /currentRegister/add` 落单 | OK |
+| 4 | `POST /currentRegister/cancel` 退号 | OK |
+| 5 | `GET /currentRegister/{id}` 查单 | OK |
+| 6 | `POST /patMasterIndex/add` + `GET /patMasterIndex/list` 患者主档 | OK |
+| 7 | `GET /dept/list` 科室字典 | OK |
+| 8 | `GET /doctor/list` 医生名录（职称/擅长） | OK（院方数据单一源改造新增） |
+
+附加端点：`GET /currentRegister/byKey/{key}`（按幂等键查单）、
+`GET /clinicMaster/list`（挂号单列表）同样 OK。
+
+### 11.6.1 院方数据单一源（2026-11-12 架构收敛）
+
+**硬约束：所有院方数据只从 HIS 来**。改造前有两条平行数据链：
+`VectorStoreDoctorService` 从知识库 `doctors.md` 经 Milvus 解析科室/医生，
+`MockSlotService` 在内存里另造排班；组合根甚至把知识库名录**反向喂给**
+本地 HIS（`seed_from_roster`）—— 方向是反的。
+
+现在：HIS 自持 `sys_dept`（科室字典）、`sys_doctor`（医生名录）、
+`clinic_index → clinic_schedule → clinic_for_regist`（排班/号源）、
+`clinic_master`（挂号单）、`pat_master_index`（患者主档）。
+主档定义收敛在 `xiaozhi/service/his_catalog.py`（HIS 域，应用侧不 import）。
+
+| 工具 / 出口 | 数据源 | 适配层 |
+|---|---|---|
+| 查询科室、工具描述科室清单、系统提示词第 9 条、姓名错位校验 | HIS `/dept/list`、`/doctor/list` | `HisDoctorService`（实现既有 `DoctorService` 抽象） |
+| 查询医生（含职称/擅长） | HIS `/doctor/list` | 同上 |
+| 查询号源、预约、取消、查单、建档 | HIS REST | `HisSlotService` + `HisClient` |
+
+`doctors.md` 退化为 **HIS 的院方导入源文件**（启动时一次性灌进主档表），
+运行时应用侧不读。**工具层 / 业务层 / 提示词一行未改** —— 这是
+「接真 HIS 时改动集中」的落点，唯一改动点清单见
+`docs/his-sandbox-onboarding.md` 第 0.5 节。
+
+复验：`./.venv/bin/python scripts/his_single_source_check.py`（自包含起服务、
+跑完自动关闭），内嵌替身 + Docker MySQL 沙箱 **26/26 通过**。
+启动时空科室字典会 fail-fast（`HisCatalogUnavailable` → 拒绝启动），
+绝不静默给一份空名单让模型编造科室名。
+
+**全流程正确姿势**（顺序不可换，现已由 `AppointmentService` 自动执行）：
+建档 → **用 HIS 返回的 `patientRef`** → 预占 → 落单 → 查单 → 退号。
+把本项目本地派生的 `patient_ref` 直接塞给 `confirm_hold` 会被 HIS 拒绝
+「患者主档不存在」—— 这不是接口缺失，是引用体系不一致，见 11.7。
+
+### 11.7 已闭合：患者主档引用统一由 HIS 签发（2026-11-12）
+
+原问题：`AppointmentService` 用本地 `sha256(salt|id_card)[:32]` 派生
+`patient_ref` 落单，与院方主档编码体系不同 → 独立沙箱真机复现
+「患者主档不存在」→ 落单被拒（本地以为约上了、医院根本没有这个患者）。
+
+**现在的做法**：`HisSlotService.patient_master_enabled=True`（组合根在
+`local_his` / `his` 模式打开）时，`_book_with_hold` 在**预占之前**先调
+`ensure_patient()` 向 HIS 建档，落单统一用 **HIS 返回的 `patientRef`**。
+院方数据因此只有一个源，不存在第二份本地引用。
+
+三个边界按下面的方式收敛：
+
+1. **PII 边界**：建档发生在落库**之前**，此时 `id_card` 仍是入参明文，
+   不需要从库里解密外送；库里的 `enc:v1:` 密文只在查重/回显链路出现，
+   两条路径不交叉。真接院方时若网关要求先查主档，明文窗口仍只在
+   入参内存中，不新增持久化解密动作；
+2. **幂等键粒度**：建档有自己的 `patient` 前缀幂等键（由身份证号哈希
+   派生，不送明文），且排在预占之前 —— 建档失败不会白占号源；
+3. **失败分类**：明确 404（院方无建档端点）→ 明确报错、不静默降级；
+   超时/不可用/认证失败 → 明确失败（此时还没占号，重试不会重复挂号）；
+   绝不退回本地派生引用。
+
+两套 HIS 的落单校验也已对齐（内嵌替身 `require_patient_master` 在
+HIS 自持主档时自动打开）。复验见 `scripts/his_single_source_check.py`
+的「患者主档引用 → HIS 建档签发」用例：内嵌 + 沙箱 26/26 通过。
+
+**接真 HIS 时**：院方主档编码不同不影响业务层，只要 HIS 建档接口
+返回 `patientRef`（或映射到 `_FIELD_MAP`）。

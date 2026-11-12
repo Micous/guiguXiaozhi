@@ -167,11 +167,23 @@ class ReconcileJob:
             to_status=appointment.status.value,
         )
 
-        # 纪律 1：没有外部单号 → 无据可查，保持 UNKNOWN
+        # 纪律 1：没有外部单号 → 原则上无据可查，保持 UNKNOWN。
+        # 例外：预占超时时我们把**幂等键**留在 external_hold_id 里
+        # （``idem:`` 前缀），HIS 侧存着"幂等键 → 预占 → 挂号单"的关联，
+        # 凭它可以查证，避免 UNKNOWN 永远收敛不了（真机演练暴露的死结）。
+        by_key = ""
         if not appointment.external_booking_id:
-            entry.message = "跳过：缺少外部挂号单号，无据可查"
-            entry.skipped = True
-            return entry
+            hold_ref = getattr(appointment, "external_hold_id", "") or ""
+            if hold_ref.startswith("idem:") and hasattr(
+                self._slot_service, "query_booking_by_idempotency_key"
+            ):
+                by_key = hold_ref[len("idem:"):]
+            else:
+                entry.message = "跳过：缺少外部挂号单号，无据可查"
+                if hold_ref.startswith("idem:"):
+                    entry.message += "（号源服务不支持按幂等键查单）"
+                entry.skipped = True
+                return entry
 
         # 纪律 2：尝试次数超阈值 → 告警但不改变状态
         if appointment.reconcile_attempts >= self._max_attempts:
@@ -188,9 +200,12 @@ class ReconcileJob:
             return entry
 
         try:
-            status = self._slot_service.query_booking(
-                appointment.external_booking_id
-            )
+            if by_key:
+                status = self._slot_service.query_booking_by_idempotency_key(by_key)
+            else:
+                status = self._slot_service.query_booking(
+                    appointment.external_booking_id
+                )
         except HisUncertainError as exc:
             # 查单结果不确定 → 保持 UNKNOWN，attempts+1
             self._bump_attempts(appointment)
@@ -218,7 +233,13 @@ class ReconcileJob:
                 appointment.id,
                 target,
                 expected_version=appointment.version,
-                external_booking_id=appointment.external_booking_id,
+                # 按幂等键查到单时，把查到的外部单号补回本地
+                # （否则下次取消预约还是退不了号）
+                external_booking_id=(
+                    status.external_booking_id
+                    if by_key and status.found and status.external_booking_id
+                    else appointment.external_booking_id
+                ),
                 reconciled_at=datetime.now(),
                 reconcile_attempts=0,
             )

@@ -86,8 +86,18 @@ def test_client_cannot_inject_scopes(service):
 
 
 def test_tampered_signature_rejected(service):
+    """篡改签名中段。
+
+    ⚠️ 不要改**最后一位**：HS256 的 32 字节签名编码成 43 位 base64url，
+    末位只有 2 bit 有效位，其余是 padding。改末位时若只动了无效位，
+    解码出的签名与原文完全相同 → 验证通过 → 偶发 ``DID NOT RAISE``。
+    这个 flaky 曾两次让全量回归误报失败。
+    """
     token = service.issue("alice")
-    tampered = token[:-1] + ("A" if token[-1] != "A" else "B")
+    header, payload, signature = token.split(".")
+    mid = len(signature) // 2
+    flipped = "A" if signature[mid] != "A" else "B"
+    tampered = f"{header}.{payload}.{signature[:mid]}{flipped}{signature[mid + 1:]}"
     with pytest.raises(InvalidTokenError):
         service.verify(tampered)
 

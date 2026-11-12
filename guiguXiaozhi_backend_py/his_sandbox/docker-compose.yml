@@ -1,0 +1,33 @@
+# HIS 沙箱专用 MySQL —— 与主库 guiguxiaozhi 完全隔离（端口 3307）
+#
+# 启动：  docker compose -f his_sandbox/docker-compose.yml up -d
+# 停止：  docker compose -f his_sandbox/docker-compose.yml down
+# 清库：  docker compose -f his_sandbox/docker-compose.yml down -v
+#
+# 本机已有 mysql:8.0.35 镜像，起容器无需再拉外网。
+
+services:
+  his-sandbox-mysql:
+    image: mysql:8.0.35
+    container_name: his-sandbox-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: his_sandbox_123
+      MYSQL_DATABASE: his_sandbox
+      TZ: Asia/Shanghai
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --default-time-zone=+08:00
+    ports:
+      - "3307:3306"
+    volumes:
+      - his_sandbox_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-phis_sandbox_123"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 20s
+
+volumes:
+  his_sandbox_data:

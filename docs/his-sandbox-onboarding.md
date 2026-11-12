@@ -1,8 +1,105 @@
-# 真实 HIS 沙箱对接清单（Phase 3b）
+# HIS 模拟沙箱与接入契约（Phase 3b）
 
-> **状态**：适配层已完成并通过契约测试（504 单测），**但尚未连过真实医院系统**。
-> 本清单是**外部依赖的行动项**——医院/业务方提供下面这些，我们才能把
-> `IMPLEMENTED_REAL_SLOT_ADAPTERS` 登记为 `{"his"}`、打开 production 门禁。
+> **本项目定位（2026-11-12 明确）**：这是**本地学习/迭代项目，不做真实上线**。
+> 目标是**尽量真实地模拟医院 HIS**，让「预约挂号 / 取消挂号 / 查询科室 /
+> 查询医生 / 查询号源」这些工具接口都从 HIS 取数、行为贴近真实医院；
+> **将来若真接院方系统，改动必须集中在适配层，别的业务代码不动**。
+>
+> 因此**验收标准不是「连过真实医院」**，而是两条：
+> ① 模拟保真度（院方数据单一源、字典/排班/号源/挂号单同源、边界行为齐全）；
+> ② 适配层集中度（接真 HIS 时只改少数几个文件）。见第 0 节与第 0.5 节。
+>
+> 下文 1~4 节记录的是**未来若要真接院方系统**才需要的外部条件，属于
+> 「备查清单」，不是当前迭代的阻断项，也不代表本项目在等待真实对接。
+> `IMPLEMENTED_REAL_SLOT_ADAPTERS` 仍为空（production 刻意拒绝启动），
+> 这是安全门，不是缺口。
+
+---
+
+## 0. 本地沙箱验收结论（已完成，2026-11-12）
+
+参考项目（Spring Cloud HIS）缺业务 DDL、缺 Nacos 配置、缺独立预占/退号，
+且被 `.gitignore` 排除，因此在主后端新增自包含沙箱
+`guiguXiaozhi_backend_py/his_sandbox/`，不改动任何第三方代码。
+
+**7 类接口全部真机通过**（`scripts/his_full_flow_check.py`，10/10）：
+
+| # | 接口 | 本地沙箱 |
+|---|---|---|
+| 1 | 号源查询 `GET /clinicForRegist/list` | OK |
+| 2 | 预占 `POST /clinicForRegist/hold` | OK（参考项目缺失，沙箱补齐） |
+| 3 | 落单 `POST /currentRegister/add` | OK |
+| 4 | 退号 `POST /currentRegister/cancel` | OK（参考项目缺失，沙箱补齐） |
+| 5 | 查单 `GET /currentRegister/{id}` | OK |
+| 6 | 患者主档 `POST /patMasterIndex/add` + `GET /patMasterIndex/list` | OK |
+| 7 | 科室字典 `GET /dept/list` | OK |
+| 8 | 医生名录 `GET /doctor/list`（含职称/擅长） | OK（本次新增，供「查询科室专家」工具） |
+
+另有 `GET /doctor/list`（医生名录：职称/擅长）、`GET /currentRegister/byKey/{key}`
+（按幂等键查单，解 UNKNOWN 对账死结）、`GET /clinicMaster/list`（挂号单列表）。
+
+**院方数据只有一个源（2026-11-12 架构收敛）**：科室字典、医生名录、排班、
+号源、挂号单、患者主档全部由 **HIS 自持**（`sys_dept` / `sys_doctor` /
+`clinic_index` → `clinic_schedule` → `clinic_for_regist` / `clinic_master` /
+`pat_master_index`）。应用侧**没有任何第二份院方数据**：
+
+- 「查询科室 / 查询医生」→ `HisDoctorService` 读 HIS 的 `/dept/list`、
+  `/doctor/list`（不再从知识库 `doctors.md` / Milvus 解析）；
+- 工具描述里的权威科室清单、系统提示词第 9 条、姓名错位校验，
+  全部走同一个 `DoctorService` 抽象 → 也就走 HIS；
+- 「预约 / 取消 / 查号源」→ `HisSlotService` 读 HIS；
+- 落单用的患者引用 → 落单前先向 HIS 建档，用 **HIS 返回的 `patientRef`**，
+  不再拿本地 `sha256(salt|idNo)` 派生值硬塞（真机复现过「患者主档不存在」）。
+
+`doctors.md` 现在只是 **HIS 的院方导入源文件**（HIS 启动时一次性灌进主档表），
+应用侧运行时不读它。这样「查得到的医生」与「约得到的号」永远同源。
+
+**全流程正确姿势**：建档 → **用 HIS 返回的 `patientRef`** → 预占 → 落单 →
+查单 → 退号。本地派生的 `patient_ref` 直接落单会被拒「患者主档不存在」，
+这是引用体系不一致（见 `ops-runbook.md` 11.7），不是接口缺失。
+
+**单一源真机核验**：`scripts/his_single_source_check.py` —— 用**真实工具对象**
+跑完整链路（查科室 → 查医生 → 查号源 → 预约 → 查单 → 取消），同时验
+「字典与号源同源」「患者引用由 HIS 签发」「端点映射集中」。
+两套 HIS 实现（内嵌替身 + Docker MySQL 沙箱）合计 **26/26 通过**。
+脚本自包含：内部临时起服务、跑完自动关闭，不留后台进程。
+
+**边界演练**：`scripts/his_fault_drill.py`（沙箱 19 条）+
+`scripts/local_his_fault_drill.py`（本地替身 19 条），合计 38 条真机边界用例
+全过；七类接口全流程 `scripts/his_full_flow_check.py` 10/10；
+全量单测 **763 passed / 6 skipped**。分类纪律与处置口径见
+`ops-runbook.md` 第 11 章。
+
+**已闭合**：`AppointmentService` 落单改用 HIS 建档返回的 `patientRef`（原先
+runbook 11.6/11.7 记的 P0-06 未闭合项已收敛）。PII 密文与建档的边界：
+建档发生在**落库之前**，此时 `id_card` 还是入参明文；库里的密文只在
+查重/回显链路出现，两者不交叉。
+
+---
+
+## 0.5 接真实 HIS 时「唯一改动点」（改动集中契约）
+
+这是本项目最重要的架构约束：**换掉 HIS 实现时，工具层、业务层、
+提示词、领域模型一律不动**。需要改的只有下面这些（按优先级）：
+
+| # | 文件 / 配置 | 改什么 | 是否必须 |
+|---|---|---|---|
+| 1 | `.env`：`SLOT_SERVICE_IMPL=his`、`HIS_API_BASE_URL`、`HIS_API_TOKEN`、`HIS_ORG_ID` | 网关地址与认证 | 必须 |
+| 2 | `.env`：`HIS_*_PATH`（14 个端点） | 院方路由与参考项目不同时覆盖 | 视院方 |
+| 3 | `xiaozhi/service/his_client.py` → `_paths` 默认值 | 若不想用环境变量，直接改这张表 | 二选一 |
+| 4 | `xiaozhi/service/his_client.py` → `_to_slot()` / 字典字段映射；`his_doctor_service.py` → `_FIELD_MAP` | 院方字段名不同（如 `empName` / `professionalTitle`）时吸收差异 | 视院方 |
+| 5 | `xiaozhi/service/his_resilience.py` → 重试 / 熔断 / 超时参数 | 院方 SLA 不同 | 视院方 |
+| 6 | `config_guard.IMPLEMENTED_REAL_SLOT_ADAPTERS` | **只有端到端验收全过后**才登记 | 上线才需要 |
+
+**明确不需要改**：`tools/appointment_tools.py`（4 个工具）、
+`service/appointment_service.py`（预约状态机）、`service/his_reconcile.py`、
+`application.py::load_system_prompt()`、`repositories/`、前端。
+它们只依赖 `SlotService` / `DoctorService` 两个抽象和 `HisClient` 的返回值，
+院方差异被适配层吃掉了。
+
+**切换后的自检**：跑 `scripts/his_single_source_check.py --sandbox <网关>`，
+26 条全部通过即说明适配层契约对齐；任何一条挂了都不要改工具层去"迁就"，
+应回到上表 1~5 改适配层。
 
 ---
 
@@ -18,7 +115,7 @@
 | 1.4 | **退号/取消接口** | 取消必须同步到 HIS，否则本地说取消了、医院还留着 | **完全未知** —— 参考项目未调研 |
 | 1.5 | **查单接口**（按单号查挂号状态） | **对账的唯一依据**：UNKNOWN 记录靠它收敛 | 参考项目推断为 `GET /currentRegister/{id}`，**未验证** |
 | 1.6 | **患者主档查询/建档接口** | 挂号单要挂到患者档案上；没有患者主档就无法落单 | 参考项目有 `PatMasterIndex` 患者主档表，接口形态**未调研** |
-| 1.7 | **科室/专家字典接口** | 我们的科室名与 HIS 科室编码的映射 | 已有本地知识库（doctors.md），但与 HIS 编码**未对齐** |
+| 1.7 | **科室/专家字典接口** | 我们的科室名与 HIS 科室编码的映射 | 本地沙箱已有 `/dept/list` + `/doctor/list`；应用侧通过 `HisDoctorService` 读取，**不再从知识库解析**。真接院方时只需对齐字段名（见 0.5 节） |
 
 ### 2. 认证方式
 
@@ -63,13 +160,14 @@
    HIS_API_BASE_URL=<网关地址>
    HIS_API_TOKEN=<token>
    HIS_ORG_ID=<机构号>
-   HIS_HOLD_PATH=...   HIS_CONFIRM_PATH=...   HIS_RELEASE_PATH=...
+   HIS_*_PATH=...   （14 个端点，见 config.py / 本文 0.5 节）
    HIS_PATIENT_REF_SALT=<部署环境注入，不要进仓库>
 
-2. 对齐端点：真实路径与默认值不同 → 改配置或改 HisClient 默认值
+2. 对齐端点：真实路径与默认值不同 → 改配置或改 HisClient._paths 默认值
 
-3. 字段映射核对：HIS 返回的科室名/时段枚举与我们的取值是否一致
-   （我们传 "上午"/"下午"，HIS 可能用 "AM"/"PM" 或数字）
+3. 字段映射核对：HIS 返回的科室名/时段枚举/医生字段与我们的取值是否一致
+   （我们传 "上午"/"下午"，HIS 可能用 "AM"/"PM" 或数字；
+    医生姓名可能是 empName，职称可能是 professionalTitle → 改 _FIELD_MAP）
 
 4. 端到端验收（必须逐条留证据）：
    □ 号源查询：剩余号与 HIS 后台一致
