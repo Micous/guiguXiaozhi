@@ -48,6 +48,27 @@ def set_trace_id(trace_id: str) -> None:
     _trace_id_var.set(trace_id)
 
 
+def peek_trace_id() -> Optional[str]:
+    """只读当前 trace_id，**不隐式新建**。
+
+    ``get_trace_id()`` 在上下文为空时会自己生成一个并写回 ContextVar；
+    生命周期管理必须在这之前先看到「请求进入前的状态」，否则 finally
+    会把第一次生成的 trace_id 残留给下一个请求。
+    """
+    return _trace_id_var.get()
+
+
+def restore_trace_id(value: Optional[str]) -> None:
+    """把 trace 上下文恢复到请求进入前的状态（``None`` 即清空）。
+
+    Phase 1 / B1：``AgentEngine.run()`` 是 async generator，客户端断开时会被
+    ``aclose()`` 抛 ``GeneratorExit``；在 ``finally`` 里恢复，而不是用
+    ``set(None)`` 一刀切 —— HTTP 路由自己设置的 trace_id 必须原样保留，
+    否则响应头 ``X-Trace-Id`` 与 ``/trace/{id}`` 会对不上。
+    """
+    _trace_id_var.set(value)
+
+
 def get_current_span() -> Optional["Span"]:
     """获取当前 span"""
     return _current_span_var.get()

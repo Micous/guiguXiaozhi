@@ -16,8 +16,8 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
-import time
 from typing import Any, AsyncIterator, Callable, Dict, Iterable, List, Optional
 
 from xiaozhi.core.event import AgentEndEvent, AgentStartEvent, Event
@@ -26,7 +26,12 @@ from xiaozhi.memory.context import ContextAssembler
 from xiaozhi.memory.store import ConversationStore
 from xiaozhi.ops.metrics import MetricsCollector
 from xiaozhi.reliability.resilience import CircuitBreaker, RetryConfig
-from xiaozhi.reliability.tracing import get_trace_id, trace_span
+from xiaozhi.reliability.tracing import (
+    get_trace_id,
+    peek_trace_id,
+    restore_trace_id,
+    trace_span,
+)
 from xiaozhi.runtime.appointment_guard import (
     assess_department_guard,
     extract_latest_id_card,
@@ -34,6 +39,7 @@ from xiaozhi.runtime.appointment_guard import (
 from xiaozhi.runtime.engine_phases import EnginePhases
 from xiaozhi.runtime.intent import is_greeting
 from xiaozhi.runtime.persister import ConversationPersister
+from xiaozhi.runtime.run_context import ExecutionBudget, RunContext
 from xiaozhi.runtime.stream_filter import trim_to_sentence as _trim_to_sentence
 from xiaozhi.security.medical_safety import assess_medical_safety
 from xiaozhi.security.secure_executor import SecureToolExecutor
@@ -120,13 +126,94 @@ class AgentEngine(EnginePhases):
         ``task_idempotency_key``（Phase 5）：客户端显式提供的幂等键。
         **绝不用请求文本派生** —— 同一句话重发（例如审批后重放）在业务上
         是两次独立请求，文本哈希会把它们错误并成一个任务。
+
+        B1 生命周期壳：入口只创建一次 ``RunContext`` / ``deadline``，
+        ``try / except / finally`` 统一处理取消、异常与 ``GeneratorExit``。
+        **finally 里绝不 yield** —— 客户端断开时 async generator 会被
+        ``aclose()`` 抛 ``GeneratorExit``，此时 yield 会抛 ``RuntimeError``。
+        异常仍原样抛给上层（``routes.generate()`` 的兜底语义不变），本批次
+        不吞异常、不改变对外事件序列；"异常路径也保证 AgentEndEvent"随 B2
+        抽取 ``RunFinalizer`` 一并收口。
         """
+        # 先记录「请求进入前」的上下文，再让 get_trace_id() 可能新建 ID。
+        # 顺序反了会把第一次生成的 trace_id 残留给下一个请求。
+        entry_trace_id = peek_trace_id()
         trace_id = get_trace_id()
         result = AgentEngineResultHolder()
-        started = time.monotonic()
+        run_ctx = RunContext.create(
+            trace_id=trace_id,
+            session_id=memory_id,
+            subject_id=user_id,
+            timeout_seconds=self.request_timeout,
+        )
+        budget = ExecutionBudget(run_ctx)
+        # 全 Run 唯一时间基准；所有阶段读同一份 deadline 的剩余预算。
+        started = run_ctx.started_monotonic
         self.metrics.inc("requests_total")
 
+        outcome = "unknown"
+        try:
+            async for event in self._run_body(
+                memory_id=memory_id,
+                user_input=user_input,
+                user_id=user_id,
+                task_idempotency_key=task_idempotency_key,
+                trace_id=trace_id,
+                result=result,
+                run_ctx=run_ctx,
+                budget=budget,
+                started=started,
+            ):
+                yield event
+            outcome = "completed"
+        except asyncio.CancelledError:
+            # 取消 ≠ 远端写已取消：写工具可能已经提交，业务侧必须靠
+            # STARTED / UNKNOWN 对账收敛，这里只记录事实并原样传播。
+            run_ctx.cancellation.cancel("client_cancelled")
+            self.metrics.inc("run_cancelled_total")
+            logger.warning(
+                "请求被取消（不代表远端写操作已取消）：run=%s trace=%s",
+                run_ctx.run_id,
+                trace_id,
+            )
+            outcome = "cancelled"
+            raise
+        except Exception as exc:
+            result.error = f"{type(exc).__name__}: {exc}"
+            result.degraded = True
+            self.metrics.inc("run_unhandled_error_total")
+            logger.exception(
+                "请求未处理异常：run=%s trace=%s", run_ctx.run_id, trace_id
+            )
+            outcome = "error"
+            raise
+        finally:
+            # GeneratorExit（客户端断开 / aclose）不会进上面两个 except，
+            # outcome 仍是 unknown —— 在这里补上取消事实。
+            if outcome == "unknown":
+                run_ctx.cancellation.cancel("generator_closed")
+                self.metrics.inc("run_generator_closed_total")
+            restore_trace_id(entry_trace_id)
+            self.metrics.inc("run_finished_total")
+            logger.debug("run 收尾：outcome=%s budget=%s", outcome, budget.snapshot())
+
+    async def _run_body(
+        self,
+        *,
+        memory_id: str,
+        user_input: str,
+        user_id: str,
+        task_idempotency_key: Optional[str],
+        trace_id: str,
+        result: "AgentEngineResultHolder",
+        run_ctx: RunContext,
+        budget: ExecutionBudget,
+        started: float,
+    ) -> AsyncIterator[Event]:
+        """原有编排顺序，逐字保留；B1 只把生命周期壳抽到 ``run()``。"""
         with trace_span("http.request", trace_id=trace_id) as span:
+            span.set_attribute("run_id", run_ctx.run_id)
+            span.set_attribute("request_id", run_ctx.request_id)
             span.set_attribute("memory_id", memory_id)
             span.set_attribute("message_preview", user_input[:120])
 
@@ -242,6 +329,7 @@ class AgentEngine(EnginePhases):
                 trace_id=trace_id,
                 request_span=span,
                 started=started,
+                budget=budget,
                 result=result,
                 outcome=loop_outcome,
             ):

@@ -868,8 +868,15 @@ class EnginePhases:
             logger.warning("读不到 medical_output_guard_enabled，按开启处理")
             return True
 
-    def _time_budget_exceeded(self, started: float) -> bool:
-        """请求级时间预算是否已用尽。"""
+    def _time_budget_exceeded(self, started: float, budget=None) -> bool:
+        """请求级时间预算是否已用尽。
+
+        B1：``budget``（``ExecutionBudget``）存在时以它为准 —— 读的是入口
+        创建的那一份 deadline，不再在阶段内部重新推导剩余时间。旧调用点
+        不传 budget 时保持原有语义，供既有单测与灰度路径平滑过渡。
+        """
+        if budget is not None:
+            return bool(budget.time_exceeded)
         return (
             self.request_timeout is not None
             and time.monotonic() - started > self.request_timeout
@@ -1196,6 +1203,7 @@ class EnginePhases:
         started: float,
         result: "AgentEngineResultHolder",
         outcome: Dict[str, Any],
+        budget=None,
     ) -> AsyncIterator[Event]:
         """主循环：预算/熔断守门 → 调模型 → 出错降级 / 无工具收尾 / 执行工具。
 
@@ -1204,7 +1212,7 @@ class EnginePhases:
         turn = 0
         while turn < self.max_turns:
             # ---- 守门一：请求级时间预算 ----
-            if self._time_budget_exceeded(started):
+            if self._time_budget_exceeded(started, budget):
                 async for _ev in self._degrade_on_time_budget(user_input, trace_id, result):
                     yield _ev
                 break
