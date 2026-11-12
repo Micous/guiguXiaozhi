@@ -305,3 +305,8 @@ spans:  context.assemble, llm.chat, tool.execute, llm.chat,
 本批次到此停止：B2 第二 / 三批已独立回归并合并到 `main`。
 下一批应单独处理 `RunFinalizer` 的异常路径 `AgentEndEvent` / `task_tracker.finish()` 终态化，
 并在 B2 收尾后统一删除 `EnginePhases` mixin；不要在协作者拆分批次里顺手修异常终态。
+
+> **后续纠偏（2026-11-13，B3 决策确认）**：上段与 §7 第 1 条的「异常路径 `AgentEndEvent` 终态化」提法需收紧。
+> `run()` 的 `finally` 不能 `yield`，异常 / `GeneratorExit` 路径**无法补发 `AgentEndEvent`**；
+> 实际交付为「持久化终态 + 明确 outcome 指标」（**B3-3**），`RunFinalizer` 结构抽取为 **B3-4**，
+> mixin 删除随 B3-4 一并处理。详见 `docs/主体Agent整改-B3-调研与分批实施方案.md` §4。

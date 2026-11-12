@@ -3,7 +3,8 @@
 > **对应方案**：`docs/主体Agent生产化架构最终整改方案.md` §1.3（取消语义）、§1.4（阻塞 IO 治理）、§3.3（超时与结果状态模型）、§4 规则 8/9、§6 批次 B3
 > **前置基线**：B2 已全部完成并合并到 `main`（`723e63c`，914 passed / 6 skipped，`docs/主体Agent整改-B2-第二三批-LoopController与ToolCoordinator交付与验收.md`）
 > **批次目标**：async / bounded IO、写操作 `STARTED` 保证；停止条件「取消和故障用例通过」
-> **本文性质**：**调研与设计文档，不改任何生产行为**。B3 涉及写操作语义变更，必须先冻结现状、拆小批次，再逐批独立回归。
+> **本文性质**：原为调研与设计文档；**2026-11-13 用户已采纳 D1 / D2 / D3**（见 §4），本文升级为 **B3 执行计划**。批次按 §3 逐批独立回归、独立提交推送，不与下一批叠加。
+> **状态**：§2 现状盘点保留 `723e63c` 时的快照不改；后续各批的实测结果写入各自交付文档。
 
 ---
 
@@ -77,14 +78,17 @@ except Exception as exc:
 
 ---
 
-## 3. 建议拆成四个小批次（每批独立回归）
+## 3. 执行批次（2026-11-13 用户确认；每批独立回归、独立提交推送）
 
 | 批次 | 工作项 | 行为是否变化 | 停止条件 |
 |---|---|---|---|
 | **B3-1** | 结构准备：新增有界、可观测的专用 IO 执行器（带队列上限、指标、shutdown 排空）；把 `memory.store` 的同步 Mongo 调用、`task_repo` 的同步 MySQL 调用、`his_client` 的同步 HTTP 统一经它调度；`time.sleep` 退避换 `await asyncio.sleep` | **不变**（只换执行位置，不改返回值/异常/事件） | 914 passed 基线不回退；真机 V1–V4 + B2 工具链路回归全 PASS |
-| **B3-2** | 写操作 `STARTED` 强保证：`tool_started` 区分「未装配 / 落库失败」；写工具在关键记录不可写时拒绝进入 Adapter，返回结构化失败（不产生副作用），并发 `ToolResultEvent` | **变化**（新增拒绝路径） | 故障注入用例通过；确认**没有任何**测试用例在 tracker 落库失败时仍执行了写工具 |
-| **B3-3** | 取消 / 故障语义：超时、客户端断开、执行后审计失败分别落到 `UNKNOWN` / 待核查；`task_tracker.finish()` 在异常与取消路径终态化 | **变化**（补齐终态） | 取消和故障用例通过（§6 B3 停止条件）；B1 的 13 条护栏若与终态语义冲突，需先更新基线文档再改断言 |
-| **B3-4** | 可选：把 `urllib` / `mysql.connector` / `pymongo` 替换为成熟异步客户端（连接池 + connect/read/write timeout + 关闭生命周期） | 不变（但风险高） | 独立批次，不与 B3-1~3 叠加；方案 §6 未列为必须，若 B3-1 的有界执行器已达标可不做 |
+| **B3-2** | 写操作 `STARTED` 强保证（D1/D2 落点）：收敛 `WRITE_TOOL_NAMES` 单一常量；新增显式策略 `require_started_for_writes`（默认 false）+ 组合根 WARNING + 启动期一致性校验；`tool_started` 返回 `DISABLED / RECORDED / FAILED` 三态；写工具在 `FAILED` 时拒绝进入 Adapter、返回结构化失败；只读放行但记 `task_started_failed_total` 与 WARNING | **变化**（新增拒绝路径） | §3.2 故障注入矩阵全通过；确认**没有任何**用例在 tracker 落库失败时仍执行了写工具；灰度关闭时事件序列不变 |
+| **B3-3** | 取消 / 故障终态语义（D3 前半）：`run()` 的 `finally` 中幂等持久化 `task_tracker.finish()` + 明确 outcome 指标；超时 / 客户端断开 / 执行后审计失败落 `UNKNOWN` 或待核查；`recover_stale()` 的 UNKNOWN 收窄到写工具，消除只读 phantom UNKNOWN。**不补发 `AgentEndEvent`** | **变化**（补齐持久化终态） | 取消和故障用例通过（方案 §6 B3 停止条件）；B1 的 13 条护栏无需删改断言 |
+| **B3-4** | 抽取 `RunFinalizer`（D3 后半）：语义定死后，把 `_finalize_response_gate` / `_persist_and_extract` / `_finalize` 平移到协作者，接口 `finalize(outcome, ...)` 一次到位；`EnginePhases` 保留委托壳 | 不变 | 复用 B2 逐字等价证明；全量回归 + 真机全 PASS |
+| **B3-5** | 可选：把 `urllib` / `mysql.connector` / `pymongo` 替换为成熟异步客户端（连接池 + connect/read/write timeout + 关闭生命周期） | 不变（但风险高） | 独立批次，不与 B3-1~4 叠加；方案 §6 未列为必须，若 B3-1 的有界执行器已达标可不做 |
+
+> **顺序调整说明**：原 §3 的 B3-4「可选异步客户端」顺延为 B3-5；`RunFinalizer` 从「B2 后续」正式归入 B3-4。理由见 §4 D3。
 
 ### 3.1 B3-1 的等价性判据
 
@@ -96,34 +100,59 @@ B3-1 仍属于「行为不变」批次，可复用 B2 的逐字证明思路，�
 
 ### 3.2 B3-2 的故障注入矩阵
 
-| 注入点 | 期望 |
+| 注入点 | 期望（D1/D2 已定） |
 |---|---|
-| `record_tool_started` 抛异常（写工具） | 不调用 `secure_executor.execute`；返回结构化失败；`ToolResultEvent.is_error=True`；`task_tracker.tool_finished` 不被调用 |
-| `record_tool_started` 抛异常（只读查询） | 按 D2 决策：可放行或同样拒绝，但必须有一致且可测的规则 |
-| `record_tool_started` 返回 `None`（未装配） | 按 D1 决策；灰度关闭时须保持现有事件序列不变 |
-| `record_tool_finished` 抛异常 | 副作用已提交，不得假装回滚；标记待核查并告警（方案 §4 规则 9） |
+| `record_tool_started` 抛异常（写工具） | **拒绝**：不调用 `secure_executor.execute`、不产生副作用；返回结构化失败（`error_type=TaskStartUnavailable`）；`ToolResultEvent.is_error=True`；`task_tracker.tool_finished` 不被调用；记 `task_started_failed_total` |
+| `record_tool_started` 抛异常（只读查询） | **放行**（D2）：正常进入 Adapter；记 `task_started_failed_total{effect=read}` + 带 `trace_id` / `tool_call_id` 的 WARNING；`tool_finished` 保持 no-op |
+| 未装配（`task_tracker=None`，DISABLED） | **放行**（D1=A）：写工具与只读工具事件序列均不变；组合根记 WARNING；`require_started_for_writes=True` 且 `tracker=None` 时启动期即失败 |
+| 同一轮混合：一个只读 + 一个写工具，`STARTED` 落库失败 | 只读正常执行、写工具被拒、循环继续（**按单个 call 判定，不按整轮**）——必须有用例覆盖 |
+| `record_tool_finished` 抛异常 | 副作用已提交，不得假装回滚；标记待核查并告警（方案 §4 规则 9）|
 
 ---
 
-## 4. 待决策点（不替用户拍板，进入 B3-2 前必须定）
+## 4. 决策点（已定 · 2026-11-13 用户采纳）
 
-* **D1｜灰度关闭（`task_tracker=None`）时是否允许写操作进入 Adapter？**
-  * A：保持现状（允许）。优点：默认部署行为零变更、不撞既有 914 条用例；缺点：规则 8 只在开启灰度后生效，默认仍无 `STARTED` 保障。
-  * B：强制装配（拒绝）。优点：规则 8 全局成立；缺点：改变默认行为，需更新 B0 基线、可能影响本地 HIS 沙箱与真机预约链路。
-  * 倾向：**先 A，把 B 作为灰度全量开启后的独立开关**，但需用户确认。
-* **D2｜只读查询在 `STARTED` 落库失败时是否放行？** 方案规则 8 只约束「写操作」，倾向只读放行（不产生副作用），但要在文档与用例里写死。
-* **D3｜B3-3 与 `RunFinalizer` 的先后**：`RunFinalizer`（§1.1 目标清单，负责 Response Gate / 持久化 / 任务终态 / 结束事件）与 `task_tracker.finish()` 终态化职责重叠。建议**先 B3-3 定语义、再抽 `RunFinalizer` 做结构平移**，避免同时改语义与改结构。
+### D1｜灰度关闭时允许写操作进入 Adapter —— 选 A，但做成显式策略
 
-> 注：B2 交付文档 §8 把「异常路径 `AgentEndEvent` / `task_tracker.finish()` 终态化」列为下一批，
-> 与方案 §6 的 B3 是**同一件事的两个侧面**：本文档把它归入 B3-3，并以方案 §6 的批次顺序为准。
+**依据（已核准）**：`config.py:146` 默认 `task_tracking_enabled=False`，`.env` 未设置该键；`application.py:324-341` 仅在 true 时装配 `TaskTracker`；`routes.py:225-229` 仅在 true 时传幂等键；`tool_coordinator.py:127-130` 在 `task_tracker is None` 时整段跳过 STARTED。选 B 会让所有默认部署（含 8082 真机、未配 task 库的环境）的预约/取消立即不可用，并推翻 B0 冻结基线。
+
+**落地约束**（不是留一个隐式 `None` 豁免）：
+
+1. 新增 `require_started_for_writes: bool = False`，按 B2 惯例由委托壳**每次调用**传入 `ToolCoordinator`，不在构造期快照。
+2. 组合根在 `task_tracking_enabled=false` 时打 WARNING：「写操作当前无 STARTED 保障，崩溃恢复无法对账」。
+3. 启动期一致性校验：`require_started_for_writes=True` 且 `task_tracker is None` → **启动即失败**，不留到每个请求里拒绝。
+4. 规则 8 的全局成立路径是「灰度全量开启 + 策略切 true」，不在 B3 改默认。
+5. 配套：`TaskTracker.tool_started()` 必须把「未装配」与「落库失败」区分开，返回 `DISABLED / RECORDED / FAILED` 三态，否则拒绝路径无从判定。
+
+### D2｜只读查询在 `STARTED` 落库失败时放行 —— 强保证只作用于写工具
+
+方案 §4 规则 8 只约束「写操作」与「外部副作用」；拒绝只读查询属于无谓可用性损失。放行必须同时写死：
+
+* 门控**按单个 call** 判定，不按整轮；混合轮用例必须覆盖。
+* 写工具清单先收敛为单一来源：现状 `state.py:140` 与 `task_tracker.py:40` **重复定义** `_WRITE_TOOLS`，B3-2 抽成公共 `WRITE_TOOL_NAMES` 供 `TurnState` / `TaskTracker` / `ToolCoordinator` 共用；**暂不用 `ToolDefinition.effect` 门控**（那是 B6 契约，提前用会出现两个真相）。
+* 失败不许静默：`task_started_failed_total`（带 `effect=read` 标签）+ 带 `trace_id` / `tool_call_id` 的 WARNING。
+* 已知副作用：`recover_stale()`（MySQL `task_repo.py:554-563`、内存版 `:257-263`）把**所有** STARTED 无差别标 UNKNOWN；只读工具「STARTED 成功但进程崩溃」会留下 phantom UNKNOWN 噪音，B3-3 收窄到写工具。
+
+### D3｜先 B3-3 定终态语义，再 B3-4 抽 RunFinalizer
+
+**原方案给的理由「避免同时改语义与改结构」不成立**：`RunFinalizer` 三块职责全在正常路径（`engine_phases.py:915-943`），B3-3 改的是 `run()` 生命周期壳（`engine.py:186-228`），两者正交。真实理由：
+
+1. 终态化是方案 §6 的 B3 停止条件「取消和故障用例通过」，结构抽取不是。
+2. 先定死 outcome 集合（completed / cancelled / error / generator_closed / UNKNOWN / WAITING_APPROVAL），`RunFinalizer.finalize(outcome, ...)` 才能一次设计好；先抽必然返工。
+3. `_finalize` 现在被 `_run_body()` 第 6 步与三个短路分支共 4 处调用，靠 `result.error` / `state.approval_required` 反推终态；应由持有权威 `outcome` 的 `run()` 先定语义。
+
+### 一处必须纠正的旧表述
+
+B1 / B2 交付文档曾写「异常路径也保证 `AgentEndEvent`，随 `RunFinalizer` 收口」——**物理上做不到**：`run()` 的 `finally` 不能 `yield`，否则 `aclose()` / `GeneratorExit` 会抛 `async generator ignored GeneratorExit`。B3-3 的目标是「异常路径保证**持久化终态 + 明确 outcome 指标**，不保证 `AgentEndEvent`」。相关文档已加后续纠偏注记；`tests/unit/test_run_context.py:251/263/278` 只断言指标与异常原样抛出，**并未**钉住「不发 AgentEndEvent」，因此 B3-3 无需删改 B1 护栏。
 
 ---
 
 ## 5. 风险与护栏
 
-1. **B1 的 13 条护栏**：`tests/unit/test_run_context.py` 钉住了 `run()` 的 `except` 只记指标并原样抛异常、
-   异常路径不发 `AgentEndEvent`。B3-3 若补发终态事件，必须先更新 B0 行为基线文档，再改断言，
-   不允许直接删测试。
+1. **B1 的 13 条护栏**（2026-11-13 核准纠偏）：`tests/unit/test_run_context.py:251/263/278` 实际只钉住
+   「`run()` 的 `except` 只记指标并原样抛异常」「`CancelledError` 不被吞」「`aclose()` 时 `finally` 安全收尾」，
+   **没有**断言异常路径不发 `AgentEndEvent`。B3-3 只在 `finally` 做同步的持久化终态与指标（不 `yield`、不补发事件），
+   与这 3 条断言不冲突，无需删改测试；B0 行为基线正文是历史冻结快照，不改写。
 2. **B2 的 17 条护栏**：`test_tool_coordinator.py` 的 `test_task_tracker_started_finished_bracket_execution`
    断言 STARTED/FINISHED 成对；B3-2 的拒绝路径会让「没有 FINISHED」成为合法场景，需新增分支用例而非改旧断言。
 3. **真机链路**：`帮我查询一下明天呼吸内科有没有号源` 是已验证的、能真实穿过两轮主循环 +
@@ -136,8 +165,8 @@ B3-1 仍属于「行为不变」批次，可复用 B2 的逐字证明思路，�
 
 ---
 
-## 6. 当前停止点
+## 6. 执行状态
 
-B3 **调研与分批设计完成，未改任何代码**。工作区代码基线仍是 `723e63c`（914 passed）。
-下一动作应先确认 §4 的 D1 / D2 / D3，再启动 **B3-1（行为不变的结构准备）**；
-未经独立回归不得把 B3-1 与 B3-2 的语义变更叠加进同一个提交。
+2026-11-13：D1 / D2 / D3 已由用户采纳，本文升级为执行计划，代码基线 `8fd284a`（914 passed / 6 skipped）。
+按 §3 顺序执行，每批独立全量回归 + 8082 隔离实例真机验证 + 独立提交推送；
+**未经独立回归不得把相邻两批叠加进同一个提交**。各批实测结果写入各自的交付文档。

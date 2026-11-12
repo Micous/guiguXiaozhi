@@ -199,3 +199,8 @@ B2 专属四项：
 ## 7. 停止点
 
 本批次到此停止：B2 第一批已独立回归并合并到 `main`，不叠加 `LoopController` / `ToolCoordinator` 的结构性改动。下一批应先抽取 `LoopController`（含 `held_deltas` 补发、降级与 `TURN_END` 顺序的完整序列快照），再单独处理 `RunFinalizer` 的异常路径终态化。
+
+> **后续纠偏（2026-11-13，B3 决策确认）**：本文 §6 第 2 条与上段「异常路径 `AgentEndEvent` 终态化」的提法需收紧。
+> `run()` 的 `finally` 不能 `yield`，异常 / `GeneratorExit` 路径**无法补发 `AgentEndEvent`**；
+> 实际交付为「持久化终态 + 明确 outcome 指标」（**B3-3**），`RunFinalizer` 结构抽取为 **B3-4**。
+> 详见 `docs/主体Agent整改-B3-调研与分批实施方案.md` §4。

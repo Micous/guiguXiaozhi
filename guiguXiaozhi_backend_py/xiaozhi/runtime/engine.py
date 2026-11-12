@@ -167,8 +167,10 @@ class AgentEngine(EnginePhases):
         **finally 里绝不 yield** —— 客户端断开时 async generator 会被
         ``aclose()`` 抛 ``GeneratorExit``，此时 yield 会抛 ``RuntimeError``。
         异常仍原样抛给上层（``routes.generate()`` 的兜底语义不变），本批次
-        不吞异常、不改变对外事件序列；"异常路径也保证 AgentEndEvent"随 B2
-        抽取 ``RunFinalizer`` 一并收口。
+        不吞异常、不改变对外事件序列。异常 / 取消路径只保证**持久化终态 +
+        明确 outcome 指标**（B3-3），**不补发 AgentEndEvent**：finally 一旦
+        yield，``aclose()`` 的 ``GeneratorExit`` 会抛 ``async generator ignored
+        GeneratorExit``。结构性的 ``RunFinalizer`` 抽取在语义定死后的 B3-4。
         """
         # 先记录「请求进入前」的上下文，再让 get_trace_id() 可能新建 ID。
         # 顺序反了会把第一次生成的 trace_id 残留给下一个请求。

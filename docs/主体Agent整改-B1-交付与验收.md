@@ -83,6 +83,11 @@ restore_trace_id(value) -> None         # 恢复到请求进入前的状态
 
 「异常路径也必须发 `AgentEndEvent` / 终态化任务」需要统一的 `RunFinalizer` 才能安全收口（要区分正常收尾、短路收尾、异常收尾且不能重复发），归入 **B2 抽取协作者** 一并做，不在本批次用 yield 硬塞进 `finally`。
 
+> **后续纠偏（2026-11-13，B3 决策确认）**：上段「异常路径也必须发 `AgentEndEvent`」的表述**不成立**。
+> `run()` 的 `finally` 不能 `yield`，`aclose()` / `GeneratorExit` 路径物理上无法补发结束事件。
+> 正确目标是「异常 / 取消路径保证**持久化终态 + 明确 outcome 指标**，不保证 `AgentEndEvent`」，归入 **B3-3**；
+> `RunFinalizer` 结构抽取顺延到 **B3-4**。详见 `docs/主体Agent整改-B3-调研与分批实施方案.md` §4。
+
 ### 3.2 异常仍原样抛出，不吞、不改上层语义
 
 `except Exception` 只记录 `result.error` / `degraded` 与指标，然后 `raise`。`routes.generate()` 原有的「服务暂时异常：{type}」兜底文案行为不变。`CancelledError` 是 `BaseException` 子类，单独一个 `except` 分支，不会被 `except Exception` 吞掉。
@@ -161,7 +166,7 @@ finally:
 
 | 残留 | 归属 |
 |---|---|
-| 异常 / 取消路径仍不发 `AgentEndEvent`，`task_tracker.finish()` 也不会执行 | **B2** 抽取 `RunFinalizer` 时统一收口 |
+| 异常 / 取消路径仍不发 `AgentEndEvent`，`task_tracker.finish()` 也不会执行 | 持久化终态归 **B3-3**；`AgentEndEvent` 不补发（物理不可行），`RunFinalizer` 结构抽取归 **B3-4** |
 | `TIMEOUT_BEFORE_EXECUTION` 与 `TIMEOUT_OUTCOME_UNKNOWN` 未区分；`Tool.timed_call` 仍只是耗时统计 | Phase 3 / B7 |
 | 模型轮数、工具调用数、纠正重试数仍在 `TurnState`，`ExecutionBudget` 目前只拥有时间预算 | **B2** 拆协作者时迁移计数 owner |
 | `run_id` / `request_id` 尚未贯穿 Message / Persister / Approval / HIS，只进了 span | Phase 2 / 3 |
