@@ -27,10 +27,11 @@ from xiaozhi.core.event import (
     TurnEndEvent,
     TurnStartEvent,
 )
-from xiaozhi.core.message import Message
+from xiaozhi.core.message import Message, ToolCall
 from xiaozhi.core.tool import ToolResult
 from xiaozhi.models.quality import booking_executed_in_history, corrective_prompt, inspect_turn
 from xiaozhi.reliability.resilience import degraded_reply
+from xiaozhi.runtime.approval_execution import approved_operation_reply
 from xiaozhi.runtime.engine_helpers import (
     _TurnView,
     _empty_turn,
@@ -56,7 +57,7 @@ from xiaozhi.security.medical_safety import (
     assess_medical_safety,
 )
 from xiaozhi.security.secure_executor import ToolCall as SecureToolCall
-from xiaozhi.security.approval_service import get_approval_context
+from xiaozhi.security.approval_service import ApprovalRejected, get_approval_context
 
 logger = logging.getLogger(__name__)
 
@@ -394,6 +395,25 @@ class EnginePhases:
 
         文本实时下发；response / call_error / emitted_this_turn 写入 outcome。
         """
+        # ---- 审批执行轮：文本先扣住，等"到底有没有真调工具"再决定要不要发 ----
+        # 2026-11-12 真机：用户点了确认，模型输出「请在确认窗口核对…未确认前不会
+        # 进行实际挂号操作」—— 这句话**与随后发生的事实相反**（服务端会按审批
+        # 记录真的执行），可它是流式下发的，字已经到用户眼前收不回来。
+        # 带 token 的这一轮里，模型的话在"看到它到底调没调工具"之前都不可信，
+        # 所以先攒进 held_deltas，由调用方在拿到 response 之后决定丢弃还是补发：
+        #   * 真调了工具 → 补发（正常叙述轮，行为不变）；
+        #   * 零工具调用且服务端已完成确定性执行 → 丢弃（用户只看到真实结果）；
+        #   * 其余情况（无 token / token 无效）→ 补发（行为与之前完全一致）。
+        held_deltas: List[str] = []
+        hold_stream = self._has_pending_approval_token()
+
+        def _text_event(text: str) -> Optional[TextResponseEvent]:
+            """要下发的文本 → 事件；被扣住时返回 None（由调用方统一补发）。"""
+            if hold_stream:
+                held_deltas.append(text)
+                return None
+            return TextResponseEvent(trace_id=trace_id, metadata={"delta": text})
+
         # ---- 调模型（流式，文本实时下发给前端）----
         with trace_span("llm.chat", trace_id=trace_id) as llm_span:
             llm_span.set_attribute("model", getattr(self.chat_model, "model", "?"))
@@ -456,9 +476,9 @@ class EnginePhases:
                             result.text += safe
                             emitted = True
                             emitted_this_turn = True
-                            yield TextResponseEvent(
-                                trace_id=trace_id, metadata={"delta": safe}
-                            )
+                            event = _text_event(safe)
+                            if event is not None:
+                                yield event
                     # 本轮结束：把回看窗口里剩下的字补发出去
                     safe = guard.feed(stream_filter.flush())
                     tail = guard.flush()
@@ -468,9 +488,9 @@ class EnginePhases:
                         result.text += safe
                         emitted = True
                         emitted_this_turn = True
-                        yield TextResponseEvent(
-                            trace_id=trace_id, metadata={"delta": safe}
-                        )
+                        event = _text_event(safe)
+                        if event is not None:
+                            yield event
                     candidate = holder.get("turn") or _empty_turn()
                     # 检测用**完整**文本（含被截断的承诺）；
                     # 下发给用户 / 写进历史的是**裁剪后**的文本。
@@ -504,9 +524,9 @@ class EnginePhases:
                         result.text += safe
                         emitted = True
                         emitted_this_turn = True
-                        yield TextResponseEvent(
-                            trace_id=trace_id, metadata={"delta": safe}
-                        )
+                        event = _text_event(safe)
+                        if event is not None:
+                            yield event
 
                 finding = inspect_turn(
                     _TurnView(detected_text, candidate.tool_calls),
@@ -617,10 +637,9 @@ class EnginePhases:
                         # 落库的最终回复也要跟着换成兜底文案，
                         # 不能让被截掉的谎话文本进历史
                         state.set_final_reply(result.text)
-                        yield TextResponseEvent(
-                            trace_id=trace_id,
-                            metadata={"delta": fallback},
-                        )
+                        event = _text_event(fallback)
+                        if event is not None:
+                            yield event
                         yield DegradedEvent(
                             trace_id=trace_id,
                             metadata={
@@ -637,6 +656,9 @@ class EnginePhases:
         outcome["response"] = response
         outcome["call_error"] = call_error
         outcome["emitted_this_turn"] = emitted_this_turn
+        # 被扣住的文本（审批执行轮）交给调用方决策：真调了工具就补发，
+        # 服务端确定性执行了就直接丢弃（用户只看到真实结果）。
+        outcome["held_deltas"] = held_deltas
 
     async def _execute_tools(
         self,
@@ -985,6 +1007,159 @@ class EnginePhases:
         )
         return True
 
+    async def _execute_approved_operation(
+        self,
+        *,
+        user_id: str,
+        trace_id: str,
+        state: TurnState,
+        result: "AgentEngineResultHolder",
+    ) -> AsyncIterator[Event]:
+        """带审批 token 却零工具调用 → 服务端按审批记录**直接执行**。
+
+        2026-11-12 真机：用户点了「确认执行」，7B 连续两轮"只说不做"
+        （"请在确认窗口核对…" → 收到强制指令后又说"正在为您提交预约"），
+        两轮都零工具调用 —— token 白拿、预约没发生，用户却被告知"正在提交"。
+        同一时间后端的强制重试已经是"求模型配合"，模型不配合就必然失败。
+
+        这件事本来不需要模型配合：token 是用户亲手点下的确认凭据，参数是
+        用户在确认窗里核对过的那一组（``record.canonical_args``），执行器
+        只需要照做。所以这里把执行权从模型手里收回来。
+
+        **没有任何绕过审批的路径**：仍走 ``SecureToolExecutor.execute()``，
+        L0 原子消费一次性 token / L1 权限 / L2 参数校验 / L3 注入防护 /
+        L4 执行+审计 全部照旧生效，重放、过期、越权、跨会话、跨工具依旧拒绝。
+        变的是"谁发起这次调用"。
+
+        执行完成（无论成败）置位 ``state.approval_auto_executed``，
+        调用方据此收尾；token 已被消费 / 无 token / 记录缺参数时什么都不做，
+        静默交回原链路。
+        """
+        if not self._has_pending_approval_token():
+            return
+        service = getattr(self.secure_executor, "approval_service", None)
+        if service is None:
+            return
+        ctx = get_approval_context()
+        session_id = getattr(ctx, "session_id", "") or user_id or "default"
+        try:
+            # 预检**不消费**：真正的原子消费在 L0 门控里，绑定的仍是
+            # 实际执行的参数 —— 这里只借 token 找到"用户确认了哪件事"。
+            record = service.inspect_token(
+                ctx.approval_token, ctx.principal, session_id=session_id
+            )
+        except ApprovalRejected as exc:
+            logger.warning(
+                "审批兜底跳过（token 不可用，交给原链路）：trace=%s reason=%s",
+                trace_id,
+                exc.reason_code,
+            )
+            return
+
+        tool_name = record.tool_name
+        args = dict(record.canonical_args or {})
+        tool = self.tool_registry.get(tool_name)
+        if tool is None or not args:
+            logger.warning(
+                "审批兜底跳过（工具未注册或缺可执行参数）：tool=%s has_args=%s trace=%s",
+                tool_name,
+                bool(args),
+                trace_id,
+            )
+            return
+
+        call_id = f"auto-{record.approval_id}"
+        tool_exec_id = None
+        if self.task_tracker is not None:
+            tool_exec_id = self.task_tracker.tool_started(call_id, tool_name, args)
+
+        yield ToolExecuteEvent(
+            trace_id=trace_id,
+            metadata={
+                "tool_name": tool_name,
+                "tool_id": call_id,
+                "approval_auto_execution": True,
+            },
+        )
+
+        with trace_span("tool.execute", trace_id=trace_id) as tool_span:
+            tool_span.set_attribute("tool_name", tool_name)
+            tool_span.set_attribute("approval_auto_execution", True)
+            tool_span.set_attribute("approval_id", record.approval_id)
+            try:
+                tool_result = await self.secure_executor.execute(
+                    SecureToolCall(
+                        tool_name=tool_name,
+                        args=args,
+                        user_id=user_id,
+                        trace_id=trace_id,
+                    ),
+                    tool,
+                )
+            except Exception as exc:  # 兜底：工具异常不外泄
+                logger.exception("审批兜底执行异常：trace=%s", trace_id)
+                tool_result = ToolResult.fail(
+                    f"工具执行异常：{type(exc).__name__}", error_type="ToolExecutionError"
+                )
+            tool_span.set_attribute("success", tool_result.success)
+            tool_span.set_attribute("result_preview", tool_result.content[:160])
+
+        if tool_result.success:
+            state.record_tool_success(tool_name)
+        else:
+            state.record_tool_failure(tool_name, tool_result)
+        # 完成态判定以业务结果为准（Response Gate 与落库都读这份账本）
+        state.record_write_result(tool_name, tool_result)
+
+        if self.task_tracker is not None:
+            self.task_tracker.tool_finished(
+                tool_exec_id, tool_name, success=tool_result.success
+            )
+        self.metrics.record_tool(tool_name, tool_result.success)
+        self.metrics.observe("tool_duration_ms", tool_result.execution_time * 1000)
+        self.metrics.inc("approval_auto_executions")
+
+        reply = approved_operation_reply(tool_result)
+
+        # 三段式落库所需的配对消息：assistant(tool_calls) 的叙述段留空 ——
+        # 模型那句"请在确认窗口核对"绝不能进历史（落历史等于教它下一轮照抄）。
+        state.approval_auto_executed = True
+        state.set_narration("")
+        state.set_final_reply(reply)
+        result.text = reply
+        result.tool_calls.append(
+            ToolCall(id=call_id, name=tool_name, arguments=args)
+        )
+        state.add_tool_result(
+            Message.tool_result(
+                tool_result.content,
+                call_id,
+                tool_name,
+                is_error=tool_result.is_error,
+                error_type=tool_result.error_type,
+            )
+        )
+
+        logger.warning(
+            "模型带审批 token 却未调用工具，已服务端确定性执行：tool=%s success=%s trace=%s",
+            tool_name,
+            tool_result.success,
+            trace_id,
+        )
+        yield ToolResultEvent(
+            trace_id=trace_id,
+            metadata={
+                "tool_id": call_id,
+                "tool_name": tool_name,
+                "is_error": tool_result.is_error,
+                "content_length": len(tool_result.content),
+                "result_preview": tool_result.content[:160],
+                "duration_ms": round(tool_result.execution_time * 1000, 2),
+                "approval_auto_execution": True,
+            },
+        )
+        yield TextResponseEvent(trace_id=trace_id, metadata={"delta": reply})
+
     def _schedule_corrective_retry(
         self,
         response,
@@ -1060,9 +1235,18 @@ class EnginePhases:
             response = turn_outcome.get("response")
             call_error = turn_outcome.get("call_error")
             emitted_this_turn = turn_outcome.get("emitted_this_turn", False)
+            held_deltas: List[str] = turn_outcome.get("held_deltas") or []
+
+            def _flush_held() -> List[Event]:
+                return [
+                    TextResponseEvent(trace_id=trace_id, metadata={"delta": delta})
+                    for delta in held_deltas
+                ]
 
             # ---- 模型调用失败 → 降级并结束 ----
             if call_error is not None:
+                for _ev in _flush_held():
+                    yield _ev
                 async for _ev in self._degrade_on_model_error(
                     call_error, emitted_this_turn, user_input, trace_id, result
                 ):
@@ -1077,7 +1261,31 @@ class EnginePhases:
 
             # ---- 没有工具调用 → 结束（或纠正重试一轮） ----
             if not response.tool_calls:
-                # ---- 带有效审批 token 的请求：模型**必须**真的调工具 ----
+                # ---- 带审批 token 的请求：服务端按审批记录**确定性执行** ----
+                # 顺序在"强制重试模型"之前：用户已经点过确认，模型这一轮说什么
+                # 都不该决定这件事办不办。2026-11-12 真机，7B 两轮"只说不做"
+                # （先"请在确认窗口核对"，再"正在为您提交预约"），token 白拿、
+                # 预约没发生 —— 求模型配合的那条路已经证明不可靠。
+                # 无 token / token 已消费时此方法静默返回，行为与之前完全一致。
+                async for _ev in self._execute_approved_operation(
+                    user_id=user_id,
+                    trace_id=trace_id,
+                    state=state,
+                    result=result,
+                ):
+                    yield _ev
+                if state.approval_auto_executed:
+                    turn += 1
+                    yield TurnEndEvent(
+                        trace_id=trace_id,
+                        metadata={
+                            "turn_number": turn,
+                            "approval_auto_executed": True,
+                        },
+                    )
+                    break
+
+                # ---- 兜底未生效（无 token 等）→ 仍按原链路："带有效审批 token 的请求" ----
                 # （2026-11-11 第十轮事故）用户点了「确认执行」→ 前端换到一次性
                 # token → 带 token 重发同一句。这一轮模型可能输出
                 # 「请在确认窗口核对上述信息并确认预约。未确认前不会进行实际挂号操作。」
@@ -1088,6 +1296,9 @@ class EnginePhases:
                 #
                 # 这类句子靠正则很难穷举（模型有无数种说法），必须在引擎层兜底：
                 # **有 token 进来，就一定要有写操作发生**。
+                # 兜底没执行成 → 模型这一轮的话补发给用户（与旧行为一致）
+                for _ev in _flush_held():
+                    yield _ev
                 if self._retry_with_approval_hint(
                     messages, tools, state, response, trace_id
                 ):
@@ -1107,6 +1318,9 @@ class EnginePhases:
                 break
 
             # ---- 执行工具 + 结果回填（见 _execute_tools）----
+            # 真调了工具 → 叙述段照常下发（被扣住的文本这时才放行）
+            for _ev in _flush_held():
+                yield _ev
             async for _ev in self._execute_tools(
                 response=response,
                 messages=messages,
@@ -1152,6 +1366,10 @@ class EnginePhases:
             return
         curated, reason = curate_final_reply(state, result.text)
         if reason is None:
+            return
+        if curated == result.text:
+            # 文本已经是裁决结果（例：审批兜底执行时按 UNKNOWN 规则生成的
+            # 固定文案）—— 再下发一遍会让用户在界面上看到同一句两遍。
             return
         logger.warning(
             "Response Gate 替换最终回复：trace=%s reason=%s", trace_id, reason
@@ -1240,6 +1458,7 @@ class EnginePhases:
                 "text_length": len(result.text),
                 "degraded": result.degraded,
                 "corrective_retries": state.corrective_used,
+                "approval_auto_executed": state.approval_auto_executed,
             },
         )
 

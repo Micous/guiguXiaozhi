@@ -1007,10 +1007,47 @@ Phase 7 的做法是收紧提示词，收住了；但那终归是概率约束：
 
 **验收（真机 8081）**：日志 `工具参数中的掩码身份证已还原为真值`；
 `id_card_restored_total=1`；用户侧不再出现「格式有误」，回显仍为掩码。
-17 条护栏单测 `tests/unit/test_id_card_restore.py`，全量
-**840 passed / 6 skipped**。
+17 条护栏单测 `tests/unit/test_id_card_restore.py`。
 
-**已知遗留**：带审批 token 重发时 7B 反复「只说不做」，强制重试也失败 →
-token 白拿、预约未执行。与掩码无关；确定性解法是服务端按审批记录直接执行，
-未混入本次改动。
+### 18.8 审批确认后的确定性执行（2026-11-12）
+
+**动机**：带审批 token 重发时 7B 反复「只说不做」（"请在确认窗口核对…" →
+收到强制指令后"正在为您提交预约"），两轮零工具调用 → token 白拿、预约未执行。
+上一轮的处理是"追加强制指令再求模型一次"，模型不配合就注定失败。
+
+**口径**：用户已经确认过的事**不由模型决定办不办**。token 是用户点「确认」
+签发的凭据，参数是确认窗里核对过的那组（`ApprovalRecord.canonical_args`），
+服务端照做即可 —— 这正是 `consume()` 的既有语义（"以用户确认的那组参数执行"）。
+
+**实现**：
+
+- `runtime/approval_execution.py`
+  - `approved_operation_reply(result)`：工具结果 → 面向用户的最终回复（纯函数）；
+    UNKNOWN → 固定文案；成功 → 工具 content（已打码）；失败 → "未能完成：原因"；
+    剥掉面向模型的收尾指令（"请根据提示修正参数后重新调用"），末尾再过
+    `mask_pii_in_text`。
+  - `strip_model_directed(text)`：上面那条剥离规则的单元实现。
+- `EnginePhases._execute_approved_operation()`：`inspect_token()`（**非消费**）
+  取 `tool_name` + `canonical_args` → `SecureToolExecutor.execute()` →
+  结果直接生成最终回复；`state.approval_auto_executed` 置位后主循环收尾。
+- `engine_phases._run_loop`：在「无工具调用」分支里**先**尝试确定性执行，
+  未生效（无 token / 已消费 / 过期 / 跨主体）才回到旧的强制重试链路。
+- `_chat_turn` 的 `held_deltas`：审批执行轮的模型文本**先扣住**，拿到 response
+  后再决定补发（真调了工具 / 无可用 token）还是丢弃（服务端已确定性执行）——
+  否则"请在确认窗口核对"会和随后的事实自相矛盾地留在界面上。
+- `_finalize_response_gate`：`curated == result.text` 时不再重复下发。
+- 指标 `approval_auto_executions`；`AgentEnd` 元数据 `approval_auto_executed`。
+
+**安全边界一条都没放宽**：执行仍走四层安全流（L0 原子消费 token / L1 权限 /
+L2 参数校验 / L3 注入防护 / L4 执行+审计）。重放、过期、跨会话、跨工具、
+缺 `chat:write`、审计 fail-closed 全部照旧拒绝 ——
+`tests/unit/test_approval_auto_execution.py` 逐条钉住（15 条）。
+
+**落库**：仍是三段式；`assistant(tool_calls)` 的叙述段**留空**（模型那句
+"请确认"绝不进历史），`tool_call_id` 与 tool 消息配对。
+
+**验收（真机 8081，`scripts/e2e_approval_execution.py`）**：带 token 重发
+12.8s 完成，`appointment` 表真的写入 1 条（科室/日期正确），用户看到
+「预约成功。预约详情：…」，`approval_auto_executions` 0 → 1。
+全量 **855 passed / 6 skipped**。
 

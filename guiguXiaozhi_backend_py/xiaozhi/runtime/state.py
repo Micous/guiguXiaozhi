@@ -68,6 +68,10 @@ class TurnState:
     # 2026-11-11 第十轮事故：没这个闸门时，模型会被反复追问，
     # 同一句失败原因在用户界面上刷了 5 遍。
     approval_forced_retry_done: bool = False
+    # 本请求是否已由服务端**按审批记录确定性执行**（2026-11-12 兜底）。
+    # 7B 两轮"只说不做"导致 token 白拿、预约没发生 —— 用户确认过的事不再
+    # 交给模型表态，服务端执行完直接收尾（见 runtime/approval_execution.py）。
+    approval_auto_executed: bool = False
 
     # ---- 请求级上下文（拦截器只读）----
     # 历史里是否真的执行过预约（真话依据：说"已经预约好了"不算幻觉）

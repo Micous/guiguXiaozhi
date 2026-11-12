@@ -535,3 +535,31 @@ HIS 自持主档时自动打开）。复验见 `scripts/his_single_source_check.
    WARNING，说明这一轮回复**没写进历史**（非 strict 模式只告警不阻断）。
    排查是否有多实例/多请求同时写同一 session；生产用 `storage_fail_fast`
    会直接抛 `RepositoryUnavailable`。
+
+## 13. 点「确认执行」后没真的预约上（2026-11-12）
+
+症状：用户在确认窗点了确认，界面回到"请在确认窗口核对…"或"正在为您提交预约"，
+但 `appointment` 表**没有**记录。
+
+1. **先看指标，分清是哪条路**：
+   ```
+   GET /metrics → snapshot.counters
+   ```
+   * `approval_auto_executions` 涨了 → 走的是**服务端确定性执行**（正常兜底）；
+     此时若业务仍失败，看 `tool.execute` span 的 `result_preview`（多为科室、
+     号源、身份证校验问题）；
+   * 没涨、`approval_forced_retry_*` 有动静 → 兜底没生效（token 已被消费 /
+     过期 / 主体不匹配），模型这一轮"只说不做"。
+2. **核对审批记录状态**：`GET /v1/approvals` 看目标 `approval_id` 是
+   `APPROVED`（没被用掉）还是 `CONSUMED`（已用掉）。
+   `CONSUMED` 却没落业务记录 = 执行阶段失败，不是审批问题。
+3. **看日志关键字**：
+   * `模型带审批 token 却未调用工具，已服务端确定性执行` → 兜底正常；
+   * `审批兜底跳过（token 不可用，交给原链路）` → 看 `reason`：
+     `invalid_or_replayed` 是已用过/过期，`forbidden` 是跨主体。
+4. **一条命令端到端复验**（真实 HTTP，跑完自动清理测试记录）：
+   ```
+   python scripts/e2e_approval_execution.py
+   ```
+   五项断言全绿才算"确认=真的挂上号"。
+5. **别用回复文本判断成败**：以 `appointment` 表 / `approval_requests` 状态为准。
