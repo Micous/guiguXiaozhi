@@ -42,6 +42,10 @@ from xiaozhi.runtime.interceptors import TurnFacts, quality_gate
 from xiaozhi.runtime.response_gate import curate_final_reply, is_write_operation, stream_claim_is_legit
 from xiaozhi.runtime.state import TurnState
 from xiaozhi.runtime.stream_filter import StreamFilter
+from xiaozhi.security.output_guard import (
+    MedicalOutputGuard,
+    strip_blocked_sentences,
+)
 from xiaozhi.security.medical_safety import (
     BOUNDARY_PROMPT,
     SafetyVerdict,
@@ -320,11 +324,22 @@ class EnginePhases:
                     metrics=self.metrics,
                     trace_id=trace_id,
                 )
+                # ---- Phase 9-A：医疗回复出口护栏 ----
+                # 入口（medical_safety）拦的是"越界请求"，这里拦的是"正常请求
+                # 但模型自己漏出用药/诊断"。两层串联：StreamFilter 先做承诺截断，
+                # 再交给出口护栏按句扫描 —— 顺序不能反，否则被截断的承诺
+                # 会把后面的句子粘成一句，扫描边界就错了。
+                guard = MedicalOutputGuard(
+                    enabled=self._output_guard_enabled(),
+                    metrics=self.metrics,
+                    trace_id=trace_id,
+                )
                 try:
                     async for delta in self.chat_model.stream_chat(
                         messages, tools=tools, result_holder=holder
                     ):
                         safe = stream_filter.feed(delta)
+                        safe = guard.feed(safe) if safe else ""
                         if safe:
                             result.text += safe
                             emitted = True
@@ -333,7 +348,10 @@ class EnginePhases:
                                 trace_id=trace_id, metadata={"delta": safe}
                             )
                     # 本轮结束：把回看窗口里剩下的字补发出去
-                    safe = stream_filter.flush()
+                    safe = guard.feed(stream_filter.flush())
+                    tail = guard.flush()
+                    if tail:
+                        safe = (safe or "") + tail
                     if safe:
                         result.text += safe
                         emitted = True
@@ -347,13 +365,29 @@ class EnginePhases:
                     # 两者分开，才不会因为"先把谎话删掉"而检测不到它。
                     detected_text = candidate.text
                     stream_filter.apply_truncation(candidate)
+                    # 出口护栏丢掉的句子同样不能进历史：叙述段会以
+                    # assistant(tool_calls, content=叙述段) 的形式落进 Mongo，
+                    # 落历史等于把"吃点感冒药"教给下一轮的 7B。
+                    if guard.blocked_any:
+                        candidate.text = strip_blocked_sentences(candidate.text)
+                        yield DegradedEvent(
+                            trace_id=trace_id,
+                            metadata={
+                                "component": "medical_safety",
+                                "reason": "medical_output_blocked",
+                                "rules": guard.blocked_rules[:3],
+                            },
+                        )
                 except Exception as exc:
                     attempt_error = exc
                     candidate = _empty_turn()
                     detected_text = ""
                     # 流中断：把已经收到、但还压在回看窗口里的内容补发出去，
                     # 否则用户会凭空少看到一截
-                    safe = stream_filter.flush()
+                    safe = guard.feed(stream_filter.flush())
+                    tail = guard.flush()
+                    if tail:
+                        safe = (safe or "") + tail
                     if safe:
                         result.text += safe
                         emitted = True
@@ -664,6 +698,21 @@ class EnginePhases:
         """
         executor = getattr(self, "secure_executor", None)
         return getattr(executor, "approval_service", None) is not None
+
+    def _output_guard_enabled(self) -> bool:
+        """医疗回复出口扫描是否开启（Phase 9-A）。
+
+        默认开：它的规则只拦"用药建议 / 诊断结论"，正常业务回复（预约成功、
+        号源列表、医院流程）不会命中，关掉它没有任何性能收益，只有漏出风险。
+        想复现历史行为（比如做对照实验）时用 ``MEDICAL_OUTPUT_GUARD_ENABLED=false``。
+        """
+        try:
+            from xiaozhi.config import get_settings
+
+            return bool(get_settings().medical_output_guard_enabled)
+        except Exception:  # pragma: no cover - 配置读不到时按安全侧默认
+            logger.warning("读不到 medical_output_guard_enabled，按开启处理")
+            return True
 
     def _time_budget_exceeded(self, started: float) -> bool:
         """请求级时间预算是否已用尽。"""

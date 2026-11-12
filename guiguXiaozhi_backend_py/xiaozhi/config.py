@@ -180,6 +180,12 @@ class Settings(BaseSettings):
     # "以为加密了其实还是明文"比不加密更危险。
     pii_secret_key: str = ""
 
+    # ---------- 医疗回复出口扫描（Phase 9-A，默认开）----------
+    # 入口拦截管"越界请求不生成"，这里管"正常请求但模型自己漏出用药/诊断"。
+    # 命中即丢弃该句并在结尾追加固定说明；整段命中则换成固定话术。
+    # 只有做对照实验/回放历史行为时才需要关（关掉只会增加漏出风险）。
+    medical_output_guard_enabled: bool = True
+
     # ---------- 认证（Phase 1，灰度默认关）----------
     # auth_enabled=false：完全沿用一期行为（memoryId/userId 由请求体自报，前端零改动）；
     # auth_enabled=true ：/xiaozhi/chat 必须带 Bearer token，memoryId 必须是服务端
