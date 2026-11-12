@@ -38,6 +38,7 @@ from xiaozhi.runtime.appointment_guard import (
 )
 from xiaozhi.runtime.engine_phases import EnginePhases
 from xiaozhi.runtime.intent import is_greeting
+from xiaozhi.runtime.model_runner import ModelRunner
 from xiaozhi.runtime.persister import ConversationPersister
 from xiaozhi.runtime.run_context import ExecutionBudget, RunContext
 from xiaozhi.runtime.stream_filter import trim_to_sentence as _trim_to_sentence
@@ -104,6 +105,14 @@ class AgentEngine(EnginePhases):
         # 真机装配时注入 ``doctor_service.list_departments``，名单仍只有 HIS 一份。
         # 每次请求都现取，HIS 主档刷新后无需重启。
         self.department_provider = department_provider
+        # B2 第一批：模型回合从 EnginePhases mixin 抽到显式协作者。
+        # 判定型依赖以 callable Port 注入（每次调用现取 contextvar / 配置）；
+        # chat_model / retry_config / metrics 仍由委托壳按调用传入，
+        # 不在构造期快照，保住构造后替换依赖的既有装配与单测方式。
+        self._model_runner = ModelRunner(
+            has_pending_approval_token=self._has_pending_approval_token,
+            output_guard_enabled=self._output_guard_enabled,
+        )
 
     async def run(
         self,
