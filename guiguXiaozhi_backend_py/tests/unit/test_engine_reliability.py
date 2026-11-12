@@ -111,7 +111,10 @@ def make_engine(model, **kwargs):
     return engine, metrics
 
 
-async def collect(engine, message="你好"):
+# 默认输入**不能用纯问候语**：引擎对"你好"走确定性快路径（不进模型、不重试），
+# 这些可靠性用例就测不到空响应重试 / 熔断降级 / 指标埋点了。
+# 「查询号源」同属操作类（不注入 RAG），保持与旧默认值一致的上下文判定。
+async def collect(engine, message="查询号源"):
     parts = []
     events = []
     async for event in engine.run("memory-1", message):

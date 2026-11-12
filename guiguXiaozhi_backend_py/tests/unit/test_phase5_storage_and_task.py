@@ -499,5 +499,5 @@ async def test_engine_without_tracker_has_no_side_effect():
     model = FakeChatModel([{"chunks": ["你好"], "turn": ChatTurn(text="你好")}])
     engine, _metrics = make_engine(model)
     assert engine.task_tracker is None
-    text, _events = await collect(engine, "你好")
+    text, _events = await collect(engine, "查询号源")
     assert "你好" in text

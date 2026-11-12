@@ -929,7 +929,7 @@ Phase 7 的做法是收紧提示词，收住了；但那终归是概率约束：
 | 本地替身真机边界演练 | 19/19（18082 正常 TTL / 18083 TTL=1） |
 | 7 类接口 + 全流程 | 10/10（`his_full_flow_check.py`） |
 | **院方数据单一源核验** | **26/26**（内嵌替身 + 沙箱，`his_single_source_check.py`） |
-| 全量单测 | **763 passed / 6 skipped** |
+| 全量单测 | **777 passed / 6 skipped** |
 | ruff `E9,F63,F7,F82,F811` | 全链路通过 |
 
 ### 18.5 院方数据单一源（2026-11-12 架构收敛）
@@ -960,3 +960,26 @@ Phase 7 的做法是收紧提示词，收住了；但那终归是概率约束：
 4. **错误分类里的业务码表**是通用猜测，接入院方后要按实际 `R.code` 枚举对齐；
 5. **`mock` 模式**（默认）仍是纯离线兜底，不是院方数据源；演示/联调请用
    `SLOT_SERVICE_IMPL=local_his`。默认值被既有契约测试钉死，未改。
+
+### 18.6 首句体验：纯问候确定性快路径（2026-11-12）
+
+- **问题**：前端「开启新会话」reload 后 `onMounted` 自动发一句 `"你好"`，
+  走完整 7B 生成。trace `9ef10dc2`：`llm.chat` 69447 ms / 整轮 69603 ms
+  （99.8%），用户只看到空白气泡。
+- **定位方法**：`/traces` → `/trace/{id}` 看 span 分解（需 ops token），
+  不要凭「感觉是网络慢」下结论；左下「响应延迟 35ms」是心跳值，不是本轮耗时。
+- **实现**：`runtime/intent.py` 加 `GREETING_REPLY`；`engine.run()` 在医疗安全
+  判定之后、`_prepare_messages` 之前用 `is_greeting()` 短路到
+  `engine_phases._short_circuit_greeting()`。不检索、不调模型、不调工具；
+  固定话术走三段式落库；留 `greeting.fast_path` span 与
+  `greeting_fast_path_total` 指标。**前端零改动**，所有客户端受益。
+- **优先级**：医疗安全（自伤/急症/越界）先判；`is_greeting()` 是全匹配
+  ≤12 字短句，夹带业务或身份证的句子照常进主链路。
+- **验收（真机）**：`"你好"` 首字节 102 ms / 总 112 ms；trace 无 `llm.chat`；
+  `llm_calls_total=0`、`greeting_fast_path_total=1`；`"你好，我胸痛"` 63 ms
+  返回 120 急救话术。14 条护栏单测 `tests/unit/test_greeting_fast_path.py`，
+  全量 **777 passed / 6 skipped**。
+- **回归注意**：`collect(engine)` 默认输入从「你好」改为「查询号源」，
+  否则 5 条可靠性用例测不到模型；`test_phase5_storage_and_task` 同步改。
+- **观察项**：重启前那次请求的 `memory.write` 有一条 `并发写冲突（重试 3 次
+  耗尽）` WARNING（该轮回复未落库），重启后未复现，暂不混入本次改动。

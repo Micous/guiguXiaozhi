@@ -184,6 +184,20 @@ def is_greeting(text: str) -> bool:
     return bool(_GREETING_RE.match(t))
 
 
+#: 纯问候的确定性回复（不进 RAG、不进模型、不调工具）。
+#:
+#: 前端「开启新会话」会 reload 并在 onMounted 里自动发一句"你好"。这句没有
+#: 任何信息量，却会走完整 7B 生成：本机实测 llm.chat 69447ms（trace
+#: 9ef10dc2），用户看到的是一个空白气泡挂 69 秒。寒暄文案不需要概率生成。
+#:
+#: 口径与 Phase 7 一致：只做信息解释与分诊引导，不诊断、不处方、不给剂量，
+#: 所以不写"症状初筛""报告解读"这类越界能力。
+GREETING_REPLY = (
+    "您好！我是硅谷小智，可以帮您查询科室与医生、了解就医流程，"
+    "也可以协助预约挂号或取消预约。请问有什么可以帮您？"
+)
+
+
 def should_inject_knowledge(text: str, last_assistant_text: str = "") -> bool:
     """是否应该注入 RAG 知识"""
     if is_greeting(text):

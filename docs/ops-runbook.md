@@ -513,3 +513,25 @@ HIS 自持主档时自动打开）。复验见 `scripts/his_single_source_check.
 
 **接真 HIS 时**：院方主档编码不同不影响业务层，只要 HIS 建档接口
 返回 `patientRef`（或映射到 `_FIELD_MAP`）。
+
+## 12. 首句慢 / 空白气泡怎么排查（2026-11-12）
+
+1. **先分清前端还是后端**：`ChatWindow.vue` 的 `isTyping` 空 bot 气泡说明
+   请求已发出、正在等流式首字，不是页面没渲染。
+2. **取 trace（需 ops token）**：
+   ```
+   POST /v1/auth/token  {"subject_id":"<ops 主体>","secret":"<bootstrap>"}
+   GET  /traces?limit=5        → 按 input_preview 找到那一轮
+   GET  /trace/{trace_id}      → 看 root_spans 的 duration_ms
+   ```
+   看 `llm.chat` 占整轮比例。>90% 就是模型推理，不是网络 / RAG / Mongo。
+   本机 7B 实测 3395 prompt tokens 就要 69 s。
+3. **看指标**：纯问候应是 `greeting_fast_path_total +1` 而
+   `llm_calls_total +0`；若 `llm_calls_total` 也涨了，说明快路径没生效——
+   检查输入是否全匹配短句（夹带业务/身份证会正常进主链路）、以及是否
+   被改回旧代码。`/metrics` 同时能看 `medical_emergency_total` 确认急症分流。
+4. **别被心跳值误导**：左下「响应延迟 35ms」是探针/心跳，不代表本轮生成耗时。
+5. **落库异常**：`memory.write` 阶段若出现 `会话并发写冲突（重试 3 次耗尽）`
+   WARNING，说明这一轮回复**没写进历史**（非 strict 模式只告警不阻断）。
+   排查是否有多实例/多请求同时写同一 session；生产用 `storage_fail_fast`
+   会直接抛 `RepositoryUnavailable`。

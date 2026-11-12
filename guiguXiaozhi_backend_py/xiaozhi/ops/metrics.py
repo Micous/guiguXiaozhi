@@ -44,6 +44,8 @@ DEFAULT_COUNTERS = (
     "medical_out_of_scope_total",
     # 放行但注入了医疗边界提示的次数（正常医疗咨询的规模）
     "medical_boundary_prompt_total",
+    # 纯问候走确定性快路径的次数（首句秒回，未进入模型）
+    "greeting_fast_path_total",
 )
 
 

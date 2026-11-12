@@ -37,7 +37,7 @@ from xiaozhi.runtime.engine_helpers import (
     _last_assistant_text,
 )
 from xiaozhi.reliability.tracing import trace_span
-from xiaozhi.runtime.intent import should_inject_knowledge
+from xiaozhi.runtime.intent import GREETING_REPLY, should_inject_knowledge
 from xiaozhi.runtime.interceptors import TurnFacts, quality_gate
 from xiaozhi.runtime.response_gate import curate_final_reply, is_write_operation, stream_claim_is_legit
 from xiaozhi.runtime.state import TurnState
@@ -144,6 +144,56 @@ class EnginePhases:
             trace_id=trace_id,
             metadata={"delta": verdict.reply, "medical_safety": verdict.to_metadata()},
         )
+
+        async for _ev in self._persist_and_extract(
+            memory_id=memory_id,
+            history=history,
+            user_input=user_input,
+            state=state,
+            result=result,
+            trace_id=trace_id,
+        ):
+            yield _ev
+
+        async for _ev in self._finalize(
+            result=result, state=state, turns=0, trace_id=trace_id, started=started
+        ):
+            yield _ev
+
+    async def _short_circuit_greeting(
+        self,
+        *,
+        memory_id: str,
+        history: List[Message],
+        user_input: str,
+        result: "AgentEngineResultHolder",
+        trace_id: str,
+        started: float,
+    ) -> AsyncIterator[Event]:
+        """纯问候的确定性快路径：不检索、不调模型、不调工具，首句秒回。
+
+        前端每次「开启新会话」都会 reload 并自动发一句"你好"（ChatWindow.vue
+        的 onMounted → hello()）。这句话不含任何待办信息，但走完整 7B 生成要
+        69s（本机 trace 9ef10dc2：llm.chat 69447ms，占整轮 99.8%），期间用户
+        只看到一个空白气泡。寒暄文案不该交给概率生成。
+
+        与医疗安全短路同样遵守三条：
+          * 判定放在读历史之后、组装上下文之前，``model.calls == 0``；
+          * 固定话术**必须落库**（三段式只有 user + assistant 两条），否则
+            下一轮"刚才那个…"的上下文是断的；
+          * 走 ``_finalize`` 收口指标与结束事件，trace 里留 ``greeting.fast_path``。
+        """
+        state = self._new_turn_state(history, operation_request=False)
+        state.set_final_reply(GREETING_REPLY)
+        result.text = GREETING_REPLY
+
+        self.metrics.inc("greeting_fast_path_total")
+        logger.info("问候快路径（未进模型）：trace=%s", trace_id)
+        with trace_span("greeting.fast_path", trace_id=trace_id) as span:
+            span.set_attribute("fast_path", True)
+            span.set_attribute("model_calls", 0)
+
+        yield TextResponseEvent(trace_id=trace_id, metadata={"delta": GREETING_REPLY})
 
         async for _ev in self._persist_and_extract(
             memory_id=memory_id,

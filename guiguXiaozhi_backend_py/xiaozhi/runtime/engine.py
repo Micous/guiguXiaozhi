@@ -28,6 +28,7 @@ from xiaozhi.ops.metrics import MetricsCollector
 from xiaozhi.reliability.resilience import CircuitBreaker, RetryConfig
 from xiaozhi.reliability.tracing import get_trace_id, trace_span
 from xiaozhi.runtime.engine_phases import EnginePhases
+from xiaozhi.runtime.intent import is_greeting
 from xiaozhi.runtime.persister import ConversationPersister
 from xiaozhi.runtime.stream_filter import trim_to_sentence as _trim_to_sentence
 from xiaozhi.security.medical_safety import assess_medical_safety
@@ -134,6 +135,23 @@ class AgentEngine(EnginePhases):
             if safety.blocked:
                 async for _ev in self._short_circuit_medical_safety(
                     safety,
+                    memory_id=memory_id,
+                    history=history,
+                    user_input=user_input,
+                    result=result,
+                    trace_id=trace_id,
+                    started=started,
+                ):
+                    yield _ev
+                return
+
+            # 1.6 纯问候确定性快路径（首句秒回）。
+            #     医疗安全判定优先：含自伤/急症/越界的消息即使在寒暄里夹带，
+            #     也已经在上一步被收走了，不会落到这里。
+            #     限定 is_greeting() 的全匹配短句（≤12 字），"你好，我胸痛"
+            #     之类的真实诉求照常进模型与工具链路。
+            if is_greeting(user_input):
+                async for _ev in self._short_circuit_greeting(
                     memory_id=memory_id,
                     history=history,
                     user_input=user_input,
