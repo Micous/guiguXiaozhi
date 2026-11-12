@@ -46,7 +46,9 @@ from __future__ import annotations
 import hashlib
 import logging
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from datetime import date as date_module
+from datetime import timedelta
+from typing import Any, Dict, List, Optional, Tuple
 
 from xiaozhi.repositories.appointment_repo import (
     Appointment,
@@ -169,6 +171,71 @@ class AppointmentService:
         return hasattr(self._slot_service, "hold_slot") and hasattr(
             self._slot_service, "confirm_hold"
         )
+
+    # ---------- 审批弹窗前的号源预检（只查不占） ----------
+
+    def check_availability(
+        self,
+        *,
+        department: str,
+        date: str,
+        time: str,
+        doctor_name: Optional[str] = None,
+    ) -> SlotAvailability:
+        """**只查不占**的号源探测，供审批门控前预检使用。
+
+        与 ``book()`` 里的查询是同一份逻辑，区别只在于这里明确不预占 ——
+        预检看到"有号"也可能几分钟后就没了，最终锁定仍由 ``hold_slot`` 负责。
+        """
+        if self._slot_service is None:
+            # 没有号源服务时不制造假结论，交给正常链路
+            return SlotAvailability(available=True, message="未配置号源服务")
+        return self._slot_service.check(department, date, time, doctor_name)
+
+    def suggest_alternatives(
+        self,
+        *,
+        department: str,
+        date: str,
+        time: str = "",
+        days: int = 5,
+        limit: int = 2,
+    ) -> List[Tuple[str, str]]:
+        """近期同科室**有号**的 (日期, 时段)，用于"这个时段没号"的替代建议。
+
+        2026-11-12 真机：用户要「呼吸内科 2026-11-14 下午」，那天是周六、
+        本院不排班。只回一句"暂无出诊安排"用户还是不知道该约哪天，于是
+        反复试。这里顺手把最近能约的时段查出来，一次说清。
+
+        **只读、幂等、绝不抛** —— 查不到就返回空，调用方降级为通用提示；
+        预检是"锦上添花"的路径，不能因为它本身失败而挡住正常预约。
+        """
+        results: List[Tuple[str, str]] = []
+        if self._slot_service is None:
+            return results
+        try:
+            start = date_module.fromisoformat(str(date))
+        except (TypeError, ValueError):
+            return results
+        # 用户想要的时段优先：同一时段比"换个时段"更贴近原意
+        slots = [time, "上午", "下午"] if time in ("上午", "下午") else ["上午", "下午"]
+        seen_slots: List[str] = []
+        for slot in slots:
+            if slot and slot not in seen_slots:
+                seen_slots.append(slot)
+        for offset in range(1, max(1, days) + 1):
+            day = (start + timedelta(days=offset)).isoformat()
+            for slot in seen_slots:
+                try:
+                    availability = self._slot_service.check(department, day, slot, None)
+                except Exception as exc:  # noqa: BLE001 - 建议查询绝不能影响主链路
+                    logger.info("替代号源建议查询失败（已忽略）：%s", exc)
+                    return results
+                if availability.available:
+                    results.append((day, slot))
+                    if len(results) >= max(1, limit):
+                        return results
+        return results
 
     # ---------- 预约 ----------
 
@@ -394,6 +461,17 @@ class AppointmentService:
             return BookingResult(
                 outcome=BookingOutcome.NO_SLOT,
                 message=hold.message or "号源预占失败，请换个时段再试。",
+            )
+
+        # ---- 1.5 HIS 分配的医生：用户没点名时，以院方实际分配的为准 ----
+        # 预占响应里带着号源所属医生（真实 HIS 同样回传）。不取它就会把
+        # "医生：未指定"写进预约记录和回复——用户会问"怎么没给我安排医生"。
+        assigned_doctor = getattr(getattr(hold, "slot", None), "doctor_name", "") or ""
+        if not doctor_name and assigned_doctor:
+            doctor_name = assigned_doctor
+            logger.info(
+                "HIS 分配医生：%s（科室=%s %s %s）",
+                assigned_doctor, department, date, time,
             )
 
         # ---- 2. 落库 HOLDING（先落库再确认：崩了能查到 HOLDING 去对账）----

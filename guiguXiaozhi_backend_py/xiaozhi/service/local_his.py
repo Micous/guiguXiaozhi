@@ -508,6 +508,16 @@ class LocalHisState:
                 "clinicForRegistId": slot.clinic_for_regist_id,
                 "clinicMasterId": master_id,
                 "remaining": slot.remaining,
+                # 号源所属的科室/医生/日期/时段 —— 必须回传。
+                # 2026-11-12 真机：用户没指定医生，HIS 按号池分配了医生，
+                # 但响应里没有 doctorName，应用侧只能写"医生：未指定"，
+                # 用户当场追问"怎么没给我安排一个医生"。
+                # 真实 HIS 的预占/落单响应也带这些字段，回传是保真的。
+                "orgId": slot.org_id,
+                "deptName": slot.dept_name,
+                "doctorName": slot.doctor_name,
+                "clinicDate": slot.clinic_date,
+                "timeDesc": slot.time_desc,
             }
             if idempotency_key:
                 self.idempotency[idempotency_key] = result

@@ -48,6 +48,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from xiaozhi.repositories.errors import (
     NotFound,
     PersistenceError,
+    RepositoryError,
     RepositoryUnavailable,
     UniqueConflict,
 )
@@ -298,6 +299,11 @@ class MySQLAppointmentRepository(AppointmentRepository):
         """
         import mysql.connector
 
+        # 已经是仓储域异常（例如写库前的前置校验）→ 原样抛出，
+        # 别二次包装成 "写入预约失败：写入预约失败：..."。
+        if isinstance(exc, RepositoryError):
+            return exc
+
         if isinstance(exc, mysql.connector.IntegrityError):
             # 唯一约束冲突 → 业务规则冲突（重复预约）
             if "Duplicate entry" in str(exc):
@@ -305,6 +311,20 @@ class MySQLAppointmentRepository(AppointmentRepository):
                     f"{action}失败：已存在相同的预约记录（唯一约束冲突）"
                 )
             return PersistenceError(f"{action}失败：数据完整性约束不满足（{exc}）")
+        # --- 数据形状不符合表结构：重试**永远**不会成功 ---
+        # 2026-11-12 真机事故：`external_hold_id` 是 VARCHAR(64)，而
+        # `idem:<sha256>` 是 69 字符 → 1406 Data too long。这条 1406 落进了
+        # 下面的 `mysql.connector.Error` 兜底，被翻译成"数据存储暂时不可用"，
+        # 用户被告知"请稍后重试"—— 而重试一万次也还是超长。
+        #
+        # 分类原则：**能不能靠重试恢复**。
+        #   DataError / ProgrammingError → 不能（值超长、类型不符、SQL/列不存在）
+        #   OperationalError / InterfaceError / 连接类 → 能（断连、超时、连接数满）
+        #
+        # 注意顺序：DataError 与 ProgrammingError 都是 DatabaseError 的子类，
+        # 必须排在通用 Error 判断之前。
+        if isinstance(exc, (mysql.connector.DataError, mysql.connector.ProgrammingError)):
+            return PersistenceError(f"{action}失败：数据不符合表结构（{exc}）")
         if isinstance(
             exc,
             (
@@ -494,9 +514,28 @@ class MySQLAppointmentRepository(AppointmentRepository):
     def _insert_sql(self) -> str:
         return self._INSERT_SQL_PII if self._pii is not None else self._INSERT_SQL
 
+    #: 外部单号列宽（与 migrations/sql/007_widen_external_refs.sql 对齐）。
+    #: 库里是 VARCHAR(128)；这里再挡一次，是为了让"超长"以**业务错误**形式
+    #: 暴露出来，而不是等 MySQL 报 1406 再被误判成"存储暂时不可用"。
+    EXTERNAL_REF_MAX_LEN = 128
+
+    def _validate_external_refs(self, appointment: Appointment) -> None:
+        """外部单号超长直接给出明确原因，别让 1406 变成"请稍后重试"。"""
+        for field_name, value in (
+            ("external_hold_id", appointment.external_hold_id),
+            ("external_booking_id", appointment.external_booking_id),
+        ):
+            if value and len(str(value)) > self.EXTERNAL_REF_MAX_LEN:
+                raise PersistenceError(
+                    f"写入预约失败：{field_name} 超长"
+                    f"（{len(str(value))} > {self.EXTERNAL_REF_MAX_LEN} 字符）。"
+                    "这是外部单号/对账凭据的格式问题，重试不会自愈。"
+                )
+
     def _insert_params(
         self, appointment: Appointment, now: datetime
     ) -> Tuple[Any, ...]:
+        self._validate_external_refs(appointment)
         base: Tuple[Any, ...] = (
             appointment.username,
             appointment.id_card,

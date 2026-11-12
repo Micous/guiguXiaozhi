@@ -562,4 +562,15 @@ HIS 自持主档时自动打开）。复验见 `scripts/his_single_source_check.
    python scripts/e2e_approval_execution.py
    ```
    五项断言全绿才算"确认=真的挂上号"。
-5. **别用回复文本判断成败**：以 `appointment` 表 / `approval_requests` 状态为准。
+5. **看到「数据存储暂时不可用」先别去查存储**（2026-11-12 踩过）：
+   这句话曾经把一个 `1406 Data too long` 包装成了"请稍后重试"，而存储
+   完全正常。查日志里的完整错误正文（`{exc}` 在括号里）：
+   * `1406 / 1264 / 1366` → 数据形状问题，**重试不会自愈**；
+     列宽见 `migrations/sql/007_widen_external_refs.sql`（`VARCHAR(128)`）。
+   * `2006 / 2013 / 1040` → 真·连接问题，重试有意义。
+   分类标准就一句：**能不能靠重试恢复**。
+6. **没号的时段不应该弹确认窗**：审批门控前会做号源预检
+   （`BookAppointmentTool.prevalidate_args`）。日志出现
+   `审批门控前参数预校验未通过，不生成 PENDING` + `暂无出诊安排` 是**正常**
+   行为（省掉一次注定失败的一次性 token），不是审批坏了。
+7. **别用回复文本判断成败**：以 `appointment` 表 / `approval_requests` 状态为准。

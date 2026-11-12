@@ -1051,3 +1051,62 @@ L2 参数校验 / L3 注入防护 / L4 执行+审计）。重放、过期、跨�
 「预约成功。预约详情：…」，`approval_auto_executions` 0 → 1。
 全量 **855 passed / 6 skipped**。
 
+
+### 18.9 预约写入的三层误判修复 + 审批前号源预检（2026-11-12）
+
+真机事故：用户点「确认执行」后得到「预约未能写入：数据存储暂时不可用，请稍后重试」，
+而同轮用户追问「怎么没给我安排一个医生」。日志真正原因是
+`1406 Data too long for column 'external_hold_id'`，与存储可用性无关。
+
+**三层根因（首尾相接）**
+
+1. `external_hold_id` 为 `VARCHAR(64)`，而 UNKNOWN 路径写的对账凭据是
+   `idem:<sha256>` = 69 字符 → **该路径必然失败**（且只在"HIS 结果不确定"
+   时才走，正是最需要留线索的时刻）。
+2. `_translate()` 的 `mysql.connector.Error` 兜底把 `DataError` 也归成
+   `RepositoryUnavailable` → 不可恢复的错误被说成「请稍后重试」。
+3. 院方把「无排班」包成 `code=500`，而 `CLEAR_REJECTION_MARKERS` 未覆盖
+   「暂无出诊安排」→ 判成 `UNCERTAIN` → 重试 2 次 → 落 `UNKNOWN` → 才触发 ①。
+
+**修复**
+
+- 迁移 `007_widen_external_refs.sql`：`external_hold_id` / `external_booking_id`
+  → `VARCHAR(128)`（幂等，长度 <128 才 MODIFY）。截断不可行：幂等键是对账
+  反查（`/currentRegister/byKey/{key}`）的唯一凭据。
+- `appointment_repo._validate_external_refs()`：写库前校验长度，超长抛
+  `PersistenceError`（「重试不会自愈」），不让 1406 冒到用户面前。
+- `appointment_repo._translate()`：`DataError`/`ProgrammingError` →
+  `PersistenceError`（分类标准 = 能否靠重试恢复）；`RepositoryError` 原样返回
+  避免二次包装。
+- `his_resilience.CLEAR_REJECTION_MARKERS`：补 `暂无出诊`/`无排班`/`没有排班`/
+  `未排班`/`暂无号源`/`无可预约`/`无可用号源`/`不在出诊`。反向护栏（真系统故障
+  仍 `UNCERTAIN`）单独钉住。
+
+**审批前号源预检（默认开，仅审批路径）**
+
+`BookAppointmentTool.prevalidate_args` = 科室校验 **or** 号源预检
+（`_prevalidate_slot`）。挂在 `SecureToolExecutor` 的 `_approval_gate` 之前，
+所以没号的时段**根本不弹确认窗**（与科室守卫同源：不让人为注定失败的参数
+点确认）。口径：
+
+- 只拦模型改不了的事实；号源竞争/幂等命中交给 `book()`；
+- `AppointmentService.check_availability()` **只查不占**；
+- 号源系统故障一律放行（HIS 不可用 ≠ 没号）；
+- `suggest_alternatives()` 按天递推取最近 2 个有号时段（只读、幂等、绝不抛），
+  查不到降级为「请换其他日期或时段」。
+
+**医生回显**
+
+本地 HIS 预占响应补回 `deptName/doctorName/clinicDate/timeDesc`；
+`_book_with_hold` 在用户未点名时取 `hold.slot.doctor_name` 落库
+（用户点名的医生优先）。修复前一律「医生：未指定」。
+
+**验收（真机 8081，真实 7B + 真实 HIS 沙箱）**
+
+| 场景 | 结果 |
+|---|---|
+| 呼吸内科 2026-11-16 下午（有号） | 服务端确定性执行 15.2s，`appointment` 写入 1 条，回复含**医生：徐国兴** |
+| 呼吸内科 2026-11-14 下午（周六无排班） | **不弹审批窗**，29.5s 回复「暂无出诊安排 + 近期有号：2026-11-16 下午/上午」 |
+
+新增 21 条护栏单测（`test_appointment_write_failures.py` 13 /
+`test_appointment_slot_precheck.py` 8），全量 **876 passed / 6 skipped**。

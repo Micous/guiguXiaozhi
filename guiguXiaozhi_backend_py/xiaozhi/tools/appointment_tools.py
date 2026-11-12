@@ -74,6 +74,62 @@ def _prevalidate_department(
     return "" if result.ok else result.message()
 
 
+def _prevalidate_slot(args: Dict[str, Any], service: Any) -> str:
+    """审批弹窗前的号源预检：**这个时段根本没号，就别让人确认**。
+
+    2026-11-12 真机：用户要「呼吸内科 2026-11-14 下午」，那天是周六、本院
+    不排班。流程却一路走到底 —— 弹确认窗 → 用户核对 → 点确认 → 执行 →
+    才被告知"暂无出诊安排"。确认窗是"我要挂这个号"的承诺，让人为一个
+    注定失败的参数点确认，等于白花一次一次性 token，体验上就是
+    "拖到审批才拒"。
+
+    与科室守卫同一口径：只拦**模型改不了的事实**（这个时段没有出诊安排）。
+    幂等键/号源竞争这类会变的东西不在这里拦 —— 最终锁定仍由 book() 负责。
+
+    失败一律放行：号源系统不可用 ≠ 没号。
+    """
+    if service is None:
+        return ""
+    try:
+        data_in = normalize_arguments(
+            args, ["username", "id_card", "department", "date", "time", "doctor_name"]
+        )
+        validation = validate_appointment(data_in)
+        if not validation.ok:
+            # 格式/缺字段的问题交给工具层（那里会告诉模型怎么改），
+            # 这里只处理"参数齐全但事实层面没号"
+            return ""
+        data = validation.normalized
+        availability = service.check_availability(
+            department=data["department"],
+            date=data["date"],
+            time=data["time"],
+            doctor_name=data.get("doctor_name") or None,
+        )
+    except Exception as exc:  # noqa: BLE001 - 预检不能挡住正常预约
+        logger.warning(
+            "号源预检失败，跳过（放行）：%s: %s", type(exc).__name__, exc
+        )
+        return ""
+    if availability.available:
+        return ""
+
+    message = availability.message or "该时段暂无出诊安排。"
+    try:
+        tips = service.suggest_alternatives(
+            department=data["department"],
+            date=data["date"],
+            time=data["time"],
+        )
+    except Exception as exc:  # noqa: BLE001 - 建议查不到就只说事实
+        logger.warning("替代号源建议查询失败（已忽略）：%s", exc)
+        tips = []
+    if tips:
+        readable = "、".join(f"{day} {slot}" for day, slot in tips)
+        return f"{message} 近期有号的时段：{readable}。请从中选择一个，或换其他日期。"
+    return f"{message} 请换其他日期或时段（本院周末通常不排班）。"
+
+
 class BookAppointmentTool(Tool):
     """提交预约"""
 
@@ -137,8 +193,10 @@ class BookAppointmentTool(Tool):
         return build_department_hint(self.doctor_service)
 
     def prevalidate_args(self, args: Dict[str, Any]) -> str:
-        """审批弹窗前：本院不存在的科室不生成 PENDING、不弹确认窗。"""
-        return _prevalidate_department(args, self.doctor_service)
+        """审批弹窗前：不存在的科室、没号的时段都不生成 PENDING。"""
+        return _prevalidate_department(args, self.doctor_service) or _prevalidate_slot(
+            args, self._service
+        )
 
     async def call(self, params: Dict[str, Any]) -> Any:
         from xiaozhi.core.tool import ToolResult
