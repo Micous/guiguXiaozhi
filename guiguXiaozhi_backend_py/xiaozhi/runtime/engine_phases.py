@@ -4,8 +4,10 @@
 （chat_model / metrics / retry_config…），事件实时 yield 给 run() 透传。
 逻辑自 engine.py 原样平移，行为零变更。
 
-B2 第一批：``_chat_turn`` 的实现已迁到 ``runtime/model_runner.py`` 的
-``ModelRunner``，本文件只保留一行委托壳；其余阶段仍按原批次逐步迁移。
+B2：``_chat_turn`` → ``runtime/model_runner.py`` 的 ``ModelRunner``、
+``_run_loop`` → ``runtime/loop_controller.py`` 的 ``LoopController``、
+``_execute_tools`` → ``runtime/tool_coordinator.py`` 的 ``ToolCoordinator``；
+本文件只保留委托壳，其余阶段（收尾/落库/短路）仍按后续批次逐步迁移。
 """
 
 from __future__ import annotations
@@ -20,30 +22,24 @@ if TYPE_CHECKING:  # 仅供类型标注，避免与 engine.py 循环导入
 
 from xiaozhi.core.event import (
     AgentEndEvent,
-    ApprovalRequiredEvent,
     DegradedEvent,
     Event,
     RetrievalEvent,
     TextResponseEvent,
     ToolExecuteEvent,
     ToolResultEvent,
-    TurnEndEvent,
-    TurnStartEvent,
 )
 from xiaozhi.core.message import Message, ToolCall
 from xiaozhi.core.tool import ToolResult
 from xiaozhi.models.quality import booking_executed_in_history, corrective_prompt
 from xiaozhi.reliability.resilience import degraded_reply
 from xiaozhi.runtime.approval_execution import approved_operation_reply
-from xiaozhi.runtime.engine_helpers import _empty_turn, _last_assistant_text
+from xiaozhi.runtime.engine_helpers import _last_assistant_text
 from xiaozhi.reliability.tracing import trace_span
 from xiaozhi.runtime.intent import GREETING_REPLY, should_inject_knowledge
 from xiaozhi.runtime.response_gate import curate_final_reply, is_write_operation
 from xiaozhi.runtime.state import TurnState
-from xiaozhi.runtime.appointment_guard import (
-    DepartmentGuardVerdict,
-    restore_masked_id_cards,
-)
+from xiaozhi.runtime.appointment_guard import DepartmentGuardVerdict
 from xiaozhi.security.medical_safety import (
     BOUNDARY_PROMPT,
     SafetyVerdict,
@@ -417,159 +413,26 @@ class EnginePhases:
         trace_id: str,
         result: "AgentEngineResultHolder",
     ) -> AsyncIterator[Event]:
-        """执行本轮全部工具调用，结果回填 messages（事件实时下发）。"""
-        # ---- 执行工具 ----
-        assistant_message = Message.assistant(response.text, tool_calls=response.tool_calls)
-        state.set_narration(response.text)
-        messages.append(self._assistant_to_ollama(assistant_message))
+        """兼容委托壳：工具执行已迁到 ``ToolCoordinator``（B2 第三批）。
 
-        for call in response.tool_calls:
-            # ---- PII 真值还原（必须在审批门控/参数校验之前）----
-            # 落库与确认窗展示用掩码是安全契约（PII P0-06），但 7B 下一轮会把
-            # 历史里看到的 `610121********2831` 直接当参数重发。这里还原成真值，
-            # 使「审批哈希 = 实际执行参数 = 真值」一致，用户看到的仍是掩码。
-            if state.known_id_card and call.arguments:
-                restored, restored_changed = restore_masked_id_cards(
-                    call.arguments, state.known_id_card
-                )
-                if restored_changed:
-                    # 原地更新：同一 ToolCall 对象已被 append 进本轮 messages，
-                    # 后面落库也用这份参数 —— 只替换副本会让三处口径不一致。
-                    call.arguments.clear()
-                    call.arguments.update(restored)
-                    self.metrics.inc("id_card_restored_total")
-                    logger.info(
-                        "工具参数中的掩码身份证已还原为真值：tool=%s trace=%s",
-                        call.name,
-                        trace_id,
-                    )
-
-            if state.tool_call_count >= self.max_tool_calls:
-                logger.warning("工具调用次数达到上限，停止本轮工具调用")
-                state.tool_results.append(
-                    Message.tool_result(
-                        "本轮工具调用次数已达上限，请直接给出建议。",
-                        call.id,
-                        call.name,
-                        is_error=True,
-                    )
-                )
-                break
-
-            state.tool_call_count += 1
-            yield ToolExecuteEvent(
-                trace_id=trace_id,
-                metadata={"tool_name": call.name, "tool_id": call.id},
-            )
-
-            with trace_span("tool.execute", trace_id=trace_id) as tool_span:
-                tool_span.set_attribute("tool_name", call.name)
-                tool = self.tool_registry.get(call.name)
-
-                # ---- Phase 5：工具执行**前**落 STARTED ----
-                # 崩溃恢复时据此判断"这个工具可能有副作用"，标记为 UNKNOWN
-                # 后必须先查业务事实，不可盲目重试（否则重复挂号）。
-                tool_exec_id = None
-                if self.task_tracker is not None:
-                    tool_exec_id = self.task_tracker.tool_started(
-                        call.id, call.name, call.arguments
-                    )
-
-                if tool is None:
-                    tool_span.set_error("工具未注册")
-                    tool_result = ToolResult.fail(
-                        f"工具【{call.name}】不存在。", error_type="ToolNotFound"
-                    )
-                elif (
-                    state.failure_count(call.name)
-                    >= self.tool_failure_threshold
-                ):
-                    tool_span.set_attribute("circuit_open", True)
-                    tool_result = ToolResult.fail(
-                        f"工具【{call.name}】本轮连续失败多次，已暂时停用，请换一种方式回答。",
-                        error_type="ToolCircuitOpen",
-                    )
-                else:
-                    secure_call = SecureToolCall(
-                        tool_name=call.name,
-                        args=call.arguments,
-                        user_id=user_id,
-                        trace_id=trace_id,
-                    )
-                    tool_result = await self.secure_executor.execute(secure_call, tool)
-
-                if tool_result.success:
-                    state.record_tool_success(call.name)
-                else:
-                    state.record_tool_failure(call.name, tool_result)
-                # ---- Phase 4：写工具的结构化结果单独入账 ----
-                # 完成态表述以业务服务的 ToolResult 为准（不让模型总结成败）；
-                # UNKNOWN（authoritative_status）在请求收尾时换固定文案。
-                state.record_write_result(call.name, tool_result)
-
-                # ---- Phase 5：工具执行后落终态（写工具成功 → 副作用已提交）----
-                if self.task_tracker is not None:
-                    self.task_tracker.tool_finished(
-                        tool_exec_id, call.name, success=tool_result.success
-                    )
-
-                self.metrics.record_tool(call.name, tool_result.success)
-                self.metrics.observe(
-                    "tool_duration_ms", tool_result.execution_time * 1000
-                )
-                tool_span.set_attribute("success", tool_result.success)
-                tool_span.set_attribute(
-                    "result_preview", tool_result.content[:160]
-                )
-                tool_span.set_attribute(
-                    "execution_time_ms", round(tool_result.execution_time * 1000, 2)
-                )
-
-            # ---- Phase 2：审批门控拦下写工具，立刻短路本轮 ----
-            # 不能把「需要确认」的工具结果继续喂给模型：7b 模型会编造
-            # 「已为您确认并预约成功」。这里直接给用户可读提示 + 结构化审批事件。
-            approval_payload = (tool_result.metadata or {}).get("approval") or {}
-            if approval_payload:
-                clean = approval_payload.get("message") or "该操作需要您确认后才会执行。"
-                state.mark_approval_required(approval_payload)
-                state.set_final_reply(clean)
-                result.text = clean
-                state.add_tool_result(
-                    Message.tool_result(clean, call.id, call.name, is_error=False)
-                )
-                result.tool_calls.append(call)
-                yield TextResponseEvent(trace_id=trace_id, metadata={"delta": clean})
-                yield ApprovalRequiredEvent(
-                    trace_id=trace_id,
-                    metadata=dict(approval_payload),
-                )
-                break
-
-            yield ToolResultEvent(
-                trace_id=trace_id,
-                metadata={
-                    "tool_id": call.id,
-                    "tool_name": call.name,
-                    "is_error": tool_result.is_error,
-                    "content_length": len(tool_result.content),
-                    "result_preview": tool_result.content[:160],
-                    "duration_ms": round(tool_result.execution_time * 1000, 2),
-                },
-            )
-
-            result_message = Message.tool_result(
-                tool_result.content,
-                call.id,
-                call.name,
-                is_error=tool_result.is_error,
-                error_type=tool_result.error_type,
-            )
-            state.add_tool_result(result_message)
-            result.tool_calls.append(call)
-
-        # ---- 工具结果回填，继续下一轮 ----
-        for message in state.drain_tool_results():
-            messages.append(self._tool_to_ollama(message))
+        消息格式转换以显式 Port 注入协作者；运行时依赖按每次调用传入，
+        ``LoopController`` 的 ``execute_tools`` Port 仍指向本委托壳，链路零改动。
+        """
+        async for _ev in self._tool_coordinator.execute_tools(
+            response=response,
+            messages=messages,
+            state=state,
+            user_id=user_id,
+            trace_id=trace_id,
+            result=result,
+            metrics=self.metrics,
+            max_tool_calls=self.max_tool_calls,
+            tool_failure_threshold=self.tool_failure_threshold,
+            tool_registry=self.tool_registry,
+            task_tracker=self.task_tracker,
+            secure_executor=self.secure_executor,
+        ):
+            yield _ev
 
     # ---------- 编排子步骤（run 的单一职责拆分，逻辑自 run() 原样平移） ----------
 
@@ -952,156 +815,28 @@ class EnginePhases:
         outcome: Dict[str, Any],
         budget=None,
     ) -> AsyncIterator[Event]:
-        """主循环：预算/熔断守门 → 调模型 → 出错降级 / 无工具收尾 / 执行工具。
+        """兼容委托壳：主循环已迁到 ``LoopController``（B2 第二批）。
 
-        结束时把最终轮数写入 outcome["turns"]（run 收口与 AgentEnd 要用）。
+        保留同名方法，``_run_body`` 与既有单测调用点零改动；运行时依赖按
+        每次调用传入，协作者实例不持有任何请求级状态。
         """
-        turn = 0
-        while turn < self.max_turns:
-            # ---- 守门一：请求级时间预算 ----
-            if self._time_budget_exceeded(started, budget):
-                async for _ev in self._degrade_on_time_budget(user_input, trace_id, result):
-                    yield _ev
-                break
-
-            # ---- 守门二：模型熔断器打开时直接本地降级 ----
-            if self._circuit_is_open():
-                async for _ev in self._degrade_on_circuit_open(user_input, trace_id, result):
-                    yield _ev
-                break
-
-            yield TurnStartEvent(trace_id=trace_id, metadata={"turn_number": turn})
-
-            # ---- 调模型（流式 + 质量拦截器链，见 _chat_turn）----
-            turn_outcome: Dict[str, Any] = {}
-            async for _ev in self._chat_turn(
-                messages=messages,
-                tools=tools,
-                known_tool_names=known_tool_names,
-                state=state,
-                user_input=user_input,
-                trace_id=trace_id,
-                turn_number=turn,
-                request_span=request_span,
-                result=result,
-                outcome=turn_outcome,
-            ):
-                yield _ev
-            response = turn_outcome.get("response")
-            call_error = turn_outcome.get("call_error")
-            emitted_this_turn = turn_outcome.get("emitted_this_turn", False)
-            held_deltas: List[str] = turn_outcome.get("held_deltas") or []
-
-            def _flush_held() -> List[Event]:
-                return [
-                    TextResponseEvent(trace_id=trace_id, metadata={"delta": delta})
-                    for delta in held_deltas
-                ]
-
-            # ---- 模型调用失败 → 降级并结束 ----
-            if call_error is not None:
-                for _ev in _flush_held():
-                    yield _ev
-                async for _ev in self._degrade_on_model_error(
-                    call_error, emitted_this_turn, user_input, trace_id, result
-                ):
-                    yield _ev
-                break
-
-            if self.circuit_breaker is not None:
-                self.circuit_breaker.record_success()
-
-            if response is None:
-                response = _empty_turn()
-
-            # ---- 没有工具调用 → 结束（或纠正重试一轮） ----
-            if not response.tool_calls:
-                # ---- 带审批 token 的请求：服务端按审批记录**确定性执行** ----
-                # 顺序在"强制重试模型"之前：用户已经点过确认，模型这一轮说什么
-                # 都不该决定这件事办不办。2026-11-12 真机，7B 两轮"只说不做"
-                # （先"请在确认窗口核对"，再"正在为您提交预约"），token 白拿、
-                # 预约没发生 —— 求模型配合的那条路已经证明不可靠。
-                # 无 token / token 已消费时此方法静默返回，行为与之前完全一致。
-                async for _ev in self._execute_approved_operation(
-                    user_id=user_id,
-                    trace_id=trace_id,
-                    state=state,
-                    result=result,
-                ):
-                    yield _ev
-                if state.approval_auto_executed:
-                    turn += 1
-                    yield TurnEndEvent(
-                        trace_id=trace_id,
-                        metadata={
-                            "turn_number": turn,
-                            "approval_auto_executed": True,
-                        },
-                    )
-                    break
-
-                # ---- 兜底未生效（无 token 等）→ 仍按原链路："带有效审批 token 的请求" ----
-                # （2026-11-11 第十轮事故）用户点了「确认执行」→ 前端换到一次性
-                # token → 带 token 重发同一句。这一轮模型可能输出
-                # 「请在确认窗口核对上述信息并确认预约。未确认前不会进行实际挂号操作。」
-                # —— 既不是成功承诺（claim 不匹配），也不是叙述承诺（narrated 不匹配），
-                # **三个检测全部漏判** → 模型零工具调用收尾 → token 白拿、
-                # 预约**没有发生**，而用户看到的却是"请在确认窗口核对"
-                # （确认窗早就关了）。
-                #
-                # 这类句子靠正则很难穷举（模型有无数种说法），必须在引擎层兜底：
-                # **有 token 进来，就一定要有写操作发生**。
-                # 兜底没执行成 → 模型这一轮的话补发给用户（与旧行为一致）
-                for _ev in _flush_held():
-                    yield _ev
-                if self._retry_with_approval_hint(
-                    messages, tools, state, response, trace_id
-                ):
-                    turn += 1
-                    yield TurnEndEvent(
-                        trace_id=trace_id,
-                        metadata={"turn_number": turn, "corrective_retry": True},
-                    )
-                    continue
-                if self._schedule_corrective_retry(response, messages, state):
-                    turn += 1
-                    yield TurnEndEvent(
-                        trace_id=trace_id,
-                        metadata={"turn_number": turn, "corrective_retry": True},
-                    )
-                    continue
-                break
-
-            # ---- 执行工具 + 结果回填（见 _execute_tools）----
-            # 真调了工具 → 叙述段照常下发（被扣住的文本这时才放行）
-            for _ev in _flush_held():
-                yield _ev
-            async for _ev in self._execute_tools(
-                response=response,
-                messages=messages,
-                state=state,
-                user_id=user_id,
-                trace_id=trace_id,
-                result=result,
-            ):
-                yield _ev
-
-            # 审批短路：本请求到此为止，不再进入下一轮模型调用
-            if state.approval_required:
-                turn += 1
-                yield TurnEndEvent(
-                    trace_id=trace_id,
-                    metadata={"turn_number": turn, "approval_required": True},
-                )
-                break
-
-            turn += 1
-            yield TurnEndEvent(
-                trace_id=trace_id,
-                metadata={"turn_number": turn, "has_tool_calls": True},
-            )
-
-        outcome["turns"] = turn
+        async for _ev in self._loop_controller.run_loop(
+            messages=messages,
+            tools=tools,
+            known_tool_names=known_tool_names,
+            state=state,
+            user_input=user_input,
+            user_id=user_id,
+            trace_id=trace_id,
+            request_span=request_span,
+            started=started,
+            result=result,
+            outcome=outcome,
+            budget=budget,
+            max_turns=self.max_turns,
+            circuit_breaker=self.circuit_breaker,
+        ):
+            yield _ev
 
     async def _finalize_response_gate(
         self,

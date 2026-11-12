@@ -38,9 +38,11 @@ from xiaozhi.runtime.appointment_guard import (
 )
 from xiaozhi.runtime.engine_phases import EnginePhases
 from xiaozhi.runtime.intent import is_greeting
+from xiaozhi.runtime.loop_controller import LoopController, LoopPorts
 from xiaozhi.runtime.model_runner import ModelRunner
 from xiaozhi.runtime.persister import ConversationPersister
 from xiaozhi.runtime.run_context import ExecutionBudget, RunContext
+from xiaozhi.runtime.tool_coordinator import ToolCoordinator
 from xiaozhi.runtime.stream_filter import trim_to_sentence as _trim_to_sentence
 from xiaozhi.security.medical_safety import assess_medical_safety
 from xiaozhi.security.secure_executor import SecureToolExecutor
@@ -112,6 +114,30 @@ class AgentEngine(EnginePhases):
         self._model_runner = ModelRunner(
             has_pending_approval_token=self._has_pending_approval_token,
             output_guard_enabled=self._output_guard_enabled,
+        )
+        # B2 第二批：主循环迁到 LoopController。所有外部能力以显式 Port 注入；
+        # max_turns / circuit_breaker 等请求级运行时依赖由委托壳按调用传入，
+        # 协作者实例本身不保存任何跨请求状态（并发请求共用同一实例）。
+        self._loop_controller = LoopController(
+            LoopPorts(
+                time_budget_exceeded=self._time_budget_exceeded,
+                degrade_on_time_budget=self._degrade_on_time_budget,
+                circuit_is_open=self._circuit_is_open,
+                degrade_on_circuit_open=self._degrade_on_circuit_open,
+                degrade_on_model_error=self._degrade_on_model_error,
+                chat_turn=self._chat_turn,
+                execute_approved_operation=self._execute_approved_operation,
+                retry_with_approval_hint=self._retry_with_approval_hint,
+                schedule_corrective_retry=self._schedule_corrective_retry,
+                execute_tools=self._execute_tools,
+            )
+        )
+
+        # B2 第三批：工具执行迁到 ToolCoordinator。两个消息格式转换是纯函数，
+        # 以显式 Port 注入；其余运行时依赖由委托壳按调用传入。
+        self._tool_coordinator = ToolCoordinator(
+            assistant_to_ollama=self._assistant_to_ollama,
+            tool_to_ollama=self._tool_to_ollama,
         )
 
     async def run(
