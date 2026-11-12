@@ -11,11 +11,18 @@ from contextlib import asynccontextmanager
 from typing import Any, Dict
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from xiaozhi.application import get_application
 from xiaozhi.config import get_settings
 from xiaozhi.core.message import Role
+from xiaozhi.server.middleware import (
+    BodySizeLimitMiddleware,
+    DEFAULT_SECURITY_HEADERS,
+    SecurityHeadersMiddleware,
+    normalize_origins,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +57,37 @@ def create_app() -> FastAPI:
             await container.aclose()
 
     app.router.lifespan_context = lifespan
+
+    # ---- Phase 8-C：HTTP 边界（安全响应头 / 请求体上限 / 可选 CORS）----
+    # 都是纯入口层能力，不碰业务与协议：前端仍然收裸文本分块。
+    #
+    # 注意 Starlette 的 add_middleware 是**前插**：后加的在外层。
+    # 所以这里按「内 → 外」的顺序注册：
+    #   router → BodySizeLimit → SecurityHeaders → CORS
+    # 两层顺序不能反：SecurityHeaders 必须在 BodySizeLimit 外层，
+    # 否则 413 响应拿不到 no-store / nosniff（错误响应同样可能被缓存）。
+    settings = get_settings()
+    app.add_middleware(
+        BodySizeLimitMiddleware, max_bytes=settings.max_request_bytes
+    )
+    app.add_middleware(
+        SecurityHeadersMiddleware,
+        headers=DEFAULT_SECURITY_HEADERS,
+        enabled=settings.security_headers_enabled,
+    )
+    origins = normalize_origins(settings.cors_allowed_origins)
+    if origins:
+        # 前端走 Vite 代理（同源）时不需要 CORS，所以默认不挂；
+        # 只有显式配置白名单才启用，且 `*` 与 allow_credentials 互斥。
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=origins,
+            allow_credentials=origins != ["*"],
+            allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+            allow_headers=["Authorization", "Content-Type", "X-Requested-With"],
+            max_age=600,
+        )
+        logger.info("CORS 已启用，白名单=%s", origins)
 
     from xiaozhi.server import routes
 

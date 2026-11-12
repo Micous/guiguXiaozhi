@@ -47,11 +47,14 @@ def validate_id_card(value: str) -> ValidationResult:
     if not value:
         return ValidationResult.failure("身份证号不能为空")
     if not ID_CARD_RE.match(value):
-        return ValidationResult.failure(f"身份证号格式不正确：{value}，应为 18 位（最后一位可能是 X）")
+        # 不回显原值（P0-06）：错误信息会进模型上下文与历史落库，
+        # 回显一个格式错误的身份证号同样是明文泄露；用户自己刚输入过，
+        # 不需要系统复述一遍才能发现打错了。
+        return ValidationResult.failure("身份证号格式不正确，应为 18 位（最后一位可能是 X）")
     body, check = value[:17], value[17].upper()
     total = sum(int(c) * w for c, w in zip(body, ID_CARD_WEIGHTS))
     if ID_CARD_CHECK_CHARS[total % 11] != check:
-        return ValidationResult.failure(f"身份证号校验位不正确：{value}")
+        return ValidationResult.failure("身份证号校验位不正确，请核对后重新提供")
     return ValidationResult.success(id_card=value)
 
 

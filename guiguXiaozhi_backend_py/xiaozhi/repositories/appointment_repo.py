@@ -51,6 +51,7 @@ from xiaozhi.repositories.errors import (
     RepositoryUnavailable,
     UniqueConflict,
 )
+from xiaozhi.security.pii import is_ciphertext
 
 logger = logging.getLogger(__name__)
 
@@ -253,9 +254,24 @@ class AppointmentRepository(ABC):
 
 
 class MySQLAppointmentRepository(AppointmentRepository):
-    """MySQL 实现（与 Java 版共用同一个 guiguxiaozhi 库与表）"""
+    """MySQL 实现（与 Java 版共用同一个 guiguxiaozhi 库与表）
 
-    def __init__(self, host: str, port: int, user: str, password: str, database: str) -> None:
+    **Phase 8-B（P0-06 落库侧）**：传入 ``pii_codec`` 时，身份证号
+    以 ``enc:v1:<fernet>`` 密文落 ``id_card``，查重/唯一约束改用
+    ``id_card_hash``（HMAC），列表展示用 ``id_card_masked``。
+    不传（默认）= 一期行为：明文落库、按明文查重，SQL 逐字不变。
+    """
+
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        user: str,
+        password: str,
+        database: str,
+        *,
+        pii_codec: Optional[Any] = None,
+    ) -> None:
         self._config = {
             "host": host,
             "port": port,
@@ -263,6 +279,7 @@ class MySQLAppointmentRepository(AppointmentRepository):
             "password": password,
             "database": database,
         }
+        self._pii = pii_codec
         self._lock = threading.Lock()
 
     def _connect(self):
@@ -311,7 +328,7 @@ class MySQLAppointmentRepository(AppointmentRepository):
         return Appointment(
             id=row.get("id"),
             username=row.get("username", ""),
-            id_card=row.get("id_card", ""),
+            id_card=self._read_id_card(row),
             department=row.get("department", ""),
             date=row.get("date", ""),
             time=row.get("time", ""),
@@ -326,23 +343,78 @@ class MySQLAppointmentRepository(AppointmentRepository):
             reconcile_attempts=int(row.get("reconcile_attempts") or 0),
         )
 
-    _SELECT_COLUMNS = (
+    # ---- Phase 8-B：敏感字段的读写口（全部集中在这里，避免漏改） ----
+
+    def _read_id_card(self, row: Dict[str, Any]) -> str:
+        """读记录时还原身份证号：密文 → 明文；存量明文原样返回。"""
+        stored = row.get("id_card", "") or ""
+        if self._pii is None:
+            return stored
+        if not is_ciphertext(stored):
+            return stored  # 未回填的存量行
+        try:
+            return self._pii.decrypt(stored)
+        except Exception as exc:  # noqa: BLE001 - 单条坏记录不能拖垮整张列表
+            logger.error("预约 id=%s 的身份证密文无法解密：%s", row.get("id"), exc)
+            return row.get("id_card_masked") or ""
+
+    def _stored_id_card(self, id_card: str) -> str:
+        return self._pii.encrypt(id_card) if self._pii is not None else id_card
+
+    def _stored_hash(self, id_card: str) -> Optional[str]:
+        return self._pii.fingerprint(id_card) if self._pii is not None else None
+
+    def _stored_masked(self, id_card: str) -> Optional[str]:
+        return self._pii.masked(id_card) if self._pii is not None else None
+
+    def _dedupe_clause(self, appointment: Appointment) -> Tuple[str, Tuple[Any, ...]]:
+        """查重条件。
+
+        开启保护后仍带 ``OR id_card=%s``：存量行可能还没回填 hash
+        （脚本没跑），只按 hash 查会把"已经约过的人"放进来重复预约。
+        回填完成后这个 OR 分支自然失效（明文不再出现），查询计划仍走 hash 索引。
+        """
+        if self._pii is None:
+            return (
+                "username=%s AND id_card=%s",
+                (appointment.username, appointment.id_card),
+            )
+        return (
+            "username=%s AND (id_card_hash=%s OR id_card=%s)",
+            (
+                appointment.username,
+                self._pii.fingerprint(appointment.id_card),
+                appointment.id_card,
+            ),
+        )
+
+    _SELECT_COLUMNS_BASE = (
         "id, username, id_card, department, date, time, doctor_name, status, version, "
         "external_booking_id, external_hold_id, patient_ref, reconciled_at, "
         "reconcile_attempts"
     )
+    #: 只有开启 PII 保护时才查这两列 —— 否则**未跑迁移 006** 的库
+    #: 会因为 "Unknown column" 让所有预约查询 500（部署顺序不该成为炸弹）。
+    _SELECT_COLUMNS_PII = (
+        _SELECT_COLUMNS_BASE + ", id_card_hash, id_card_masked"
+    )
+
+    def _select_columns(self) -> str:
+        return (
+            self._SELECT_COLUMNS_PII if self._pii is not None else self._SELECT_COLUMNS_BASE
+        )
 
     def find_duplicate(self, appointment: Appointment) -> Optional[Appointment]:
         conn = self._connect()
         try:
             cursor = conn.cursor(dictionary=True)
+            where, key_params = self._dedupe_clause(appointment)
             cursor.execute(
-                f"SELECT {self._SELECT_COLUMNS} FROM appointment "
-                "WHERE username=%s AND id_card=%s AND department=%s "
+                f"SELECT {self._select_columns()} FROM appointment "
+                f"WHERE {where} AND department=%s "
                 f"AND date=%s AND time=%s AND status NOT IN ({_TERMINAL_STATUS_SQL}) LIMIT 1",
-                (
-                    appointment.username,
-                    appointment.id_card,
+                key_params
+                + (
                     appointment.department,
                     appointment.date,
                     appointment.time,
@@ -360,13 +432,13 @@ class MySQLAppointmentRepository(AppointmentRepository):
         conn = self._connect()
         try:
             cursor = conn.cursor(dictionary=True)
+            where, key_params = self._dedupe_clause(appointment)
             cursor.execute(
-                f"SELECT {self._SELECT_COLUMNS} FROM appointment "
-                "WHERE username=%s AND id_card=%s AND department=%s "
+                f"SELECT {self._select_columns()} FROM appointment "
+                f"WHERE {where} AND department=%s "
                 "AND date=%s AND time=%s ORDER BY id DESC LIMIT 1",
-                (
-                    appointment.username,
-                    appointment.id_card,
+                key_params
+                + (
                     appointment.department,
                     appointment.date,
                     appointment.time,
@@ -385,7 +457,7 @@ class MySQLAppointmentRepository(AppointmentRepository):
         try:
             cursor = conn.cursor()
             now = datetime.now()
-            cursor.execute(self._INSERT_SQL, self._insert_params(appointment, now))
+            cursor.execute(self._insert_sql(), self._insert_params(appointment, now))
             conn.commit()
             appointment.id = cursor.lastrowid
             cursor.close()
@@ -398,20 +470,58 @@ class MySQLAppointmentRepository(AppointmentRepository):
 
     # Phase 3b：插入语句集中一处 —— save 与 create_if_absent 共用，
     # 避免"一处加了 HIS 字段另一处忘了"的漏写（这类漏写只在真机暴露）。
-    _INSERT_SQL = (
-        "INSERT INTO appointment (username, id_card, department, date, time, "
+    # Phase 8-B：开启 PII 保护时多写 id_card_hash / id_card_masked 两列；
+    # 未开启时 SQL 与一期逐字一致（未迁移的库也能正常写入）。
+    _INSERT_COLUMNS = (
+        "username, id_card, department, date, time, "
         "doctor_name, status, version, external_booking_id, external_hold_id, "
-        "patient_ref, reconciled_at, reconcile_attempts, created_at, updated_at) "
+        "patient_ref, reconciled_at, reconcile_attempts, created_at, updated_at"
+    )
+    _INSERT_SQL = (
+        f"INSERT INTO appointment ({_INSERT_COLUMNS}) "
         "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
     )
+    _INSERT_COLUMNS_PII = (
+        "username, id_card, id_card_hash, id_card_masked, department, date, time, "
+        "doctor_name, status, version, external_booking_id, external_hold_id, "
+        "patient_ref, reconciled_at, reconcile_attempts, created_at, updated_at"
+    )
+    _INSERT_SQL_PII = (
+        f"INSERT INTO appointment ({_INSERT_COLUMNS_PII}) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
+    )
 
-    @staticmethod
+    def _insert_sql(self) -> str:
+        return self._INSERT_SQL_PII if self._pii is not None else self._INSERT_SQL
+
     def _insert_params(
-        appointment: Appointment, now: datetime
+        self, appointment: Appointment, now: datetime
     ) -> Tuple[Any, ...]:
-        return (
+        base: Tuple[Any, ...] = (
             appointment.username,
             appointment.id_card,
+            appointment.department,
+            appointment.date,
+            appointment.time,
+            appointment.doctor_name,
+            appointment.status.value,
+            appointment.version,
+            appointment.external_booking_id,
+            appointment.external_hold_id,
+            appointment.patient_ref,
+            appointment.reconciled_at,
+            appointment.reconcile_attempts,
+            now,
+            now,
+        )
+        if self._pii is None:
+            return base
+        encrypted, fingerprint, masked = self._pii.protect(appointment.id_card)
+        return (
+            appointment.username,
+            encrypted,
+            fingerprint,
+            masked,
             appointment.department,
             appointment.date,
             appointment.time,
@@ -438,14 +548,14 @@ class MySQLAppointmentRepository(AppointmentRepository):
         try:
             cursor = conn.cursor(dictionary=True)
             # 同一事务内查重
+            where, key_params = self._dedupe_clause(appointment)
             cursor.execute(
-                f"SELECT {self._SELECT_COLUMNS} FROM appointment "
-                "WHERE username=%s AND id_card=%s AND department=%s "
+                f"SELECT {self._select_columns()} FROM appointment "
+                f"WHERE {where} AND department=%s "
                 f"AND date=%s AND time=%s AND status NOT IN ({_TERMINAL_STATUS_SQL}) LIMIT 1 "
                 "FOR UPDATE",
-                (
-                    appointment.username,
-                    appointment.id_card,
+                key_params
+                + (
                     appointment.department,
                     appointment.date,
                     appointment.time,
@@ -458,7 +568,7 @@ class MySQLAppointmentRepository(AppointmentRepository):
                 return self._row_to_appointment(row), False
 
             now = datetime.now()
-            cursor.execute(self._INSERT_SQL, self._insert_params(appointment, now))
+            cursor.execute(self._insert_sql(), self._insert_params(appointment, now))
             conn.commit()
             appointment.id = cursor.lastrowid
             cursor.close()
@@ -482,7 +592,7 @@ class MySQLAppointmentRepository(AppointmentRepository):
         try:
             cursor = conn.cursor(dictionary=True)
             cursor.execute(
-                f"SELECT {self._SELECT_COLUMNS} FROM appointment WHERE id=%s",
+                f"SELECT {self._select_columns()} FROM appointment WHERE id=%s",
                 (appointment_id,),
             )
             row = cursor.fetchone()
@@ -531,7 +641,7 @@ class MySQLAppointmentRepository(AppointmentRepository):
         try:
             cursor = conn.cursor(dictionary=True)
             cursor.execute(
-                f"SELECT {self._SELECT_COLUMNS} FROM appointment WHERE id=%s",
+                f"SELECT {self._select_columns()} FROM appointment WHERE id=%s",
                 (appointment_id,),
             )
             row = cursor.fetchone()
@@ -599,7 +709,7 @@ class MySQLAppointmentRepository(AppointmentRepository):
         try:
             cursor = conn.cursor(dictionary=True)
             cursor.execute(
-                f"SELECT {self._SELECT_COLUMNS} FROM appointment "
+                f"SELECT {self._select_columns()} FROM appointment "
                 "WHERE status=%s ORDER BY id ASC LIMIT %s",
                 (status.value, max(1, int(limit))),
             )
@@ -617,7 +727,7 @@ class MySQLAppointmentRepository(AppointmentRepository):
         try:
             cursor = conn.cursor(dictionary=True)
             cursor.execute(
-                f"SELECT {self._SELECT_COLUMNS} FROM appointment WHERE id=%s",
+                f"SELECT {self._select_columns()} FROM appointment WHERE id=%s",
                 (appointment_id,),
             )
             row = cursor.fetchone()
@@ -649,7 +759,7 @@ class MySQLAppointmentRepository(AppointmentRepository):
         try:
             cursor = conn.cursor(dictionary=True)
             cursor.execute(
-                f"SELECT {self._SELECT_COLUMNS} FROM appointment ORDER BY id DESC LIMIT %s",
+                f"SELECT {self._select_columns()} FROM appointment ORDER BY id DESC LIMIT %s",
                 (limit,),
             )
             rows = cursor.fetchall()

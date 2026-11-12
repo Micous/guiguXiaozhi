@@ -49,6 +49,7 @@ from xiaozhi.runtime.task_tracker import TaskTracker
 from xiaozhi.security.approval_service import ApprovalService
 from xiaozhi.security.auth import TokenService
 from xiaozhi.security.permissions import PermissionDecisionEngine
+from xiaozhi.security.pii import build_pii_codec
 from xiaozhi.security.secure_executor import SecureToolExecutor
 from xiaozhi.security.session_access import SessionAccess
 from xiaozhi.service.impl.VectorStoreDoctorService import VectorStoreDoctorService
@@ -453,12 +454,21 @@ async def get_application(settings: Optional[Settings] = None) -> Application:
     )
 
     # ---- 仓储 ----
+    # Phase 8-B（P0-06）：开启后身份证号密文落库 + HMAC 指纹查重。
+    # 关闭（默认）时 pii_codec=None → SQL 与一期逐字一致。
+    pii_codec = build_pii_codec(
+        enabled=settings.pii_protection_enabled,
+        secret_key=settings.pii_secret_key,
+    )
+    if pii_codec is not None:
+        logger.info("预约敏感字段保护：已开启（密文落库 + HMAC 指纹查重）")
     repository = MySQLAppointmentRepository(
         settings.mysql_host,
         settings.mysql_port,
         settings.mysql_user,
         settings.mysql_password,
         settings.mysql_database,
+        pii_codec=pii_codec,
     )
 
     # ---- 记忆 ----

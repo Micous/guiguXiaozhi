@@ -9,6 +9,8 @@ pymongo==4.10.1
 mysql-connector-python==9.1.0
 PyYAML==6.0.2
 PyJWT==2.10.1
+# Phase 8：敏感字段加密（预约身份证号 / 画像），Fernet 实现
+cryptography==50.0.2
 # Phase 6：共享限流后端（rate_limit_backend=redis 时才真正连接）
 redis==5.2.1
 

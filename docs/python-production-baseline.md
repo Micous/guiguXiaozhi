@@ -48,7 +48,7 @@
 | P0-03 Mock 号源 | `SOURCE_CONFIRMED` | `EXTERNAL_DEPENDENCY` | `service/slot_service.py::MockSlotService`、`application.py::_build_slot_service`、`config_guard.IMPLEMENTED_REAL_SLOT_ADAPTERS` | Phase 3b |
 | P0-04 数据一致性 | `SOURCE_CONFIRMED` | — | `repositories/appointment_repo.py`（异常吞掉 / 无事务 / 无唯一约束） | Phase 3a |
 | P0-05 流式输出谎报 | `PARTIALLY_FIXED` | `RUNTIME_VERIFIED` | `runtime/interceptors.py`、`runtime/stream_filter.py`、`tests/unit/test_engine_characterization.py` | Phase 4 |
-| P0-06 敏感数据 | `SOURCE_CONFIRMED` | `NOT_TESTED` | `tools/appointment_tools.py`（回显完整身份证号）、`config.py::mysql_password`、`repositories/appointment_repo.py`（明文落库） | Phase 1/3b + 合规 |
+| P0-06 敏感数据 | `PARTIALLY_FIXED` | `RUNTIME_VERIFIED`（Phase 8，灰度开关开启时生效） | `security/masking.py`、`security/pii.py`、`tools/appointment_tools.py`（已改掩码）、`repositories/appointment_repo.py`（密文 + 指纹 + 掩码三列）、`config_guard.py` 第 12 项 | Phase 8 / 合规 |
 
 ### P0-01 身份认证与会话归属缺失
 
@@ -87,10 +87,14 @@
 
 ### P0-06 敏感数据存储、回显和访问边界不完整
 
-- `tools/appointment_tools.py`：预约详情回显完整身份证号；`repositories/appointment_repo.py`：身份证明文落库；`config.py::mysql_password` 默认值 `123456`。
+- **原状**：`tools/appointment_tools.py` 预约详情回显完整身份证号；`repositories/appointment_repo.py` 身份证明文落库；`config.py::mysql_password` 默认值 `123456`。
 - 做得好的部分：日志/trace/审计统一脱敏；P2 画像的 `id_card` 用 Fernet 密文、注入段脱敏（默认关）。
-- **本批缓解**：production 拒绝弱口令、拒绝「画像开启但缺 Fernet 密钥」的静默降级；**明文回显与明文落库未改**。
-- **剩余**：Phase 1/3b（`patient_ref` 替代明文业务键、回显只留尾号）+ PIPL/医疗数据合规评审（`NOT_TESTED`）。
+- **Phase 2 缓解**：production 拒绝弱口令、拒绝「画像开启但缺 Fernet 密钥」的静默降级。
+- **Phase 8 修复（灰度，默认关）**：回显统一走 `masking.mask_id_card`；落库存 `enc:v1:` 密文 +
+  `id_card_hash`（HMAC 指纹，唯一约束建在这里）+ `id_card_masked`；落历史前对 tool 参数/结果打码；
+  校验失败文案不再回显原值。开关 `PII_PROTECTION_ENABLED`，关闭时 SQL 与一期逐字一致；
+  production 门禁第 12 项强制开启。详见第 16 节。
+- **剩余**：业务主键改用 `patient_ref`（患者主档）才是终局；密钥版本化/KMS 未做；PIPL/医疗数据合规评审仍为外部事项（`NOT_TESTED`）。
 
 ------------------------------------------------------------------------
 
@@ -716,3 +720,88 @@ P0-06 整改时本列与 `appointment.id_card` 一并切到 `patient_ref`。
    刻意设短：上线前必须由医务处实际复核并延长，否则启动期会告警"已过失效日期"；
 5. **渗透测试 / PIPL 隐私影响评估 / 容量压测 / 值班流程 / 四方签署**均为外部事项，仓库无法自证；
 6. **`production` 仍恒定拒绝启动**（`IMPLEMENTED_REAL_SLOT_ADAPTERS` 为空）——真实 HIS 沙箱验收前不得放开。
+
+------------------------------------------------------------------------
+
+## 16. Phase 8 增量复核（2026-11-12，敏感数据收口 · HTTP 边界 · 数据留存）
+
+> 结论先行：**P0-06 从"知道有问题"变成"有开关、有迁移路径、有验收脚本"**。
+> 三处泄露面（工具回显 / 明文档存 / 落历史明文）各自堵住，且**全部默认关**——
+> 关闭时 SQL 与一期逐字一致（有单测钉死），不会因为"加固"把存量库跑挂。
+
+### 16.1 P0-06 的三个泄露面与对应处置
+
+| 泄露面 | 原来 | 现在 |
+|---|---|---|
+| 工具回显 | `_describe()` 拼 `身份证号：{完整号}` | `mask_id_card()` → `610121********2831` |
+| 校验失败文案 | `身份证号格式不正确：{原值}` | 不回显原值（校验位不对/demo 格式分别给固定文案） |
+| 明文档存 | `appointment.id_card` 明文 | `enc:v1:` 密文 + `id_card_hash`（HMAC 指纹）+ `id_card_masked` |
+| 落历史 | tool 参数与 tool 结果进 Mongo 时是明文 | 落库前统一打码（`mask_sensitive_args` / `mask_pii_in_text`） |
+| 审批表 | 已脱敏（Phase 2 的 `mask_sensitive_args`） | 收敛到 `security/masking.py` 一处实现，避免两套规则漂移 |
+
+### 16.2 关键取舍
+
+1. **唯一约束必须建在指纹列，不能建在密文列**：Fernet 带随机 IV，
+   同一明文两次加密结果不同 → 建在 `id_card` 上的唯一索引**永远不冲突**，
+   去重静默失效（比明文更危险：看上去有约束，实际没有）。
+2. **回填期间查重 SQL 必须带 `OR id_card=%s` 双分支**：迁移是分批的，
+   中途既有密文行也有明文行；只按指纹查会漏掉未回填的老患者 → 同一个人重复挂号。
+   回填完成、索引切换后这个分支自然退化成"多走一次索引"。
+3. **默认关**：`PII_PROTECTION_ENABLED=false` 时仓储走一期 SQL（单测断言
+   `_insert_sql()` 与 `_INSERT_SQL` 完全相同），存量未迁移的库照常跑；
+   production 门禁第 12 项强制开启。
+4. **密钥丢失要降级不要 500**：单条密文解不开时退回 `id_card_masked` 展示，
+   否则一次密钥更换会让整张预约列表报错。
+5. **清理作业按 `expires_at` 而非 status 判生死**：过期审批无论 `PENDING` 还是
+   `APPROVED` 都换不出可执行 token，按 status 筛会漏删大量记录。
+6. **HTTP 加固只做"默认安全且零侵入"的三项**：安全响应头（默认开）、CORS
+   （白名单非空才启用，空则不挂中间件＝保持一期宽松行为）、请求体上限
+   （256KB，流式响应不受影响）。
+
+### 16.3 交付物
+
+| 文件 | 作用 |
+|---|---|
+| `xiaozhi/security/masking.py` | `mask_id_card` / `mask_phone` / `mask_pii_in_text` / `mask_sensitive_args`，掩码唯一实现 |
+| `xiaozhi/security/pii.py` | `PiiCodec`（Fernet 加解密 + HMAC 指纹 + 掩码）、`build_pii_codec`（开启却无密钥 → 抛错不降级）、`is_ciphertext` |
+| `xiaozhi/security/validators.py` | 校验失败文案不再回显原值 |
+| `xiaozhi/tools/appointment_tools.py` | 回显改掩码 |
+| `xiaozhi/runtime/persister.py` | 落库前对 tool 参数/结果打码 |
+| `xiaozhi/repositories/appointment_repo.py` | 双路径：`_select_columns()` / `_dedupe_clause()` / `_insert_sql()` / `_insert_params()` 按 codec 有无切换；读回自动解密、坏密钥降级掩码 |
+| `xiaozhi/migrations/sql/006_appointment_pii_protection.sql` | 加 `id_card_hash` / `id_card_masked` 两列 + 指纹索引 |
+| `scripts/pii_protect_appointments.py` | `--status` / `--backfill` / `--switch-index` / `--verify`，幂等 + 多道前置拦截（退出码 0/1/2/4） |
+| `xiaozhi/server/middleware.py` | `SecurityHeadersMiddleware` + CORS 白名单 + `BodySizeLimitMiddleware`（按 `Content-Length` 判定，chunked 不拦 → 公网须在网关配 `max_client_body_size`） |
+| `scripts/purge_expired.py` | 审批按 TTL、任务按终态 + 留存期分批清理，`--dry-run`、子表先删 |
+| `xiaozhi/config.py` · `config_guard.py` | `pii_protection_enabled` / `pii_secret_key` / `security_headers_enabled` / `cors_allowed_origins` / `max_request_bytes`；门禁 **11 → 12 项** |
+| `tests/unit/test_phase8_pii.py` | 37 条：掩码/指纹/加解密/密钥轮换/仓储双路径/回显不打码即失败 |
+| `tests/unit/test_phase8_http.py` | 12 条：响应头、CORS 未配置不放开、请求体超限 413、**413 也带安全头**、装配顺序回归 |
+| `tests/unit/test_phase8_purge.py` | 5 条：留存窗口边界、终态筛选、子表级联、dry-run 不落库 |
+
+### 16.4 验收证据
+
+| 验收点 | 证据 |
+|---|---|
+| 单测 | 新增 **54 条**（37 + 12 + 5），全量 **699 passed / 6 skipped**；ruff `E9,F63,F7,F82,F811` 全过 |
+| 关闭态零变更 | `_insert_sql() == _INSERT_SQL`（15 个占位符）、`_dedupe_clause()` 返回 `username=%s AND id_card=%s`、`_select_columns()` 不含新列 |
+| 回填幂等 | 验证库 2 行明文：首次回填 2 行，二次回填 **0 行**（不再二次加密） |
+| 前置拦截 | 未回填直接 `--switch-index` → **拒绝**，退出码 4，提示先 `--backfill` |
+| 查重仍命中 | 回填后按明文探针 `find_duplicate()` 命中存量行（密文行按指纹、`OR id_card` 双分支） |
+| 二次提交判重 | 同参数 `create_if_absent` 第二次返回 `created=False` 且 id 相同 |
+| 唯一约束兜底 | 绕过 `create_if_absent` 直接 `save()` 撞 `uk_appointment_hash` → 抛异常（不再是静默重复） |
+| 库内是密文 | 直接查库 `id_card` 为 `enc:v1:…`，`id_card_masked` 为掩码；明文不在库里 |
+| 索引切换 | `uk_appointment_active`（明文）删除、`uk_appointment_hash`（指纹）建立，`--verify` 退出码 0 |
+| HTTP 边界 | 8081 真机：`/health` 含 `x-frame-options: DENY` / `x-content-type-options: nosniff` / `referrer-policy: no-referrer` / `cache-control: no-store`；300KB 请求体 → **413 且同样带全套安全头**（第一版装配顺序反了，413 光秃秃，已修并加回归测试） |
+| 清理作业 | 造数（过期审批 2 + 生效中 1、40 天前终态任务 1 + 新任务 1）：执行后过期审批与旧任务及其 4 张子表行全部清空，**生效中审批与新任务保留** |
+| 门禁 | production 门禁 **11 → 12 项**，默认配置"共 12 项不合规"一次报全 |
+
+### 16.5 残留
+
+1. **`PII_PROTECTION_ENABLED` 仍默认关**：本机 8081/5173 未开（开了就得先回填真库）；
+   真实上线前需按 runbook 第 9 节在预生产跑通回填 + 切索引再动生产；
+2. **`PII_SECRET_KEY` 无密钥轮换机制**：换密钥 = 存量密文不可解（降级成掩码展示），
+   生产必须具备密钥管理（KMS / 密钥版本化），当前只有单密钥；
+3. **`patient_ref` 才是终局方案**：P0-06 原始整改建议是"业务主键改用 `patient_ref`、
+   回显只留尾号"，本轮做的是"明文换成密文"，患者主档尚未建立；
+4. **输出侧仍无药物名词典扫描**（Phase 7 残留，未动）；
+5. **`7B` 仍会自填当天日期**（未动）；
+6. **`production` 仍恒定拒绝启动**（`IMPLEMENTED_REAL_SLOT_ADAPTERS` 为空）。

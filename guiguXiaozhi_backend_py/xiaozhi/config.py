@@ -169,6 +169,17 @@ class Settings(BaseSettings):
     # Fernet 密钥；开启画像时必填，缺失则画像模块整体禁用（敏感字段必须密文落库）
     profile_secret_key: str = ""
 
+    # ---------- 预约敏感字段保护（Phase 8-B / 审计 P0-06，灰度默认关）----------
+    # true ：身份证号以 enc:v1:<fernet> 密文落 id_card，查重/唯一约束改用
+    #        id_card_hash（HMAC），展示用 id_card_masked；
+    # false：一期行为（明文落库、按明文查重），SQL 逐字不变。
+    # 开启前必须先跑 scripts/pii_protect_appointments.py 回填存量行，
+    # 否则老记录查不到（hash 为空），用户会被判成"从未约过"。
+    pii_protection_enabled: bool = False
+    # Fernet 密钥（32 字节 urlsafe-base64）。开启时必填，缺失**拒绝启动**——
+    # "以为加密了其实还是明文"比不加密更危险。
+    pii_secret_key: str = ""
+
     # ---------- 认证（Phase 1，灰度默认关）----------
     # auth_enabled=false：完全沿用一期行为（memoryId/userId 由请求体自报，前端零改动）；
     # auth_enabled=true ：/xiaozhi/chat 必须带 Bearer token，memoryId 必须是服务端
@@ -181,6 +192,18 @@ class Settings(BaseSettings):
     auth_issuer: str = "xiaozhi-local"
     auth_audience: str = "xiaozhi-chat"  # JWT 受众，防止别处签发的 token 被本服务接受
     auth_ops_subjects: List[str] = Field(default_factory=list)  # 可访问运维端点的主体
+
+    # ---------- HTTP 边界（Phase 8-C）----------
+    # 安全响应头：nosniff / DENY / no-referrer / no-store。纯响应头，
+    # 前端零感知；关掉只会让浏览器更容易把响应往别的方向解释。
+    security_headers_enabled: bool = True
+    # CORS 白名单。**默认为空 = 不挂 CORS 中间件**（前端走 Vite 代理同源访问）。
+    # 填了才启用；"*" 与凭证互斥（装配层自动关 credentials）。
+    cors_allowed_origins: List[str] = Field(default_factory=list)
+    # 请求体上限（字节）。JSON body 是一次读进内存的，没有上限就是内存放大器。
+    # chunked 传输无 Content-Length，本项不拦 —— 公网部署必须在网关配
+    # max_client_body_size（见 docs/ops-runbook.md）。
+    max_request_bytes: int = 262_144
 
     # ---------- 可观测 ----------
     log_level: str = "INFO"

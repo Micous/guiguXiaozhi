@@ -144,7 +144,7 @@ curl http://localhost:8081/ready     # readiness（依赖 Ollama/Milvus/MySQL/Mo
 - 密钥（`MYSQL_PASSWORD`、`AUTH_SECRET_KEY`、`HIS_API_TOKEN`…）一律环境注入，
   `.dockerignore` 已排除 `.env`。
 
-## 7. 生产启动门禁速查（11 项）
+## 7. 生产启动门禁速查（12 项）
 
 `APP_ENV=production` 会在连接任何外部服务之前聚合校验并拒绝启动：
 
@@ -158,7 +158,8 @@ curl http://localhost:8081/ready     # readiness（依赖 Ollama/Milvus/MySQL/Mo
 8. 禁止 `slot_service_impl=local_his`；
 9. `audit_fail_closed=true` 且 `audit_sink` 含 `mongo`；
 10. `rag_ingest_on_startup=false` 且 `rag_require_index=true`；
-11. `rag_require_doc_meta=true`（知识条目必须有来源/审核人/失效日期）。
+11. `rag_require_doc_meta=true`（知识条目必须有来源/审核人/失效日期）；
+12. `pii_protection_enabled=true` 且 `pii_secret_key` 非空（预约身份证号必须密文落库 + 指纹查重）。
 
 **当前第 4 项恒不满足**，所以 `production` 必然启动失败 —— 这是刻意的，
 真实 HIS 沙箱验收通过前不要放开。
@@ -223,3 +224,73 @@ version: 2026-10
 3. 任何一条 expect 漂移，先看该条 `note` 判断是"规则错了"还是"预期该更新"——
    **不要为了让测试变绿改 expect**（那是把契约改掉）；
 4. 改固定话术必须同步改合规断言（药名/剂量/诊断词黑名单）。
+
+## 9. 预约敏感字段保护（Phase 8，灰度默认关）
+
+`PII_PROTECTION_ENABLED=true` + `PII_SECRET_KEY=<Fernet key>` 后，预约表的身份证号：
+
+- **落库**存密文（`enc:v1:` 前缀，Fernet 带随机 IV）+ `id_card_hash`（HMAC-SHA256 指纹，查重用）+ `id_card_masked`（展示用）；
+- **回显**只给掩码（`610121********2831`），校验失败文案也不再回显原值；
+- **落历史**前对 tool 参数与 tool 结果统一打码（`security/masking.py`）。
+
+> 生成密钥：`python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`。
+> **密钥丢失 = 存量密文不可解**（读回自动降级成掩码展示，不会 500），必须进密钥管理。
+
+### 9.1 开关打开是一次数据迁移，顺序不能颠倒
+
+```bash
+# 0) 先跑迁移 006（加 id_card_hash / id_card_masked 两列 + 索引）
+python -m xiaozhi.migrations --apply
+
+# 1) 看现状（不写库）
+python scripts/pii_protect_appointments.py --status
+
+# 2) 回填存量明文行（幂等，可中断重跑；建议先 --dry-run 看量）
+python scripts/pii_protect_appointments.py --backfill --dry-run
+python scripts/pii_protect_appointments.py --backfill
+
+# 3) 唯一约束从明文列切到指纹列（有指纹为空 / 有重复活跃预约时会拒绝）
+python scripts/pii_protect_appointments.py --switch-index --dry-run
+python scripts/pii_protect_appointments.py --switch-index
+
+# 4) 验收（不通过退出码 4）
+python scripts/pii_protect_appointments.py --verify
+```
+
+退出码：`0` 成功 / `1` 执行失败 / `2` 配置不符（含"未开启保护却来回填"）/ `4` 验收或前置条件不通过。
+
+**为什么唯一约束必须切到指纹列**：Fernet 密文带随机 IV，同一明文两次加密结果不同，
+建在 `id_card` 上的唯一索引**永远不冲突**＝去重静默失效。
+
+**为什么回填期间查重 SQL 带 `OR id_card=%s`**：回填是分批的，中途既有密文行也有明文行。
+只按指纹查会漏掉未回填的老患者 → 同一个人被重复挂号。
+
+### 9.2 回滚
+
+`PII_PROTECTION_ENABLED=false` 即可让仓储回到一期口径（明文 SQL），
+但**已回填的行仍是密文**（读回会解密，功能正常）。要真正退回明文只能从备份恢复——
+所以先在预生产库上跑通再动生产。
+
+## 10. 过期数据清理（Phase 8）
+
+审批记录与任务流水会无限增长，需要定期清理（含用户可识别信息，属数据最小化义务）。
+
+```bash
+# 演练（只统计，不删除）
+python scripts/purge_expired.py --dry-run
+
+# 实际清理：审批 7 天、任务流水 30 天
+python scripts/purge_expired.py
+
+# 自定义留存 / 单批行数
+python scripts/purge_expired.py --approval-days 3 --task-days 14 --batch-size 500
+```
+
+- **审批按 `expires_at` 判定"已死"**：过了有效期的记录无论 `PENDING` 还是 `APPROVED`
+  都换不出可执行 token，所以直接按过期时间删，不看 status（`PENDING` 过期同样不可消费）；
+- **任务只删终态**（`SUCCEEDED/FAILED/CANCELLED/UNKNOWN`）且超过留存期的，
+  先删子表（`task_events` / `tool_executions` / `agent_executions`）再删父表
+  ——顺序错了会撞外键；
+- **分批删除**（默认 200 行/批）避免长事务锁表；
+- 建议 cron 每天凌晨一次，失败退出码 `1` 交给监控告警；
+- 表不存在时跳过（未开审批/任务追踪的部署不需要这张表）。

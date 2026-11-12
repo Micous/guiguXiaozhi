@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional
 
 from xiaozhi.core.tool import Tool, ToolDefinition, ToolParameter, RiskLevel
 from xiaozhi.repositories.appointment_repo import Appointment, AppointmentRepository
+from xiaozhi.security.masking import mask_id_card
 from xiaozhi.security.validators import validate_appointment
 from xiaozhi.service.appointment_service import AppointmentService, BookingOutcome
 from xiaozhi.service.doctor_service import DoctorService
@@ -214,8 +215,14 @@ class BookAppointmentTool(Tool):
 
     @staticmethod
     def _describe(appointment: Appointment) -> str:
+        """回给模型的预约详情 —— 身份证号**必须打码**（P0-06）。
+
+        这条文本的传播路径比想象的长：工具结果 → 模型上下文 → 模型转述
+        → 用户看到的回复 → 落库的历史消息。原文照抄等于把完整身份证号
+        复制到四个地方，而用户核对信息只需要"尾号对得上"。
+        """
         return (
-            f"姓名：{appointment.username}，身份证号：{appointment.id_card}，"
+            f"姓名：{appointment.username}，身份证号：{mask_id_card(appointment.id_card)}，"
             f"科室：{appointment.department}，日期：{appointment.date}，"
             f"时段：{appointment.time}，医生：{appointment.doctor_name or '未指定'}"
         )

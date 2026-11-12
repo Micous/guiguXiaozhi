@@ -51,6 +51,9 @@ def his_ready(monkeypatch):
         "rag_require_index": True,
         # Phase 7：医疗知识条目必须可溯源（来源/审核人/失效日期）
         "rag_require_doc_meta": True,
+        # Phase 8：预约敏感字段必须密文落库 + HMAC 指纹查重（P0-06）
+        "pii_protection_enabled": True,
+        "pii_secret_key": "w07yDAOyFvLRMKFOyjh9qEGr02tdkt3VWldlrMOh-ac=",
     }
 
 
@@ -96,11 +99,11 @@ def test_production_env_aliases_detected(env):
 
 
 def test_production_reports_all_problems_at_once():
-    """默认配置下 11 项不合规（画像默认关，故不含密钥项），一次报全。"""
+    """默认配置下 12 项不合规（画像默认关，故不含密钥项），一次报全。"""
     with pytest.raises(ProductionConfigError) as exc:
         validate_production_settings(prod())
     msg = str(exc.value)
-    assert "共 11 项不合规" in msg
+    assert "共 12 项不合规" in msg
     for token in (
         "permission_no_ui",
         "mysql_password",
@@ -112,6 +115,8 @@ def test_production_reports_all_problems_at_once():
         "audit_sink",
         "rag_ingest_on_startup",
         "rag_require_index",
+        "rag_require_doc_meta",
+        "pii_protection_enabled",
     ):
         assert token in msg
     assert "APP_ENV=development" in msg  # 错误信息要给出可执行的修复方向

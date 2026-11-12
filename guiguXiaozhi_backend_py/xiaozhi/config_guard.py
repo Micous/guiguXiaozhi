@@ -172,6 +172,20 @@ def validate_production_settings(settings: Settings) -> None:
             "（医疗内容需可溯源、可追责，过期条目必须复审）"
         )
 
+    # 12) 预约敏感字段保护（Phase 8-B / 审计 P0-06）：身份证号明文落库
+    #     等于把"谁在哪天看了什么病"整表暴露给任何一次拖库。
+    #     唯一约束必须建在 HMAC 指纹上（Fernet 随机化加密无法做唯一键）。
+    if not settings.pii_protection_enabled:
+        problems.append(
+            "pii_protection_enabled=false → 生产必须开启预约敏感字段保护："
+            "身份证号需以密文落库、查重走 HMAC 指纹（P0-06 明文落库）"
+        )
+    elif not settings.pii_secret_key.strip():
+        problems.append(
+            "pii_protection_enabled=true 但 pii_secret_key 为空 → "
+            "加密与指纹都需要 Fernet 密钥，生产禁止静默降级成明文"
+        )
+
     if problems:
         raise ProductionConfigError(
             f"APP_ENV=production 启动被拒绝，共 {len(problems)} 项不合规：\n  - "

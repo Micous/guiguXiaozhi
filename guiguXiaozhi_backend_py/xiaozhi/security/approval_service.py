@@ -28,6 +28,7 @@ from xiaozhi.repositories.approval_repo import (
     ApprovalRepository,
     ApprovalStatus,
 )
+from xiaozhi.security.masking import mask_sensitive_args as _mask_sensitive_args
 from xiaozhi.security.principal import ANONYMOUS, Principal
 
 logger = logging.getLogger(__name__)
@@ -54,30 +55,14 @@ def _token_hash(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
-_SENSITIVE_KEYS = ("id_card", "idcard", "identity", "身份证", "phone", "mobile", "手机号")
-
-
 def mask_sensitive_args(args: Dict[str, Any]) -> Dict[str, Any]:
     """生成**仅用于展示/落审批表**的脱敏副本。
 
-    完整身份证号不进审批表、不回显前端（顺带收窄 P0-06 的一个泄露面；
-    预约业务表本身仍明文，属于 Phase 3b 范围）。
+    完整身份证号不进审批表、不回显前端。Phase 8 起实现收敛到
+    ``security/masking.py``（同一口径同时供工具层回显、历史落库使用）——
+    这里保留函数名不改调用方，避免为了"统一实现"去动审批这条高风险链路。
     """
-    preview: Dict[str, Any] = {}
-    for key, value in (args or {}).items():
-        lowered = str(key).lower()
-        if isinstance(value, str) and any(token in lowered for token in _SENSITIVE_KEYS):
-            if len(value) > 8:
-                preview[key] = f"{value[:6]}{'*' * (len(value) - 10)}{value[-4:]}"
-            elif value:
-                preview[key] = "*" * len(value)
-            else:
-                preview[key] = ""
-        elif isinstance(value, (str, int, float, bool)) or value is None:
-            preview[key] = value
-        else:
-            preview[key] = str(value)
-    return preview
+    return _mask_sensitive_args(args)
 
 
 class ApprovalDecision(str, Enum):

@@ -15,10 +15,12 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from typing import Any, Dict, List, Sequence
 
 from xiaozhi.core.message import Message, Role, ToolCall
 from xiaozhi.runtime.state import TurnState
+from xiaozhi.security.masking import mask_pii_in_text, mask_sensitive_args
 
 logger = logging.getLogger(__name__)
 
@@ -83,7 +85,46 @@ class ConversationPersister:
                 )
 
         self.validate_new_entries(history, new_messages)
-        return new_messages
+        return self.mask_new_entries(history, new_messages)
+
+    @staticmethod
+    def mask_new_entries(
+        history: Sequence[Message], new_messages: List[Message]
+    ) -> List[Message]:
+        """落库前对**模型产出**做 PII 打码（P0-06）。
+
+        为什么要在这里做：历史不只是给模型看的，它还是一份长期存储的个人信息。
+        模型的叙述、工具调用参数（``{"id_card": "610121..."}``）、工具结果
+        都带着身份证号 —— 不在这里收口，加密预约表也挡不住会话库里的明文。
+
+        **不改用户自己的消息**：``content`` 是用户亲口说的话，改写它就等于
+        篡改对话记录（审计与举证时"用户到底说了什么"必须可还原），而且会让
+        "取消刚才那个预约"这类多轮请求彻底失去上下文。用户原文的留存与
+        加密属于会话存储侧的策略问题，不在本函数的职责内。
+        """
+        masked: List[Message] = list(new_messages[: len(history)])
+        for message in new_messages[len(history) :]:
+            if message.role == Role.USER:
+                masked.append(message)
+                continue
+            content = mask_pii_in_text(message.content)
+            tool_calls = message.tool_calls
+            if tool_calls:
+                tool_calls = [
+                    ToolCall(
+                        id=call.id,
+                        name=call.name,
+                        arguments=mask_sensitive_args(call.arguments),
+                    )
+                    for call in tool_calls
+                ]
+            if content == message.content and tool_calls is message.tool_calls:
+                masked.append(message)
+            else:
+                masked.append(
+                    replace(message, content=content, tool_calls=tool_calls)
+                )
+        return masked
 
     @staticmethod
     def validate_new_entries(
