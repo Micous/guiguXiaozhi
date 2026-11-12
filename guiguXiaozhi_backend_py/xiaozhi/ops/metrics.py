@@ -46,6 +46,12 @@ DEFAULT_COUNTERS = (
     "medical_boundary_prompt_total",
     # 纯问候走确定性快路径的次数（首句秒回，未进入模型）
     "greeting_fast_path_total",
+    # 预约填单里给出本院不存在的科室，被确定性守卫拦下的次数
+    # （拦下即不进模型、不进工具、不弹审批窗）
+    "appointment_department_guard_total",
+    # 工具参数里被掩码的身份证在**执行前**还原为真值的次数
+    # （落库/展示仍掩码；不还原会导致「身份证号格式有误」而约不成）
+    "id_card_restored_total",
 )
 
 

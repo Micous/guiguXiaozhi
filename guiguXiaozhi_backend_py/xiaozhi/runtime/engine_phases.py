@@ -41,6 +41,10 @@ from xiaozhi.runtime.intent import GREETING_REPLY, should_inject_knowledge
 from xiaozhi.runtime.interceptors import TurnFacts, quality_gate
 from xiaozhi.runtime.response_gate import curate_final_reply, is_write_operation, stream_claim_is_legit
 from xiaozhi.runtime.state import TurnState
+from xiaozhi.runtime.appointment_guard import (
+    DepartmentGuardVerdict,
+    restore_masked_id_cards,
+)
 from xiaozhi.runtime.stream_filter import StreamFilter
 from xiaozhi.security.output_guard import (
     MedicalOutputGuard,
@@ -194,6 +198,64 @@ class EnginePhases:
             span.set_attribute("model_calls", 0)
 
         yield TextResponseEvent(trace_id=trace_id, metadata={"delta": GREETING_REPLY})
+
+        async for _ev in self._persist_and_extract(
+            memory_id=memory_id,
+            history=history,
+            user_input=user_input,
+            state=state,
+            result=result,
+            trace_id=trace_id,
+        ):
+            yield _ev
+
+        async for _ev in self._finalize(
+            result=result, state=state, turns=0, trace_id=trace_id, started=started
+        ):
+            yield _ev
+
+    async def _short_circuit_department_guard(
+        self,
+        verdict: DepartmentGuardVerdict,
+        *,
+        memory_id: str,
+        history: List[Message],
+        user_input: str,
+        result: "AgentEngineResultHolder",
+        trace_id: str,
+        started: float,
+    ) -> AsyncIterator[Event]:
+        """预约填单里的非法科室：不检索、不调模型、不调工具、不弹审批窗。
+
+        与医疗安全/问候快路径同样三条纪律：``model.calls == 0``、固定话术
+        照常落库、走 ``_finalize`` 收口。区别是这里拦的是"参数本身不成立"，
+        必须在审批门控看到这次写操作**之前**收尾 —— 否则用户会为一个
+        注定失败的预约点确认（2026-11-12 真机：内科 → 确认 → 43s 后被拒）。
+        """
+        state = self._new_turn_state(history, operation_request=False)
+        state.set_final_reply(verdict.reply)
+        result.text = verdict.reply
+
+        self.metrics.inc("appointment_department_guard_total")
+        logger.info(
+            "预约科室守卫（未进模型、未进审批）：trace=%s mentioned=%s",
+            trace_id,
+            verdict.mentioned,
+        )
+        with trace_span("appointment.department_guard", trace_id=trace_id) as span:
+            span.set_attribute("mentioned", verdict.mentioned)
+            span.set_attribute("model_calls", 0)
+
+        yield TextResponseEvent(
+            trace_id=trace_id,
+            metadata={
+                "delta": verdict.reply,
+                "department_guard": {
+                    "mentioned": verdict.mentioned,
+                    "suggestions": list(verdict.suggestions),
+                },
+            },
+        )
 
         async for _ev in self._persist_and_extract(
             memory_id=memory_id,
@@ -593,6 +655,26 @@ class EnginePhases:
         messages.append(self._assistant_to_ollama(assistant_message))
 
         for call in response.tool_calls:
+            # ---- PII 真值还原（必须在审批门控/参数校验之前）----
+            # 落库与确认窗展示用掩码是安全契约（PII P0-06），但 7B 下一轮会把
+            # 历史里看到的 `610121********2831` 直接当参数重发。这里还原成真值，
+            # 使「审批哈希 = 实际执行参数 = 真值」一致，用户看到的仍是掩码。
+            if state.known_id_card and call.arguments:
+                restored, restored_changed = restore_masked_id_cards(
+                    call.arguments, state.known_id_card
+                )
+                if restored_changed:
+                    # 原地更新：同一 ToolCall 对象已被 append 进本轮 messages，
+                    # 后面落库也用这份参数 —— 只替换副本会让三处口径不一致。
+                    call.arguments.clear()
+                    call.arguments.update(restored)
+                    self.metrics.inc("id_card_restored_total")
+                    logger.info(
+                        "工具参数中的掩码身份证已还原为真值：tool=%s trace=%s",
+                        call.name,
+                        trace_id,
+                    )
+
             if state.tool_call_count >= self.max_tool_calls:
                 logger.warning("工具调用次数达到上限，停止本轮工具调用")
                 state.tool_results.append(

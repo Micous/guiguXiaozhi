@@ -171,6 +171,22 @@ class Tool(ABC):
     def input_schema(self) -> Dict[str, Any]:
         return self.definition().input_schema
 
+    def prevalidate_args(self, args: Dict[str, Any]) -> str:
+        """写工具进入审批门控**之前**的参数预校验（默认不校验）。
+
+        返回空串表示放行；返回非空字符串表示"参数不合法"的错误说明。
+        只做**不会因模型自我纠正而改变**的确定性校验（例如用户选了本院
+        根本不存在的科室），缺字段/格式错这类仍留给工具层回传给模型。
+
+        为什么要有这个钩子：L0 审批门控先生成 PENDING 记录并弹确认窗，
+        工具的参数校验却要等用户点确认、带 token 重发后才执行。结果是
+        用户核对了一组注定失败的参数（2026-11-12 真机：内科 → 确认 →
+        43 秒后被告知没有这个科室）。钩子让门控在弹窗前就否掉这类参数。
+
+        默认空实现 = 所有既有工具零改动、行为零变更。
+        """
+        return ""
+
     async def timed_call(self, params: Dict[str, Any]) -> ToolResult:
         """带耗时统计的执行入口"""
         start = time.perf_counter()

@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, AsyncIterator, Dict, List, Optional
+from typing import Any, AsyncIterator, Callable, Dict, Iterable, List, Optional
 
 from xiaozhi.core.event import AgentEndEvent, AgentStartEvent, Event
 from xiaozhi.core.message import Role, ToolCall, Message
@@ -27,6 +27,10 @@ from xiaozhi.memory.store import ConversationStore
 from xiaozhi.ops.metrics import MetricsCollector
 from xiaozhi.reliability.resilience import CircuitBreaker, RetryConfig
 from xiaozhi.reliability.tracing import get_trace_id, trace_span
+from xiaozhi.runtime.appointment_guard import (
+    assess_department_guard,
+    extract_latest_id_card,
+)
 from xiaozhi.runtime.engine_phases import EnginePhases
 from xiaozhi.runtime.intent import is_greeting
 from xiaozhi.runtime.persister import ConversationPersister
@@ -65,6 +69,7 @@ class AgentEngine(EnginePhases):
         profile_injector=None,
         profile_service=None,
         task_tracker=None,
+        department_provider: Optional[Callable[[], Iterable[str]]] = None,
     ) -> None:
         self.chat_model = chat_model
         self.tool_registry = tool_registry
@@ -89,6 +94,10 @@ class AgentEngine(EnginePhases):
         # 时为 None，行为与 Phase 4 完全一致）。追踪失败绝不打断对话 ——
         # 追踪是可观测性，不是业务依赖。
         self.task_tracker = task_tracker
+        # 院方权威科室名单提供者（默认 None = 守卫不启用，既有行为零变更）。
+        # 真机装配时注入 ``doctor_service.list_departments``，名单仍只有 HIS 一份。
+        # 每次请求都现取，HIS 主档刷新后无需重启。
+        self.department_provider = department_provider
 
     async def run(
         self,
@@ -162,6 +171,36 @@ class AgentEngine(EnginePhases):
                     yield _ev
                 return
 
+            # 1.7 预约科室确定性守卫：本院不存在的科室在填单阶段就收尾。
+            #     顺序必须在医疗安全、问候之后，检索/模型/工具/审批之前：
+            #     真机事故里 7B 拿到 ToolResult「本院没有【内科】」仍继续
+            #     要时段、承诺预约、弹确认窗，43 秒后才把拒绝转述出来。
+            #     provider 为空或取数失败一律放行，绝不因守卫把请求打死。
+            if self.department_provider is not None:
+                try:
+                    known = list(self.department_provider() or [])
+                except Exception as exc:  # 名单不可用 ≠ 本院没有科室
+                    logger.warning(
+                        "院方科室名单读取失败，本轮跳过科室守卫：trace=%s err=%s: %s",
+                        trace_id,
+                        type(exc).__name__,
+                        exc,
+                    )
+                    known = []
+                dept_verdict = assess_department_guard(user_input, known)
+                if dept_verdict is not None:
+                    async for _ev in self._short_circuit_department_guard(
+                        dept_verdict,
+                        memory_id=memory_id,
+                        history=history,
+                        user_input=user_input,
+                        result=result,
+                        trace_id=trace_id,
+                        started=started,
+                    ):
+                        yield _ev
+                    return
+
             # 2. 检索知识 + 组装上下文
             prep: Dict[str, Any] = {}
             async for _ev in self._prepare_messages(
@@ -176,6 +215,9 @@ class AgentEngine(EnginePhases):
             state = self._new_turn_state(history, prep["operation_request"])
             # Phase 4：写操作模式（Response Gate 的完成态确定性门控）
             state.write_operation = bool(prep.get("write_operation"))
+            # PII 真值：落库/展示用掩码，但写工具执行必须用真值
+            # （7B 会把历史里看到的掩码身份证直接当参数重发，见 appointment_guard）
+            state.known_id_card = extract_latest_id_card(history, user_input)
 
             # 3.5 Phase 5：任务生命周期持久化（灰度关闭时 tracker 为 None，
             #     行为与 Phase 4 完全一致）。追踪失败不打断对话。

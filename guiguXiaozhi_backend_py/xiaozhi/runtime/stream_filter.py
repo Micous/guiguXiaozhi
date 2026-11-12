@@ -20,12 +20,38 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Optional, Tuple
 
 from xiaozhi.models.quality import claim_span, textual_tool_call_span
 from xiaozhi.ops.metrics import MetricsCollector
 
 logger = logging.getLogger(__name__)
+
+# 截断承诺时"承诺之前的前缀"会补发给用户。7B 高频先吐一串应承词
+# （真机 2026-11-12：「好的，好的，好的，我将为您预约内科的号」），
+# 承诺被丢掉后只剩「好的，好的，好的，」单独占一个气泡，看起来像刷屏。
+# 纯应承/标点前缀不该下发；只要还剩一个实义词就原样保留，避免误删正文。
+_FILLER_STRIP_RE = re.compile(
+    r"[\s，,。.！!？?、；;：:…~\-—]+"
+    r"|(?:好的|好嘞|好呀|好|嗯|哦|噢|哎|行|马上|请稍等|稍等|正在|我这就|这就|没问题|收到|明白|了解|请|您)"
+)
+
+
+def is_pure_filler(text: str) -> bool:
+    """前缀是不是"停在半句的纯应承碎片"（该丢），而不是一句完整的话。
+
+    **带句末标点的完整句一律保留**：既有特征测试钉死了
+    「好的。+ 纯文本工具调用 JSON」被截断时前缀「好的。」必须下发。
+    真机刷屏的「好的，好的，好的，」停在逗号、没有句末标点，才是要丢的。
+    """
+    value = text or ""
+    if not value.strip():
+        return True
+    if any(ch in value for ch in "。！？!?\n"):
+        return False
+    return not _FILLER_STRIP_RE.sub("", value).strip()
+
 
 # 流式下发的**回看窗口**（字）。
 #
@@ -145,6 +171,8 @@ class StreamFilter:
             logger.warning(
                 "模型把工具调用写成了纯文本，就地截断：trace=%s", self.trace_id
             )
+            if is_pure_filler(safe):
+                safe = ""
             return safe
 
         match = None if self.claim_is_legit else claim_span(self.turn_buffer)
@@ -165,6 +193,8 @@ class StreamFilter:
                 self.trace_id,
                 kind,
             )
+            if is_pure_filler(safe):
+                safe = ""
             return safe
 
         # 回看窗口：末尾 LOOKBEHIND 个字先留着不下发，

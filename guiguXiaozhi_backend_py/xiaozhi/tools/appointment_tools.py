@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional
 from xiaozhi.core.tool import Tool, ToolDefinition, ToolParameter, RiskLevel
 from xiaozhi.repositories.appointment_repo import Appointment, AppointmentRepository
 from xiaozhi.security.masking import mask_id_card
-from xiaozhi.security.validators import validate_appointment
+from xiaozhi.security.validators import validate_appointment, validate_department
 from xiaozhi.service.appointment_service import AppointmentService, BookingOutcome
 from xiaozhi.service.doctor_service import DoctorService
 from xiaozhi.service.slot_service import SlotService
@@ -45,6 +45,33 @@ def build_department_hint(doctor_service: DoctorService) -> str:
         + "。请从中选择最接近的一个；用户说的若不是其中之一（如“内科”），"
         "应先向用户说明本院没有该科室并推荐最接近的科室，让用户确认后再预约。"
     )
+
+
+def _prevalidate_department(
+    args: Dict[str, Any], doctor_service: Optional[DoctorService]
+) -> str:
+    """审批弹窗前的确定性科室校验：只拦"本院不存在"这一种。
+
+    与 QuerySlotTool / BookAppointmentTool.call 用同一套 ``validate_department``
+    和同一份 HIS 名单，避免"守卫说没有、工具说有"的判定漂移。
+    名单取不到或为空一律放行（HIS 不可用 ≠ 本院没有科室）。
+    """
+    department = str(args.get("department") or "").strip()
+    if not department or doctor_service is None:
+        return ""
+    try:
+        known = sorted(doctor_service.list_departments() or [])
+    except Exception as exc:
+        logger.warning(
+            "科室名单读取失败，跳过审批前科室预校验：%s: %s",
+            type(exc).__name__,
+            exc,
+        )
+        return ""
+    if not known:
+        return ""
+    result = validate_department(department, known)
+    return "" if result.ok else result.message()
 
 
 class BookAppointmentTool(Tool):
@@ -108,6 +135,10 @@ class BookAppointmentTool(Tool):
     def _build_department_hint(self) -> str:
         """列出本院科室，供模型选择"""
         return build_department_hint(self.doctor_service)
+
+    def prevalidate_args(self, args: Dict[str, Any]) -> str:
+        """审批弹窗前：本院不存在的科室不生成 PENDING、不弹确认窗。"""
+        return _prevalidate_department(args, self.doctor_service)
 
     async def call(self, params: Dict[str, Any]) -> Any:
         from xiaozhi.core.tool import ToolResult
@@ -262,6 +293,7 @@ class CancelAppointmentTool(Tool):
         self,
         repository: AppointmentRepository,
         slot_service: Optional[SlotService] = None,
+        doctor_service: Optional[DoctorService] = None,
     ) -> None:
         self.repository = repository
         # Phase 3a：取消 = 状态迁移，业务规则在服务层。
@@ -272,6 +304,12 @@ class CancelAppointmentTool(Tool):
         # （真机实测：号源 current_num 没回落，HIS 侧单子仍是 REGISTERED）。
         # slot_service 保持可选（默认 None = 只改本地，历史行为）。
         self._service = AppointmentService(repository, slot_service)
+        # 审批前科室预校验用（可选：不传则跳过，历史构造方式零改动）
+        self.doctor_service = doctor_service
+
+    def prevalidate_args(self, args: Dict[str, Any]) -> str:
+        """退号同样不该为不存在的科室弹确认窗。"""
+        return _prevalidate_department(args, self.doctor_service)
 
     async def call(self, params: Dict[str, Any]) -> Any:
         from xiaozhi.core.tool import ToolResult

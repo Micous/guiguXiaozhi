@@ -120,6 +120,27 @@ class SecureToolExecutor:
             canonical_args = normalize_arguments_by_schema(
                 dict(tool_call.args or {}), definition
             )
+            # 审批弹窗**之前**的确定性参数预校验。
+            # 真机 2026-11-12：L0 先生成 PENDING 并弹确认窗，参数校验却要等
+            # 用户点确认、带 token 重发、进入 tool.call() 才跑 —— 用户核对了
+            # 一组本院根本不存在的科室，白等 43 秒后仍被拒。这里只拦模型
+            # 改不了的事实（不存在的科室），缺字段/格式错仍留给工具层。
+            # 必须在 _approval_gate 之前：一旦 create() 落库，确认窗已经弹出。
+            prevalidate = getattr(tool, "prevalidate_args", None)
+            prevalidation_error = (
+                prevalidate(canonical_args) if prevalidate is not None else ""
+            )
+            if prevalidation_error:
+                logger.warning(
+                    "审批门控前参数预校验未通过，不生成 PENDING：tool=%s trace=%s reason=%s",
+                    tool_call.tool_name,
+                    tool_call.trace_id,
+                    prevalidation_error,
+                )
+                return ToolResult.fail(
+                    f"参数校验未通过：{prevalidation_error}。请根据提示修正参数后重新调用。",
+                    error_type="ValidationError",
+                )
             gate, effective_args = self._approval_gate(tool_call, canonical_args)
             if gate is not None:
                 return gate

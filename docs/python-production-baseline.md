@@ -983,3 +983,34 @@ Phase 7 的做法是收紧提示词，收住了；但那终归是概率约束：
   否则 5 条可靠性用例测不到模型；`test_phase5_storage_and_task` 同步改。
 - **观察项**：重启前那次请求的 `memory.write` 有一条 `并发写冲突（重试 3 次
   耗尽）` WARNING（该轮回复未落库），重启后未复现，暂不混入本次改动。
+
+### 18.7 掩码身份证的执行前还原（默认开）
+
+**问题**：落库按 PII 契约把 assistant 的 `content` 与 `tool_calls.arguments`
+打码成 `610121********2831`；`_to_ollama_message` 又把参数原样发给模型，
+7B 下一轮照抄掩码 → `validate_appointment` 报「身份证号格式有误」，预约永远
+约不成（真机：用户首轮给完整号，第 4 轮改时段后失败）。
+
+**修法**：三条口径分离——存储/展示用掩码（契约不变），**执行用真值**。
+
+- `runtime/appointment_guard.py`
+  - `extract_latest_id_card(history, user_input)`：当前输入 → 历史 user 消息倒序
+    取最近一次完整 18/15 位号；**跳过 assistant/tool**（那里按契约是掩码）。
+  - `restore_masked_id_cards(args, truth)`：只替换含 `*` 的身份证字段，真值不动，
+    不原地改入参。
+- `engine_phases._execute_tools`：在 for 循环开头（**审批门控之前**）还原并
+  原地写回 `call.arguments`，使「审批哈希 = 执行参数 = 真值」一致。
+- `TurnState.known_id_card`：请求级真值，`engine.run()` 组装 state 时填充。
+- 指标 `id_card_restored_total`。
+
+**边界**：找不到真值不伪造（让校验如实失败）；只认完整号码；非身份证键不动。
+
+**验收（真机 8081）**：日志 `工具参数中的掩码身份证已还原为真值`；
+`id_card_restored_total=1`；用户侧不再出现「格式有误」，回显仍为掩码。
+17 条护栏单测 `tests/unit/test_id_card_restore.py`，全量
+**840 passed / 6 skipped**。
+
+**已知遗留**：带审批 token 重发时 7B 反复「只说不做」，强制重试也失败 →
+token 白拿、预约未执行。与掩码无关；确定性解法是服务端按审批记录直接执行，
+未混入本次改动。
+

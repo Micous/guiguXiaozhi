@@ -580,7 +580,7 @@ async def get_application(settings: Optional[Settings] = None) -> Application:
             QuerySlotTool(slot_service, doctor_service),
             QueryDoctorsTool(doctor_service),
             # 取消也要号源服务（真实 HIS 退号必须通知医院）
-            CancelAppointmentTool(repository, slot_service),
+            CancelAppointmentTool(repository, slot_service, doctor_service),
         ]
     )
 
@@ -751,6 +751,9 @@ async def get_application(settings: Optional[Settings] = None) -> Application:
         profile_injector=profile_injector,
         profile_service=profile_service,
         task_tracker=task_tracker,
+        # 院方权威科室名单仍只有 HIS 一份；注入 provider 而非启动时快照，
+        # HIS 主档刷新后守卫无需重启即可生效。
+        department_provider=lambda: doctor_service.list_departments(),
     )
 
     return Application(

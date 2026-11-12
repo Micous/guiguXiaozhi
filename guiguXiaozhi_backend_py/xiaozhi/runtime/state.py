@@ -74,6 +74,11 @@ class TurnState:
     prior_booking: bool = False
     # 本请求是否为操作类（决定叙述门控是否启用）
     operation_request: bool = False
+    # 用户最近一次提供的**完整身份证号**（执行真值）。
+    # PII 契约要求落库/展示用掩码，但 7B 会把历史里的掩码当参数重发，
+    # 导致「身份证号格式有误」。写工具执行前用它还原参数，见
+    # appointment_guard.restore_masked_id_cards。
+    known_id_card: str = ""
     # ---- Phase 4 写操作 Response Gate ----
     # 本请求是否为写操作（预约/取消/退号/含身份证号）：完成态承诺只认
     # 本请求真实执行的写操作（prior_booking 不再背书，见 response_gate.py）

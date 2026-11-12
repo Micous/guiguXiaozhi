@@ -107,6 +107,8 @@ def make_engine(model, **kwargs):
         retry_config=kwargs.pop("retry_config", None) or RetryConfig(max_attempts=1),
         circuit_breaker=kwargs.pop("breaker", None),
         tool_failure_threshold=kwargs.pop("tool_failure_threshold", 3),
+        # 预约科室守卫默认关闭；新护栏单测需要显式注入名单提供者
+        department_provider=kwargs.pop("department_provider", None),
     )
     return engine, metrics
 
