@@ -28,6 +28,7 @@ from typing import Any, Dict, List, Optional
 
 from xiaozhi.core.message import Message
 from xiaozhi.core.tool import ToolResult
+from xiaozhi.runtime.write_tools import WRITE_TOOL_NAMES
 
 # 触发"查询成功是真话"标记的工具（与 booking/cancel 分开跟踪，见 I5）
 _QUERY_TOOLS = ("查询是否有号源", "查询科室专家")
@@ -137,16 +138,15 @@ class TurnState:
 
     # ---- Phase 4 写操作结构化结果账本 ----
 
-    _WRITE_TOOLS = ("预约挂号", "取消预约挂号")
-
     def record_write_result(self, tool_name: str, result: ToolResult) -> None:
         """登记写工具的结构化执行结果（Response Gate 收尾判定用）。
 
-        只记写工具（查询结果不影响完成态判定）；
+        只记写工具（查询结果不影响完成态判定）；写工具清单的单一来源是
+        ``runtime/write_tools.py`` 的 ``WRITE_TOOL_NAMES``（B3-2 收敛）。
         ``authoritative_status`` 来自工具 metadata（UNKNOWN 对账语义，
         Phase 3b 真实 HIS 接入后由 his_client 填写）。
         """
-        if tool_name not in self._WRITE_TOOLS:
+        if tool_name not in WRITE_TOOL_NAMES:
             return
         meta = result.metadata or {}
         self.write_results.append(

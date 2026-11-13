@@ -52,6 +52,10 @@ DEFAULT_COUNTERS = (
     # 工具参数里被掩码的身份证在**执行前**还原为真值的次数
     # （落库/展示仍掩码；不还原会导致「身份证号格式有误」而约不成）
     "id_card_restored_total",
+    # B3-2：工具执行前 STARTED 落库失败的次数（只读放行但必须留痕）
+    "task_started_failed_total",
+    # B3-2：其中**写工具**被拒绝进入执行阶段的次数（规则 8 强保证生效次数）
+    "task_started_failed_write_total",
 )
 
 

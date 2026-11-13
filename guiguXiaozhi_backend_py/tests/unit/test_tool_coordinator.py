@@ -27,6 +27,7 @@ from xiaozhi.models.ollama import ChatTurn  # noqa: E402
 from xiaozhi.ops.metrics import MetricsCollector  # noqa: E402
 from xiaozhi.runtime.engine import AgentEngine, AgentEngineResultHolder  # noqa: E402
 from xiaozhi.runtime.state import TurnState  # noqa: E402
+from xiaozhi.runtime.task_tracker import ToolStartResult, ToolStartStatus  # noqa: E402
 from xiaozhi.runtime.tool_coordinator import ToolCoordinator  # noqa: E402
 
 
@@ -89,17 +90,20 @@ class RecordingExecutor:
 
 
 class RecordingTracker:
-    """Phase 5：STARTED 必须在执行前、FINISHED 必须在执行后，且 exec_id 一致。"""
+    """Phase 5：STARTED 必须在执行前、FINISHED 必须在执行后，且 exec_id 一致。
+
+    B3-2 之后执行链路调用三态入口 ``try_tool_started``。
+    """
 
     def __init__(self):
         self.records = []
         self._seq = 0
 
-    def tool_started(self, tool_call_id, tool_name, args):
+    def try_tool_started(self, tool_call_id, tool_name, args):
         self._seq += 1
         exec_id = f"exec-{self._seq}"
         self.records.append(("started", exec_id, tool_name, True))
-        return exec_id
+        return ToolStartResult(ToolStartStatus.RECORDED, exec_id)
 
     def tool_finished(self, exec_id, tool_name, *, success):
         self.records.append(("finished", exec_id, tool_name, success))

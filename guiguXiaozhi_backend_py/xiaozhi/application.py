@@ -291,6 +291,27 @@ def _build_slot_service(
     )
 
 
+def validate_task_tracking_settings(settings: Settings) -> None:
+    """B3-2（D1 决策）：写操作 STARTED 强保证的启动期一致性校验与告警。
+
+    * ``require_started_for_writes=true`` 但 ``task_tracking_enabled=false``
+      → 强保证物理上无法生效，**启动即失败**，不留到每个请求运行期才发现；
+    * 灰度关闭（默认）→ 允许启动，但必须 WARNING：写操作当前无 STARTED
+      保障、崩溃恢复无法对账，避免运维误以为规则 8 全局成立。
+    """
+    if settings.require_started_for_writes and not settings.task_tracking_enabled:
+        raise RuntimeError(
+            "require_started_for_writes=true 但 task_tracking_enabled=false："
+            "写操作 STARTED 强保证无法生效，拒绝启动"
+            "（请开启任务追踪，或关闭该策略）"
+        )
+    if not settings.task_tracking_enabled:
+        logger.warning(
+            "写操作当前无 STARTED 保障，崩溃恢复无法对账"
+            "（task_tracking_enabled=false；规则 8 仅在开启任务追踪后生效）"
+        )
+
+
 async def get_application(settings: Optional[Settings] = None) -> Application:
     """装配整个应用"""
     settings = settings or get_settings()
@@ -372,6 +393,7 @@ async def get_application(settings: Optional[Settings] = None) -> Application:
             )
         task_tracker = TaskTracker(task_repo, model_id=settings.ollama_chat_model)
         logger.info("任务生命周期持久化已启用（task_tracking_enabled=true）")
+    validate_task_tracking_settings(settings)
 
     # ---- 运维组件 ----
     # 审计：fail-closed + 可选集中存储（Phase 6）。

@@ -147,6 +147,12 @@ class Settings(BaseSettings):
     # 恢复扫描：运行超过该秒数且无更新的 execution 视为进程已死
     task_stale_after_seconds: float = 600.0
 
+    # B3-2（D1 决策）：写操作 STARTED 强保证的策略开关。
+    # false（默认）= 灰度关闭（task_tracker=None）时写操作照常放行；
+    # true = 必须装配 task_tracker，否则**启动即失败**（组合根校验），
+    # 而不是把「写操作全部不可用」留给每个请求在运行期才发现。
+    require_started_for_writes: bool = False
+
     # ---------- B3-1：有界阻塞 IO 执行器 ----------
     # 同步 Mongo / MySQL / HIS / 探针调用统一经它调度；max_inflight 是
     # 「执行中 + 排队中」的上限，超限时在 async 层排队等待，不静默丢弃。

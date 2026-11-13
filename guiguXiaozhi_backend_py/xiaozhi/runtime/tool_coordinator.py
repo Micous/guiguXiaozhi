@@ -38,6 +38,8 @@ from xiaozhi.ops.bounded_io import run_sync_io
 from xiaozhi.reliability.tracing import trace_span
 from xiaozhi.runtime.appointment_guard import restore_masked_id_cards
 from xiaozhi.runtime.state import TurnState
+from xiaozhi.runtime.task_tracker import ToolStartStatus
+from xiaozhi.runtime.write_tools import WRITE_TOOL_NAMES
 from xiaozhi.security.secure_executor import ToolCall as SecureToolCall
 
 logger = logging.getLogger(__name__)
@@ -121,19 +123,48 @@ class ToolCoordinator:
                 tool_span.set_attribute("tool_name", call.name)
                 tool = tool_registry.get(call.name)
 
-                # ---- Phase 5：工具执行**前**落 STARTED ----
-                # 崩溃恢复时据此判断"这个工具可能有副作用"，标记为 UNKNOWN
-                # 后必须先查业务事实，不可盲目重试（否则重复挂号）。
-                tool_exec_id = None
+                # ---- B3-2：STARTED 三态 + 写操作强保证（方案 §4 规则 8）----
+                # DISABLED（灰度关闭）→ 写/只读都照常放行，事件序列不变（D1=A）；
+                # FAILED + 写工具 → 拒绝进入 Adapter，不产生副作用（核心行为变更）；
+                # FAILED + 只读 → 放行但必须留痕（D2）。
+                start = None
                 if task_tracker is not None:
-                    tool_exec_id = await run_sync_io(
-                        task_tracker.tool_started,
+                    start = await run_sync_io(
+                        task_tracker.try_tool_started,
                         call.id,
                         call.name,
                         call.arguments,
                     )
+                tool_exec_id = start.tool_execution_id if start else None
+                start_failed = bool(start and start.status is ToolStartStatus.FAILED)
+                if start_failed:
+                    metrics.inc("task_started_failed_total")
 
-                if tool is None:
+                if start_failed and call.name in WRITE_TOOL_NAMES:
+                    metrics.inc("task_started_failed_write_total")
+                    tool_span.set_error("task_start_failed")
+                    logger.warning(
+                        "写工具 STARTED 落库失败，已拒绝执行：trace=%s tool=%s call=%s",
+                        trace_id,
+                        call.name,
+                        call.id,
+                    )
+                    tool_result = ToolResult.fail(
+                        f"任务追踪暂不可用，已阻止写操作【{call.name}】执行，请稍后重试。",
+                        error_type="TaskStartUnavailable",
+                    )
+                elif start_failed:
+                    logger.warning(
+                        "只读工具 STARTED 落库失败，按 D2 决策放行："
+                        "trace=%s tool=%s call=%s effect=read",
+                        trace_id,
+                        call.name,
+                        call.id,
+                    )
+
+                if start_failed and call.name in WRITE_TOOL_NAMES:
+                    pass  # 拒绝结果已在上面构造，直接跳到入账段
+                elif tool is None:
                     tool_span.set_error("工具未注册")
                     tool_result = ToolResult.fail(
                         f"工具【{call.name}】不存在。", error_type="ToolNotFound"
@@ -166,7 +197,10 @@ class ToolCoordinator:
                 state.record_write_result(call.name, tool_result)
 
                 # ---- Phase 5：工具执行后落终态（写工具成功 → 副作用已提交）----
-                if task_tracker is not None:
+                # 被拒绝的写操作没有任何 STARTED 记录可收尾，直接跳过。
+                if task_tracker is not None and not (
+                    start_failed and call.name in WRITE_TOOL_NAMES
+                ):
                     await run_sync_io(
                         task_tracker.tool_finished,
                         tool_exec_id,

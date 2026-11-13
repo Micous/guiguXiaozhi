@@ -21,7 +21,9 @@
 
 from __future__ import annotations
 
+import enum
 import logging
+from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
 from xiaozhi.repositories.task_repo import (
@@ -33,11 +35,29 @@ from xiaozhi.repositories.task_repo import (
     new_id,
     now_str,
 )
+from xiaozhi.runtime.write_tools import WRITE_TOOL_NAMES
 
 logger = logging.getLogger(__name__)
 
-# 会产生外部副作用的工具（成功才算 side_effect_committed）
-_WRITE_TOOLS = ("预约挂号", "取消预约挂号")
+
+class ToolStartStatus(str, enum.Enum):
+    """``try_tool_started`` 的三态结果（B3-2，D1/D2 决策落点）。
+
+    旧版 ``tool_started`` 把「未启用」和「落库失败」都吞成 ``None``，
+    调用方无法区分「规则 8 不适用」和「关键记录不可写、必须拒绝写操作」。
+    """
+
+    RECORDED = "RECORDED"  # STARTED 已持久化，可以进入外部副作用阶段
+    DISABLED = "DISABLED"  # 追踪未启用（task_tracker=None 或本轮未登记）
+    FAILED = "FAILED"  # STARTED 落库失败：写操作必须被拒绝（方案 §4 规则 8）
+
+
+@dataclass(frozen=True)
+class ToolStartResult:
+    """一次「工具执行前落 STARTED」的三态结果。"""
+
+    status: ToolStartStatus
+    tool_execution_id: Optional[str] = None
 
 
 class TaskTracker:
@@ -103,12 +123,21 @@ class TaskTracker:
 
     # ---- 工具执行 ----
 
-    def tool_started(
+    def try_tool_started(
         self, tool_call_id: str, tool_name: str, args: Dict[str, Any]
-    ) -> Optional[str]:
-        """工具执行**前**落 STARTED；返回 tool_execution_id（失败时 None）。"""
+    ) -> ToolStartResult:
+        """工具执行**前**落 STARTED 的三态入口（B3-2 主 API）。
+
+        * ``RECORDED``：已持久化，返回 ``tool_execution_id``；
+        * ``DISABLED``：追踪未启用（未装配或本轮未登记）——D1 决策 A：
+          灰度关闭时写操作照常放行，事件序列与关闭前完全一致；
+        * ``FAILED``：落库失败 —— 写操作必须被调用方拒绝（规则 8），
+          只读操作放行但必须记指标与告警（D2 决策）。
+
+        本方法**永不抛异常**（追踪失败不打断对话），失败语义由状态表达。
+        """
         if not self.task_id or not self.execution_id:
-            return None
+            return ToolStartResult(ToolStartStatus.DISABLED)
         try:
             record = ToolExecution(
                 tool_execution_id=new_id(),
@@ -121,12 +150,29 @@ class TaskTracker:
                 started_at=now_str(),
             )
             self._repo.record_tool_started(record)
-            return record.tool_execution_id
+            return ToolStartResult(
+                ToolStartStatus.RECORDED, record.tool_execution_id
+            )
         except Exception as exc:
             logger.warning(
-                "工具执行前落库失败（忽略）tool=%s: %s: %s", tool_name, type(exc).__name__, exc
+                "工具执行前落库失败 tool=%s call=%s: %s: %s",
+                tool_name,
+                tool_call_id,
+                type(exc).__name__,
+                exc,
             )
-            return None
+            return ToolStartResult(ToolStartStatus.FAILED)
+
+    def tool_started(
+        self, tool_call_id: str, tool_name: str, args: Dict[str, Any]
+    ) -> Optional[str]:
+        """旧版兼容入口：仅返回 ``tool_execution_id``（RECORDED）或 ``None``。
+
+        DISABLED 与 FAILED 都映射为 ``None`` —— 需要区分两者时必须改用
+        :meth:`try_tool_started`（B3-2 之后所有执行链路均已迁移）。
+        """
+        result = self.try_tool_started(tool_call_id, tool_name, args)
+        return result.tool_execution_id
 
     def tool_finished(
         self,
@@ -139,7 +185,7 @@ class TaskTracker:
         if not tool_execution_id:
             return
         try:
-            committed = bool(success and tool_name in _WRITE_TOOLS)
+            committed = bool(success and tool_name in WRITE_TOOL_NAMES)
             status = "SUCCEEDED" if success else "FAILED"
             self._repo.record_tool_finished(
                 tool_execution_id, status, side_effect_committed=committed

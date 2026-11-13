@@ -38,6 +38,8 @@ from xiaozhi.runtime.approval_execution import approved_operation_reply
 from xiaozhi.runtime.engine_helpers import _last_assistant_text
 from xiaozhi.reliability.tracing import trace_span
 from xiaozhi.runtime.intent import GREETING_REPLY, should_inject_knowledge
+from xiaozhi.runtime.task_tracker import ToolStartStatus
+from xiaozhi.runtime.write_tools import WRITE_TOOL_NAMES
 from xiaozhi.runtime.response_gate import curate_final_reply, is_write_operation
 from xiaozhi.runtime.state import TurnState
 from xiaozhi.runtime.appointment_guard import DepartmentGuardVerdict
@@ -687,11 +689,16 @@ class EnginePhases:
             return
 
         call_id = f"auto-{record.approval_id}"
-        tool_exec_id = None
+        # ---- B3-2：审批兜底路径同样受写操作 STARTED 强保证约束 ----
+        start = None
         if self.task_tracker is not None:
-            tool_exec_id = await run_sync_io(
-                self.task_tracker.tool_started, call_id, tool_name, args
+            start = await run_sync_io(
+                self.task_tracker.try_tool_started, call_id, tool_name, args
             )
+        tool_exec_id = start.tool_execution_id if start else None
+        start_failed = bool(start and start.status is ToolStartStatus.FAILED)
+        if start_failed:
+            self.metrics.inc("task_started_failed_total")
 
         yield ToolExecuteEvent(
             trace_id=trace_id,
@@ -706,21 +713,36 @@ class EnginePhases:
             tool_span.set_attribute("tool_name", tool_name)
             tool_span.set_attribute("approval_auto_execution", True)
             tool_span.set_attribute("approval_id", record.approval_id)
-            try:
-                tool_result = await self.secure_executor.execute(
-                    SecureToolCall(
-                        tool_name=tool_name,
-                        args=args,
-                        user_id=user_id,
-                        trace_id=trace_id,
-                    ),
-                    tool,
+            if start_failed and tool_name in WRITE_TOOL_NAMES:
+                # 规则 8：关键记录不可写 → 即使已有用户审批也拒绝进入副作用阶段
+                self.metrics.inc("task_started_failed_write_total")
+                tool_span.set_error("task_start_failed")
+                logger.warning(
+                    "审批兜底执行被拒（STARTED 落库失败）：trace=%s tool=%s approval=%s",
+                    trace_id,
+                    tool_name,
+                    record.approval_id,
                 )
-            except Exception as exc:  # 兜底：工具异常不外泄
-                logger.exception("审批兜底执行异常：trace=%s", trace_id)
                 tool_result = ToolResult.fail(
-                    f"工具执行异常：{type(exc).__name__}", error_type="ToolExecutionError"
+                    f"任务追踪暂不可用，已阻止写操作【{tool_name}】执行，请稍后重试。",
+                    error_type="TaskStartUnavailable",
                 )
+            else:
+                try:
+                    tool_result = await self.secure_executor.execute(
+                        SecureToolCall(
+                            tool_name=tool_name,
+                            args=args,
+                            user_id=user_id,
+                            trace_id=trace_id,
+                        ),
+                        tool,
+                    )
+                except Exception as exc:  # 兜底：工具异常不外泄
+                    logger.exception("审批兜底执行异常：trace=%s", trace_id)
+                    tool_result = ToolResult.fail(
+                        f"工具执行异常：{type(exc).__name__}", error_type="ToolExecutionError"
+                    )
             tool_span.set_attribute("success", tool_result.success)
             tool_span.set_attribute("result_preview", tool_result.content[:160])
 
