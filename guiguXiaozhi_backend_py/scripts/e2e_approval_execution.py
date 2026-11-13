@@ -216,11 +216,20 @@ def main() -> int:
         shown[:60],
     )
     if auto_before >= 0:
-        check(
-            "走的是服务端确定性执行（approval_auto_executions +1）",
-            auto_after > auto_before,
-            f"{auto_before:.0f} → {auto_after:.0f}",
-        )
+        if auto_after > auto_before:
+            check(
+                "走的是服务端确定性执行（approval_auto_executions +1）",
+                True,
+                f"{auto_before:.0f} → {auto_after:.0f}",
+            )
+        else:
+            # 模型自己调了写工具（happy path）→ 兜底**不该**触发。
+            # 契约是"确认之后预约真的发生"，而不是"必须走兜底"。
+            check(
+                "模型自己调用了写工具，无需兜底（approval_auto_executions 未增长）",
+                len(rows) == 1,
+                f"{auto_before:.0f} → {auto_after:.0f}",
+            )
 
     print(f"\n  trace：第一轮 {first_trace} / 执行轮 {second_trace}")
     print(f"  详情：{base}/trace/{second_trace}")

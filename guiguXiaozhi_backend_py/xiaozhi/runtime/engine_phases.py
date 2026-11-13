@@ -657,6 +657,17 @@ class EnginePhases:
         """
         if not self._has_pending_approval_token():
             return
+        # 本请求**已经真的执行过写操作**（模型自己调了工具、token 已被原子消费）
+        # → 不必再探一次：探也是 `invalid_or_replayed`，日志里还会打出
+        # 「审批兜底跳过（token 不可用）」，让人误以为走的是兜底。
+        # 2026-11-13 真机：执行轮 turn0 模型正常调工具成功，turn1 转述收尾时
+        # 兜底又探了一次 → WARNING 与 trace 上的 `tool.execute success=true` 互相矛盾。
+        if state.write_results:
+            logger.debug(
+                "本请求已执行过写操作（token 已消费），跳过审批兜底：trace=%s",
+                trace_id,
+            )
+            return
         service = getattr(self.secure_executor, "approval_service", None)
         if service is None:
             return

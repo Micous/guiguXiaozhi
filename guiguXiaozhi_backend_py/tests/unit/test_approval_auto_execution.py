@@ -29,6 +29,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from xiaozhi.core.event import EventType  # noqa: E402
+from xiaozhi.core.message import ToolCall  # noqa: E402
 from xiaozhi.core.tool import (  # noqa: E402
     RiskLevel,
     Tool,
@@ -252,6 +253,51 @@ async def test_replayed_token_is_not_executed():
 
     assert tool.call_count == 0
     assert text
+
+
+async def test_no_fallback_after_model_already_wrote():
+    """模型自己调了写工具 → 兜底**不再探**（2026-11-13 真机）。
+
+    执行轮正常时序是「turn0 模型调工具 → turn1 转述结果」。turn1 天然零工具
+    调用，旧逻辑会拿同一个 token 再探一次：
+
+      * token 已被 turn0 原子消费 → 探出 `invalid_or_replayed`，日志打出
+        「审批兜底跳过（token 不可用）」，与 trace 上的
+        `tool.execute success=true` 自相矛盾；
+      * 若工具因权限策略没走审批门控（token 未被消费），这次探测会**真的
+        再执行一遍**——同一个确认被用两次，重复挂号。
+
+    判据用 `state.write_results`（本请求是否真的写过），不是
+    `tool_call_count`（查询工具也算，会漏掉"只查了没写"的兜底时机）。
+    """
+    tool = BookTool()
+    engine, metrics, service, repo, _executor = _build(tool)
+    record, _token = _approve(service)
+    model = FakeChatModel(
+        [
+            {
+                "turn": ChatTurn(
+                    tool_calls=[
+                        ToolCall(id="c1", name="预约挂号", arguments=dict(TRUTH_ARGS))
+                    ]
+                )
+            },
+            {
+                "chunks": ["已为您预约成功。"],
+                "turn": ChatTurn(text="已为您预约成功。"),
+            },
+        ]
+    )
+    engine.chat_model = model
+
+    text, _events = await _run(engine)
+
+    # 写操作只发生一次（模型那次），兜底没有再来一遍
+    assert tool.call_count == 1
+    assert metrics.snapshot()["counters"].get("approval_auto_executions", 0) == 0
+    assert "预约成功" in text or "已为您预约成功" in text
+    # token 由模型那次调用原子消费 —— 兜底再探只会得到 invalid_or_replayed
+    assert repo.get(record.approval_id).status == ApprovalStatus.CONSUMED
 
 
 async def test_expired_token_is_not_executed():
