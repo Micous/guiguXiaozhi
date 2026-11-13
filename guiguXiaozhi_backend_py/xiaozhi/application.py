@@ -23,6 +23,12 @@ from xiaozhi.memory.store import (
 )
 from xiaozhi.models.ollama import OllamaChatModel, OllamaEmbeddingModel
 from xiaozhi.ops.audit import AuditLogger, MongoAuditSink
+from xiaozhi.ops.bounded_io import (
+    BoundedIOExecutor,
+    configure_bounded_io,
+    release_bounded_io,
+    run_sync_io,
+)
 from xiaozhi.ops.lifecycle import GracefulShutdown, HealthChecker, RateLimiter
 from xiaozhi.ops.metrics import MetricsCollector
 from xiaozhi.ops.redis_limiter import RateLimitBackendError, build_rate_limiter
@@ -108,6 +114,8 @@ class Application:
     approval_service: Optional[ApprovalService] = None
     # 本地 HIS 替身（slot_service_impl=local_his 时非 None）
     local_his_server: Optional[LocalHisServer] = None
+    # B3-1：有界阻塞 IO 执行器（停机时排空）
+    io_executor: Optional[BoundedIOExecutor] = None
 
     async def aclose(self) -> None:
         """优雅停机：释放连接"""
@@ -117,6 +125,13 @@ class Application:
         if self.local_his_server is not None:
             self.local_his_server.stop()
         self.audit.close()
+        # B3-1：最后排空有界 IO 执行器 —— 前面的组件关闭过程中可能仍在提交
+        # 同步 IO（例如 Mongo ping / 审计落盘），所以必须放在收尾最后一步。
+        if self.io_executor is not None:
+            await self.io_executor.aclose(
+                drain_timeout=self.settings.io_drain_timeout_seconds
+            )
+            release_bounded_io(self.io_executor)
 
 
 def load_system_prompt(doctor_service=None) -> str:
@@ -284,6 +299,22 @@ async def get_application(settings: Optional[Settings] = None) -> Application:
     validate_production_settings(settings)
     configure_logging(settings.log_level, json_output=settings.json_logs)
 
+    # ---- B3-1：有界阻塞 IO 执行器 ----
+    # 必须在所有可能调用 ``get_bounded_io()`` 的组件之前装配，保证请求链路
+    # 用的是带指标的同一实例，而不是 lazy 创建的裸默认实例。
+    metrics = MetricsCollector()
+    io_executor = BoundedIOExecutor(
+        max_workers=settings.io_max_workers,
+        max_inflight=settings.io_max_inflight,
+        metrics=metrics,
+    )
+    configure_bounded_io(io_executor)
+    logger.info(
+        "有界 IO 执行器已装配（workers=%d inflight=%d）",
+        io_executor.snapshot()["max_workers"],
+        io_executor.snapshot()["max_inflight"],
+    )
+
     # ---- 认证与会话归属（P1，灰度默认关）----
     # 开启但配置/存储不就绪时**直接抛错**，不静默降级：画像模块曾因初始化失败
     # 被「禁用+告警」吞掉而假健康（见《踩坑与优化记录》13.1）。
@@ -305,7 +336,7 @@ async def get_application(settings: Optional[Settings] = None) -> Application:
             settings.mysql_password,
             settings.mysql_database,
         )
-        session_repo.ensure_table()
+        await run_sync_io(session_repo.ensure_table)
         session_access = SessionAccess(session_repo)
         logger.info("认证已启用（issuer=%s，会话归属表已就绪）", settings.auth_issuer)
 
@@ -329,8 +360,10 @@ async def get_application(settings: Optional[Settings] = None) -> Application:
             settings.mysql_password,
             settings.mysql_database,
         )
-        task_repo.ensure_tables()
-        report = task_repo.recover_stale(settings.task_stale_after_seconds)
+        await run_sync_io(task_repo.ensure_tables)
+        report = await run_sync_io(
+            task_repo.recover_stale, settings.task_stale_after_seconds
+        )
         if report.interrupted_executions or report.unknown_tool_executions:
             logger.warning(
                 "崩溃恢复扫描：中断执行 %d 个、待核实工具执行 %d 个（UNKNOWN 须查业务事实，勿重试）",
@@ -341,7 +374,6 @@ async def get_application(settings: Optional[Settings] = None) -> Application:
         logger.info("任务生命周期持久化已启用（task_tracking_enabled=true）")
 
     # ---- 运维组件 ----
-    metrics = MetricsCollector()
     # 审计：fail-closed + 可选集中存储（Phase 6）。
     # mongo sink 启动先 ping：连不上直接抛错，不静默降级成本地文件
     # （降级后集中库里查不到记录，运维会以为"没有操作发生过"）。
@@ -353,7 +385,7 @@ async def get_application(settings: Optional[Settings] = None) -> Application:
             database=settings.audit_mongo_database,
             collection=settings.audit_mongo_collection,
         )
-        mongo_sink.ping()
+        await run_sync_io(mongo_sink.ping)
         audit_sinks.append(mongo_sink)
         logger.info(
             "审计集中存储已启用：Mongo %s.%s",
@@ -780,4 +812,5 @@ async def get_application(settings: Optional[Settings] = None) -> Application:
         token_service=token_service,
         session_access=session_access,
         approval_service=approval_service,
+        io_executor=io_executor,
     )

@@ -34,6 +34,7 @@ from xiaozhi.core.event import (
 )
 from xiaozhi.core.message import Message
 from xiaozhi.core.tool import ToolResult
+from xiaozhi.ops.bounded_io import run_sync_io
 from xiaozhi.reliability.tracing import trace_span
 from xiaozhi.runtime.appointment_guard import restore_masked_id_cards
 from xiaozhi.runtime.state import TurnState
@@ -125,8 +126,11 @@ class ToolCoordinator:
                 # 后必须先查业务事实，不可盲目重试（否则重复挂号）。
                 tool_exec_id = None
                 if task_tracker is not None:
-                    tool_exec_id = task_tracker.tool_started(
-                        call.id, call.name, call.arguments
+                    tool_exec_id = await run_sync_io(
+                        task_tracker.tool_started,
+                        call.id,
+                        call.name,
+                        call.arguments,
                     )
 
                 if tool is None:
@@ -163,8 +167,11 @@ class ToolCoordinator:
 
                 # ---- Phase 5：工具执行后落终态（写工具成功 → 副作用已提交）----
                 if task_tracker is not None:
-                    task_tracker.tool_finished(
-                        tool_exec_id, call.name, success=tool_result.success
+                    await run_sync_io(
+                        task_tracker.tool_finished,
+                        tool_exec_id,
+                        call.name,
+                        success=tool_result.success,
                     )
 
                 metrics.record_tool(call.name, tool_result.success)

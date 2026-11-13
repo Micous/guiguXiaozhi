@@ -32,6 +32,7 @@ from xiaozhi.core.event import (
 from xiaozhi.core.message import Message, ToolCall
 from xiaozhi.core.tool import ToolResult
 from xiaozhi.models.quality import booking_executed_in_history, corrective_prompt
+from xiaozhi.ops.bounded_io import run_sync_io
 from xiaozhi.reliability.resilience import degraded_reply
 from xiaozhi.runtime.approval_execution import approved_operation_reply
 from xiaozhi.runtime.engine_helpers import _last_assistant_text
@@ -688,7 +689,9 @@ class EnginePhases:
         call_id = f"auto-{record.approval_id}"
         tool_exec_id = None
         if self.task_tracker is not None:
-            tool_exec_id = self.task_tracker.tool_started(call_id, tool_name, args)
+            tool_exec_id = await run_sync_io(
+                self.task_tracker.tool_started, call_id, tool_name, args
+            )
 
         yield ToolExecuteEvent(
             trace_id=trace_id,
@@ -729,8 +732,11 @@ class EnginePhases:
         state.record_write_result(tool_name, tool_result)
 
         if self.task_tracker is not None:
-            self.task_tracker.tool_finished(
-                tool_exec_id, tool_name, success=tool_result.success
+            await run_sync_io(
+                self.task_tracker.tool_finished,
+                tool_exec_id,
+                tool_name,
+                success=tool_result.success,
             )
         self.metrics.record_tool(tool_name, tool_result.success)
         self.metrics.observe("tool_duration_ms", tool_result.execution_time * 1000)
@@ -934,11 +940,12 @@ class EnginePhases:
         # 状态机管理（approval_requests 表）。
         if self.task_tracker is not None:
             if result.error:
-                self.task_tracker.finish("FAILED")
+                status = "FAILED"
             elif state.approval_required:
-                self.task_tracker.finish("WAITING_APPROVAL")
+                status = "WAITING_APPROVAL"
             else:
-                self.task_tracker.finish("SUCCEEDED")
+                status = "SUCCEEDED"
+            await run_sync_io(self.task_tracker.finish, status)
 
         yield AgentEndEvent(
             trace_id=trace_id,

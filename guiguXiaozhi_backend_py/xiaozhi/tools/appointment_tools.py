@@ -14,6 +14,7 @@ import logging
 from typing import Any, Dict, List, Optional
 
 from xiaozhi.core.tool import Tool, ToolDefinition, ToolParameter, RiskLevel
+from xiaozhi.ops.bounded_io import run_sync_io
 from xiaozhi.repositories.appointment_repo import Appointment, AppointmentRepository
 from xiaozhi.security.masking import mask_id_card
 from xiaozhi.security.validators import validate_appointment, validate_department
@@ -201,7 +202,9 @@ class BookAppointmentTool(Tool):
     async def call(self, params: Dict[str, Any]) -> Any:
         from xiaozhi.core.tool import ToolResult
 
-        departments = self.doctor_service.list_departments() or None
+        # B3-1：科室字典底层是同步 HIS HTTP，offload 到有界执行器，
+        # 不阻塞 event loop；返回值/异常经执行器原样传递。
+        departments = await run_sync_io(self.doctor_service.list_departments) or None
         data_in = normalize_arguments(
             params, ["username", "id_card", "department", "date", "time", "doctor_name"]
         )
@@ -223,12 +226,13 @@ class BookAppointmentTool(Tool):
         #
         # 这里做一次交叉校验：username 命中了本科室的医生名录，
         # 而 doctor_name 为空 → 几乎必然是字段填反了，直接拒绝并让模型重问。
-        swap_error = self._detect_name_swap(data)
+        swap_error = await self._detect_name_swap(data)
         if swap_error is not None:
             return ToolResult.fail(swap_error, error_type="ValidationError")
 
         # ---- 委托业务服务（Phase 3a）：号源检查 + 原子查重写入都在服务里 ----
-        result = self._service.book(
+        result = await run_sync_io(
+            self._service.book,
             username=data["username"],
             id_card=data["id_card"],
             department=data["department"],
@@ -276,7 +280,7 @@ class BookAppointmentTool(Tool):
             f"预约写入失败：{result.message}", error_type="PersistenceError"
         )
 
-    def _detect_name_swap(self, data: Dict[str, Any]) -> Optional[str]:
+    async def _detect_name_swap(self, data: Dict[str, Any]) -> Optional[str]:
         """检测"患者姓名"和"医生姓名"填反了。
 
         返回错误说明（没问题时返回 None）。
@@ -289,7 +293,9 @@ class BookAppointmentTool(Tool):
         if not username or doctor_name:
             return None
         try:
-            roster = self.doctor_service.list_doctors(data.get("department") or "")
+            roster = await run_sync_io(
+                self.doctor_service.list_doctors, data.get("department") or ""
+            )
         except Exception:  # 名录不可用时不做判断，放行
             return None
         matched = next((d for d in roster if d.name == username), None)
@@ -385,7 +391,8 @@ class CancelAppointmentTool(Tool):
         data = validation.normalized
 
         # ---- 委托业务服务（Phase 3a）：取消 = 状态迁移，保留审计痕迹 ----
-        result = self._service.cancel(
+        result = await run_sync_io(
+            self._service.cancel,
             username=data["username"],
             id_card=data["id_card"],
             department=data["department"],
@@ -479,7 +486,9 @@ class QuerySlotTool(Tool):
         # "内科没有号源"，用户被误导成"号源查过了、确实没有"。
         # 参数问题必须让模型**去问用户**，而不是当作查询结果。
         try:
-            departments = sorted(self.doctor_service.list_departments() or [])
+            departments = sorted(
+                await run_sync_io(self.doctor_service.list_departments) or []
+            )
         except Exception:
             departments = []
         if not department:
@@ -505,8 +514,12 @@ class QuerySlotTool(Tool):
                 error_type="ValidationError",
             )
 
-        availability = self.slot_service.check(
-            department, date_str, time_slot, data_in.get("doctor_name")
+        availability = await run_sync_io(
+            self.slot_service.check,
+            department,
+            date_str,
+            time_slot,
+            data_in.get("doctor_name"),
         )
         if availability.available:
             return ToolResult.ok(availability.message)
@@ -548,7 +561,7 @@ class QueryDoctorsTool(Tool):
         data_in = normalize_arguments(params, ["department", "keyword"])
         department = data_in.get("department", "")
         keyword = (data_in.get("keyword") or "").strip()
-        doctors = self.doctor_service.list_doctors(department)
+        doctors = await run_sync_io(self.doctor_service.list_doctors, department)
         if not doctors:
             return ToolResult.ok(
                 f"本院暂无【{department}】科室的专家信息，建议先做 AI 分导诊。"

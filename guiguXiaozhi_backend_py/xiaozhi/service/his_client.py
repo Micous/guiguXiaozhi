@@ -40,6 +40,7 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any, Dict, FrozenSet, List, Optional
 
+from xiaozhi.ops.bounded_io import get_bounded_io
 from xiaozhi.service.his_resilience import (
     DEFAULT_UNCERTAIN_BUSINESS_CODES,
     KIND_AUTH,
@@ -386,6 +387,40 @@ class HisClient:
             raise last_exc
         raise HisUncertainError(
             MSG_UNCERTAIN, detail="整体时限在首次调用前耗尽"
+        )
+
+    async def request_async(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Optional[Dict[str, Any]] = None,
+        body: Optional[Dict[str, Any]] = None,
+        idempotency_key: Optional[str] = None,
+        timeout: Optional[float] = None,
+    ) -> HisResponse:
+        """B3-1：async 链路专用的 HIS 调用入口。
+
+        把**整段同步重试循环**（含 ``time.sleep`` 退避）一次性 offload 到
+        ``BoundedIOExecutor`` 的专用线程池，等价于「把阻塞与 sleep 移出 event
+        loop」。这是 ``time.sleep → await asyncio.sleep`` 的等价实现：
+
+        * 把 ``request()`` 改成 async 会破坏同步契约并波及全部服务层与 914 条
+          用例，不符合 B3-1「行为不变」硬约束；
+        * 在线程里 sleep 只占工作线程，不再阻塞事件循环，且重试 deadline、
+          熔断、幂等键等语义逐字不变。
+
+        新增入口，既有 ``request()`` 与所有同步调用方零改动。返回值与异常经
+        执行器原样传递。
+        """
+        return await get_bounded_io().run(
+            self.request,
+            method,
+            path,
+            params=params,
+            body=body,
+            idempotency_key=idempotency_key,
+            timeout=timeout,
         )
 
     def _record_failure(self, decision: Decision, method: str, path: str) -> None:

@@ -16,6 +16,8 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Awaitable, Callable, Deque, Dict, Optional, Union
 
+from xiaozhi.ops.bounded_io import get_bounded_io
+
 Probe = Callable[[], Union[Dict[str, Any], Awaitable[Dict[str, Any]]]]
 
 
@@ -57,7 +59,7 @@ class HealthChecker:
                     result = await asyncio.wait_for(probe(), timeout=timeout_per_probe)
                 else:
                     result = await asyncio.wait_for(
-                        asyncio.to_thread(probe), timeout=timeout_per_probe
+                        get_bounded_io().run(probe), timeout=timeout_per_probe
                     )
                 if inspect.isawaitable(result):
                     result = await asyncio.wait_for(result, timeout=timeout_per_probe)

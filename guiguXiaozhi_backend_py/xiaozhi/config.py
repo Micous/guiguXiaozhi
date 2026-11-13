@@ -147,6 +147,13 @@ class Settings(BaseSettings):
     # 恢复扫描：运行超过该秒数且无更新的 execution 视为进程已死
     task_stale_after_seconds: float = 600.0
 
+    # ---------- B3-1：有界阻塞 IO 执行器 ----------
+    # 同步 Mongo / MySQL / HIS / 探针调用统一经它调度；max_inflight 是
+    # 「执行中 + 排队中」的上限，超限时在 async 层排队等待，不静默丢弃。
+    io_max_workers: int = 8
+    io_max_inflight: int = 64
+    io_drain_timeout_seconds: float = 10.0
+
     # ---------- 记忆 ----------
     memory_max_messages: int = 20
     memory_token_budget: int = 4000

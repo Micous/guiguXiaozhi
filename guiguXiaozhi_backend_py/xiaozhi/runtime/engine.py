@@ -24,6 +24,7 @@ from xiaozhi.core.event import AgentEndEvent, AgentStartEvent, Event
 from xiaozhi.core.message import Role, ToolCall, Message
 from xiaozhi.memory.context import ContextAssembler
 from xiaozhi.memory.store import ConversationStore
+from xiaozhi.ops.bounded_io import run_sync_io
 from xiaozhi.ops.metrics import MetricsCollector
 from xiaozhi.reliability.resilience import CircuitBreaker, RetryConfig
 from xiaozhi.reliability.tracing import (
@@ -302,7 +303,9 @@ class AgentEngine(EnginePhases):
             #     provider 为空或取数失败一律放行，绝不因守卫把请求打死。
             if self.department_provider is not None:
                 try:
-                    known = list(self.department_provider() or [])
+                    # B3-1：provider 底层是同步 HIS 科室字典，放到有界线程池，
+                    # 避免一次主档抖动把整个 event loop 卡住。
+                    known = list(await run_sync_io(self.department_provider) or [])
                 except Exception as exc:  # 名单不可用 ≠ 本院没有科室
                     logger.warning(
                         "院方科室名单读取失败，本轮跳过科室守卫：trace=%s err=%s: %s",
@@ -346,7 +349,8 @@ class AgentEngine(EnginePhases):
             # 3.5 Phase 5：任务生命周期持久化（灰度关闭时 tracker 为 None，
             #     行为与 Phase 4 完全一致）。追踪失败不打断对话。
             if self.task_tracker is not None:
-                task_id, execution_id = self.task_tracker.begin(
+                task_id, execution_id = await run_sync_io(
+                    self.task_tracker.begin,
                     subject_id=user_id,
                     session_id=memory_id,
                     idempotency_key=task_idempotency_key,

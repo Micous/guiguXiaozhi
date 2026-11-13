@@ -38,6 +38,8 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from xiaozhi.ops.bounded_io import get_bounded_io
+
 from xiaozhi.core.message import Message
 from xiaozhi.repositories.errors import (
     PersistenceError,
@@ -252,7 +254,7 @@ class MongoConversationStore(ConversationStore):
     async def ping(self) -> None:
         """有界存活探测（serverSelectionTimeoutMS 已限 3s）。失败抛分类异常。"""
         try:
-            await asyncio.to_thread(
+            await get_bounded_io().run(
                 self._db().database.client.admin.command, "ping"
             )
         except Exception as exc:
@@ -260,7 +262,9 @@ class MongoConversationStore(ConversationStore):
 
     async def load(self, memory_id: str, limit: int = 20) -> List[Message]:
         try:
-            doc = self._db().find_one({"memoryId": str(memory_id)})
+            doc = await get_bounded_io().run(
+                self._db().find_one, {"memoryId": str(memory_id)}
+            )
         except Exception as exc:
             failure = self._fail("读取", memory_id, exc)
             if failure is not None:
@@ -281,7 +285,9 @@ class MongoConversationStore(ConversationStore):
         payload = json.dumps([m.to_dict() for m in messages], ensure_ascii=False, default=str)
         key = str(memory_id)
         try:
-            self._save_with_cas(key, payload, messages)
+            await get_bounded_io().run(
+                self._save_with_cas, key, payload, messages
+            )
         except ConcurrentWriteConflict as exc:
             if self._strict:
                 raise
@@ -342,7 +348,9 @@ class MongoConversationStore(ConversationStore):
 
     async def clear(self, memory_id: str) -> None:
         try:
-            self._db().delete_one({"memoryId": str(memory_id)})
+            await get_bounded_io().run(
+                self._db().delete_one, {"memoryId": str(memory_id)}
+            )
             self._versions.pop(str(memory_id), None)
         except Exception as exc:
             failure = self._fail("清空", memory_id, exc)

@@ -24,12 +24,12 @@ fail-closed 与否（``fail_open``）：
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import math
 import time
 from typing import Any, Callable, Dict, Optional
 
+from xiaozhi.ops.bounded_io import get_bounded_io
 from xiaozhi.ops.lifecycle import RateLimiter
 
 logger = logging.getLogger(__name__)
@@ -140,7 +140,7 @@ class RedisRateLimiter:
 
     async def allow_async(self, key: str) -> bool:
         """异步入口：Redis 调用是阻塞 IO，放到线程池里，避免卡住事件循环。"""
-        return await asyncio.to_thread(self.allow, key)
+        return await get_bounded_io().run(self.allow, key)
 
     def remaining(self, key: str) -> int:
         try:
